@@ -1,13 +1,87 @@
 # gitomic
 
-`gitomic` is a light-weight daemon that can be attached to a git repository and track repo changes, creating atomic commmits as you go.
-Since git already tracks file changes, gitomic should be able to simply copy git's homework and as file ar changed, create individual commits 
-for each change. Each change is diffrent than "each file" as if a file is changed, and then later another edit is made to it, therre having been other repo changes between the first change and the current change those should not be flattened into a single commit.  Each "event" should be recoverable. 
+`gitomic` records **atomic commits** while a git repository changes, then stamps a **single message** across the
+whole batch when the work is done. A session of many small, individually recoverable steps collapses into one
+authored intent — without flattening the intermediate history into a single commit.
 
-Commits should be created with a blank message, then at the end when the user actually goes to review / write the commit, one message gets entered and that  message gets duplicated across all the commits in the batch . 
+It is deliberately narrow: it never touches credentials, never contacts a remote, and writes nothing but local
+commits. Publishing stays an explicit, separate `git push`.
 
-gitomic should run as a user-level daemon and be configured via `~/.config/gitomic/gitomic.cfg` the most important options that I have in mind at this point is the ability to add multiple directories as "locations containing git repos," and maybe some basic formatting things... and whateer else would be importnat to such a program when interactnig with git. 
+## Model
 
-I dont' want gitomic to deal with any credentials, that should all be on the `git` side of things.  Just as narrowly scoped as possible to achieve the goal: atomic commits without having to create individual commits s you go. 
+A session has two pieces of state, both inspectable with plain git:
 
-My familiarity with git at this point is still a learning process and discovery of new frutrations, so this nis not a hard definition of the scope. What ever is useful, you may add. 
+- A ref `refs/gitomic/base` marking the commit HEAD sat on when the session began.
+- A background watcher process, identified by a pidfile at `<git-dir>/gitomic/watch.pid`.
+
+`gitomic init` plants the base and forks the watcher. As the work tree settles after each burst of edits, the
+watcher records one commit with an empty placeholder message. `gitomic finish` stops the watcher, collects every
+commit in `base..HEAD`, obtains one message, and rebuilds the batch onto the base with that message applied to
+each commit (original tree and authorship preserved, fresh committer). The branch ref is advanced with a
+compare-and-swap and the base marker is removed.
+
+Because the batch is unpublished, rewriting the messages is safe. The result is N commits carrying the same
+message; each remains individually recoverable by hash and reflog. Enable numbering to append ` [i/N]` so the
+commits stay distinguishable in `git log`.
+
+## Usage
+
+Run any command from anywhere inside the repository; the repository is inferred from the working directory.
+
+```
+gitomic init                 # mark HEAD as the base and start watching (alias: start)
+gitomic status               # base, pending atomic-commit count, watcher state, log path
+gitomic finish -m "message"  # stop watching and stamp the message across the batch (alias: commit)
+gitomic finish               # same, but open $GIT_EDITOR for the message
+gitomic stop                 # stop watching, keep the base and commits for later finish/resume
+gitomic abort --force        # discard the session: reset the branch to the base
+```
+
+Running `init` again when a base already exists but no watcher is live **resumes** that session rather than
+starting a new one, so an accidental `stop` — or a reboot — is recoverable without losing recorded commits.
+
+### finish options
+
+- `-m, --message <text>` — use `<text>` and skip the editor.
+- `-n, --numbering` — append ` [i/N]` to each commit message this run.
+- `--no-numbering` — do not append ordinals this run (overrides the config default).
+
+## Configuration
+
+`${XDG_CONFIG_HOME:-~/.config}/gitomic/gitomic.cfg`, a flat `key = value` file. Every key has a compiled-in
+default, so the file is optional. See `gitomic.cfg.example`.
+
+| key                  | default | meaning                                                                 |
+|----------------------|---------|-------------------------------------------------------------------------|
+| `debounce_ms`        | `1000`  | Quiescence window; a burst of edits commits once this long has passed.  |
+| `finalize_numbering` | `false` | Append ` [i/N]` to each finalized message.                              |
+| `include_untracked`  | `true`  | Stage untracked files (`git add -A`) as well as modifications.          |
+
+## Behaviour and guarantees
+
+- **Staging respects `.gitignore`** — the watcher uses git's own `add`, and a cycle that stages nothing
+  produces no commit.
+- **The watcher stands down during multi-step operations** — an in-progress merge, rebase, cherry-pick, revert,
+  or bisect suspends auto-committing; a held `index.lock` defers to a later cycle.
+- **A detached HEAD is refused at `init`** — finalize needs a branch ref to advance.
+- **Events inside the git directory are ignored** — committing writes to `.git`, so those writes are filtered
+  to prevent a feedback loop.
+- **Hooks are bypassed** — placeholder commits use `--no-verify`, and the finalize rewrite uses `commit-tree`,
+  which does not run hooks. Run hooks manually if a session depends on them.
+
+## Scope, and what is intentionally left out
+
+The original design contemplated an always-running daemon watching several configured directories. That is out
+of scope here in favour of a session-scoped, manually started watcher tied to the current repository, which
+avoids recording commits during periods the maintainer did not intend to track. The `watch_dir` config key is
+accepted and ignored, reserved for a future multi-repository daemon should one prove useful. The known cost of
+the manual model — forgetting to `init` before working — is documented rather than solved.
+
+## Building
+
+Requires a Rust toolchain and the `git` binary at run time. Linux only (inotify).
+
+```
+cargo build --release
+install -Dm755 target/release/gitomic ~/.local/bin/gitomic
+```

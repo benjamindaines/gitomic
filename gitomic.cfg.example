@@ -1,0 +1,19 @@
+# gitomic configuration. Copy to ${XDG_CONFIG_HOME:-~/.config}/gitomic/gitomic.cfg and edit.
+# Every key is optional; the value shown is the compiled-in default. Blank lines and '#' comments
+# are ignored, as is inline text after a '#'.
+
+# Quiescence window in milliseconds. A burst of file-system events is coalesced into one atomic
+# commit once no further event has arrived for this long.
+debounce_ms = 1000
+
+# Append " [i/N]" to each commit message at finish, so otherwise identical batch messages stay
+# distinguishable in the log. Overridable per run with --numbering / --no-numbering.
+finalize_numbering = false
+
+# Stage untracked files as well as modifications when recording an atomic commit. false stages only
+# changes to already-tracked files.
+include_untracked = true
+
+# Reserved for a future always-on multi-repository mode; currently accepted and ignored. The manual,
+# cwd-scoped model supersedes it.
+# watch_dir = /home/ben/code

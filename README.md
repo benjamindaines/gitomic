@@ -57,7 +57,8 @@ default, so the file is optional. See `gitomic.cfg.example`.
 | `finalize_numbering` | `false` | Append ` [i/N]` to each finalized message.                              |
 | `include_untracked`  | `true`  | Stage untracked files (`git add -A`) as well as modifications.          |
 
-## Behaviour and guarantees
+## Behaviour and ~~guarantees~~ Intent
+(guarantees is a very strong word)
 
 - **Staging respects `.gitignore`** — the watcher uses git's own `add`, and a cycle that stages nothing
   produces no commit.

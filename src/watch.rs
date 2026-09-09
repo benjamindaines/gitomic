@@ -46,9 +46,11 @@ pub fn run(root: &Path, git_dir: &Path, cfg: &Config) -> Res<()> {
     let mut last_event: Option<Instant> = None;
     loop {
         if proc::shutdown_requested() {
-            if last_event.is_some() {
-                commit_cycle(root, &git_dir, cfg);
-            }
+            // Exit promptly on signal without a final commit. The capture of any change observed after the
+            // last debounce cycle is performed by the foreground `finish`/`stop` command, where its output is
+            // visible to the operator and no in-flight staging blocks the watcher's exit. This keeps watcher
+            // shutdown bounded by at most one already-running commit cycle rather than by a fresh flush of the
+            // whole tree.
             log("shutdown signal received; watcher exiting");
             return Ok(());
         }
@@ -56,12 +58,7 @@ pub fn run(root: &Path, git_dir: &Path, cfg: &Config) -> Res<()> {
         match rx.recv_timeout(POLL) {
             Ok(()) => last_event = Some(Instant::now()),
             Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => {
-                if last_event.is_some() {
-                    commit_cycle(root, &git_dir, cfg);
-                }
-                return Ok(());
-            }
+            Err(RecvTimeoutError::Disconnected) => return Ok(()),
         }
 
         // Commit once the tree has been quiescent for the full debounce window. Draining any events that
@@ -78,47 +75,64 @@ pub fn run(root: &Path, git_dir: &Path, cfg: &Config) -> Res<()> {
     }
 }
 
-// Attempt one atomic commit. Preconditions that make committing unsafe or pointless are checked first: an
-// in-progress merge/rebase/etc. causes the cycle to stand down, and a held index lock defers to a later cycle.
-// Staging respects .gitignore through git itself; an empty staged diff produces no commit.
-fn commit_cycle(root: &Path, git_dir: &Path, cfg: &Config) {
+// Outcome of one capture attempt, returned rather than logged so the caller can report it in the register
+// appropriate to its context: the background watcher writes it to its log, while a foreground command prints
+// it to the operator's terminal.
+pub(crate) enum Flush {
+    // A commit was recorded; the field carries the short object id (empty when it could not be re-read).
+    Committed(String),
+    // Nothing was staged, so no commit was made (for example the burst touched only ignored files).
+    Nothing,
+    // A precondition stood the capture down without error (in-progress operation, or a held index lock).
+    Skipped(String),
+    // A git invocation failed; the field carries the diagnostic.
+    Failed(String),
+}
+
+// Perform one capture and return its outcome without logging. Preconditions that make committing unsafe or
+// pointless are checked first: an in-progress merge/rebase/etc. stands the capture down, and a held index
+// lock defers. Staging respects .gitignore through git itself; an empty staged diff produces no commit. The
+// placeholder message is intentionally empty; finalize replaces it across the batch. Verification hooks are
+// bypassed so transient placeholder commits neither block on nor repeatedly trigger hooks.
+pub(crate) fn flush_once(root: &Path, git_dir: &Path, cfg: &Config) -> Flush {
     if git::operation_in_progress(git_dir) {
-        log("multi-step git operation in progress; skipping commit");
-        return;
+        return Flush::Skipped("multi-step git operation in progress".to_string());
     }
     if git::index_locked(git_dir) {
-        log("index locked by another git process; will retry");
-        return;
+        return Flush::Skipped("index locked by another git process".to_string());
     }
 
     let add_arg = if cfg.include_untracked { "-A" } else { "-u" };
     if let Err(e) = git::run(root, &["add", add_arg]) {
-        log(&format!("stage failed: {e}"));
-        return;
+        return Flush::Failed(format!("stage failed: {e}"));
     }
 
-    // Nothing staged means no observable change (e.g. the burst touched only ignored files); do not create an
-    // empty commit.
     match git::succeeds(root, &["diff", "--cached", "--quiet"]) {
-        Ok(true) => return, // exit 0: no staged differences
-        Ok(false) => {}     // exit 1: staged differences present
-        Err(e) => {
-            log(&format!("diff check failed: {e}"));
-            return;
-        }
+        Ok(true) => return Flush::Nothing, // exit 0: no staged differences
+        Ok(false) => {}                    // exit 1: staged differences present
+        Err(e) => return Flush::Failed(format!("diff check failed: {e}")),
     }
 
-    // The placeholder message is intentionally empty; finalize replaces it across the batch. Verification
-    // hooks are bypassed so transient placeholder commits neither block on nor repeatedly trigger hooks.
     match git::run(
         root,
         &["commit", "--allow-empty-message", "--no-verify", "-m", ""],
     ) {
         Ok(_) => match git::rev_parse(root, "HEAD") {
-            Ok(sha) => log(&format!("atomic commit {}", &sha[..sha.len().min(12)])),
-            Err(_) => log("atomic commit recorded"),
+            Ok(sha) => Flush::Committed(sha.chars().take(12).collect()),
+            Err(_) => Flush::Committed(String::new()),
         },
-        Err(e) => log(&format!("commit failed: {e}")),
+        Err(e) => Flush::Failed(format!("commit failed: {e}")),
+    }
+}
+
+// Attempt one atomic commit on the watcher's schedule, logging the outcome to the watcher's redirected log.
+fn commit_cycle(root: &Path, git_dir: &Path, cfg: &Config) {
+    match flush_once(root, git_dir, cfg) {
+        Flush::Committed(sha) if !sha.is_empty() => log(&format!("atomic commit {sha}")),
+        Flush::Committed(_) => log("atomic commit recorded"),
+        Flush::Nothing => {}
+        Flush::Skipped(why) => log(&format!("{why}; skipping commit")),
+        Flush::Failed(msg) => log(&msg),
     }
 }
 

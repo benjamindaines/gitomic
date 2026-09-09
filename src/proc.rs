@@ -26,10 +26,14 @@ pub fn shutdown_requested() -> bool {
 // Install handlers for SIGTERM and SIGINT. Establishing these before the watch loop begins guarantees the
 // flush-on-exit contract that `finish` and `stop` rely upon.
 pub fn install_signal_handlers() {
+    // The handler is coerced to an `extern "C"` function pointer before the numeric `sighandler_t` cast that
+    // `libc::signal` requires. The intermediate pointer avoids a direct function-item-to-integer cast; the
+    // two-step form is the documented way to express this conversion without tripping fn-to-numeric lints.
+    let handler = on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t;
     // SAFETY: on_signal only performs an atomic store, which is permitted in a signal handler.
     unsafe {
-        libc::signal(libc::SIGTERM, on_signal as libc::sighandler_t);
-        libc::signal(libc::SIGINT, on_signal as libc::sighandler_t);
+        libc::signal(libc::SIGTERM, handler);
+        libc::signal(libc::SIGINT, handler);
     }
 }
 

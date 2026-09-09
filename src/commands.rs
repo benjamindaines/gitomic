@@ -121,23 +121,33 @@ pub fn status(cwd: &Path) -> Res<()> {
 pub fn stop(cwd: &Path) -> Res<()> {
     let root = git::work_tree(cwd)?;
     let git_dir = git::git_dir(cwd)?;
+    let cfg = Config::load()?;
 
-    let stopped = terminate_watcher(&git_dir, Duration::from_secs(5))?;
+    let stopped = terminate_watcher(&git_dir)?;
     if !stopped {
         println!("gitomic: no watcher running in {}", root.display());
     } else {
         println!("gitomic: watcher stopped in {}", root.display());
     }
+    // Foreground capture of any change observed after the watcher's last debounce cycle, run only once the
+    // watcher is confirmed gone so the two never contend for the index. Skipped when no session is active,
+    // since there is no base against which the recorded commit would be finalized.
     if git::rev_exists(&root, BASE_REF)? {
+        report_flush(&root, &git_dir, &cfg);
         let pending = git::count(&root, &format!("{BASE_REF}..HEAD"))?;
         println!("  {pending} atomic commit(s) preserved; run 'gitomic finish' to finalize or 'gitomic init' to resume");
     }
     Ok(())
 }
 
-// Discard the session: stop the watcher, reset the branch back to the base marker (dropping all atomic
-// commits and their working-tree state), and remove the marker. Destructive, so it requires an explicit
-// --force to proceed; without it the effect is described but not performed.
+// Discard the session: stop the watcher, move the branch back to the base marker (dropping all atomic
+// commits), and remove the marker. The working tree is preserved: `reset --mixed` rewinds the branch and
+// index to the base without touching files on disk, so content the watcher swept into atomic commits from a
+// previously untracked state survives the abort as untracked files rather than being deleted. A prior
+// `reset --hard` here removed such files, because files present only in the discarded commits (absent at the
+// base) are deleted by a hard reset; that data-loss path is the reason a mixed reset is used. Still requires
+// an explicit --force, since dropping recorded commits is not reversible through gitomic itself; without it
+// the effect is described but not performed.
 pub fn abort(cwd: &Path, force: bool) -> Res<()> {
     let root = git::work_tree(cwd)?;
     let git_dir = git::git_dir(cwd)?;
@@ -151,18 +161,23 @@ pub fn abort(cwd: &Path, force: bool) -> Res<()> {
 
     if !force {
         println!(
-            "gitomic: abort would reset {} to {} and discard {pending} atomic commit(s).",
+            "gitomic: abort would move {} back to {} and discard {pending} atomic commit(s).",
             root.display(),
             short(&base)
         );
         println!(
-            "  working-tree changes since the base would be lost. Re-run with --force to proceed."
+            "  working-tree files are preserved; content from discarded commits reverts to unstaged/untracked. \
+             Re-run with --force to proceed."
         );
         return Ok(());
     }
 
-    terminate_watcher(&git_dir, Duration::from_secs(5))?;
-    git::run(&root, &["reset", "--hard", &base])?;
+    terminate_watcher(&git_dir)?;
+    // A mixed reset moves the branch and index to the base while leaving every working-tree file in place, so
+    // no file on disk is deleted by the abort. A hard reset would remove files that exist only in the
+    // discarded commits. No final capture is performed: the session is being discarded, so committing the
+    // last changes only to reset past them would be pointless.
+    git::run(&root, &["reset", "--mixed", &base])?;
     git::delete_ref(&root, BASE_REF)?;
     proc::clear_pid(&state_dir(&git_dir));
     println!(
@@ -186,7 +201,11 @@ pub fn finish(cwd: &Path, message: Option<String>, numbering_override: Option<bo
         return Ok(());
     }
 
-    terminate_watcher(&git_dir, Duration::from_secs(10))?;
+    terminate_watcher(&git_dir)?;
+    // Foreground capture before the batch is enumerated, so a change made after the watcher's last cycle is
+    // included in the finalized batch rather than lost. Visible to the operator, unlike the former in-watcher
+    // shutdown flush.
+    report_flush(&root, &git_dir, &cfg);
 
     let branch = git::current_branch(&root)?;
     let base = git::rev_parse(&root, BASE_REF)?;
@@ -294,9 +313,15 @@ fn template(commits: &[String]) -> String {
     t
 }
 
-// Stop a running watcher and wait for it to exit within `deadline`. Returns whether a watcher was found and
-// stopped. A stale pidfile (process already gone) is cleared and reported as "not running".
-fn terminate_watcher(git_dir: &Path, deadline: Duration) -> Res<bool> {
+// Stop a running watcher and wait for it to exit. Returns whether a watcher was found and stopped. A stale
+// pidfile (process already gone) is cleared and reported as "not running". There is no shutdown deadline: the
+// watcher exits within one poll interval unless it is mid-commit on a large tree, in which case it exits once
+// that single git operation completes. The function waits for that to happen and reports periodically so the
+// wait is never silent, rather than giving up after an arbitrary interval and returning control while the
+// watcher is still live. Confirming the watcher has exited before returning is what lets a caller safely run a
+// subsequent reset without racing a live watcher over the index. A genuinely wedged watcher is interrupted by
+// the operator (Ctrl-C) rather than by a timer.
+fn terminate_watcher(git_dir: &Path) -> Res<bool> {
     let sdir = state_dir(git_dir);
     let pid = match proc::read_pid(&sdir) {
         Some(p) => p,
@@ -308,21 +333,39 @@ fn terminate_watcher(git_dir: &Path, deadline: Duration) -> Res<bool> {
     }
 
     proc::request_stop(pid);
+    println!("gitomic: stopping watcher (pid {pid})");
     let start = Instant::now();
-    while start.elapsed() < deadline {
-        if !proc::alive(pid) {
-            proc::clear_pid(&sdir);
-            return Ok(true);
+    let mut next_notice = Duration::from_secs(2);
+    while proc::alive(pid) {
+        if start.elapsed() >= next_notice {
+            // A watcher caught mid-commit on a large tree completes that git operation before observing the
+            // signal; report the ongoing wait rather than leaving the operator at a silent prompt.
+            println!(
+                "  still waiting for the watcher to finish an in-flight commit ({}s elapsed)",
+                start.elapsed().as_secs()
+            );
+            next_notice += Duration::from_secs(2);
         }
-        sleep(Duration::from_millis(50));
+        sleep(Duration::from_millis(100));
     }
-    // The watcher flushes on SIGTERM; failure to exit within the deadline indicates a wedged process and is
-    // surfaced rather than left ambiguous.
-    Err(format!(
-        "watcher (pid {pid}) did not exit within {} ms",
-        deadline.as_millis()
-    )
-    .into())
+    proc::clear_pid(&sdir);
+    println!("  watcher exited after {:.1}s", start.elapsed().as_secs_f64());
+    Ok(true)
+}
+
+// Perform one foreground capture and report its outcome to the operator's terminal. Used by `stop` and
+// `finish` after the watcher is confirmed gone, so the final capture and its result are visible rather than
+// buried in the watcher's redirected log.
+fn report_flush(root: &Path, git_dir: &Path, cfg: &Config) {
+    match watch::flush_once(root, git_dir, cfg) {
+        watch::Flush::Committed(sha) if !sha.is_empty() => {
+            println!("  captured final change as {sha}")
+        }
+        watch::Flush::Committed(_) => println!("  captured final change"),
+        watch::Flush::Nothing => println!("  no pending changes to capture"),
+        watch::Flush::Skipped(why) => println!("  final capture skipped: {why}"),
+        watch::Flush::Failed(msg) => println!("  final capture failed: {msg}"),
+    }
 }
 
 // Poll for a freshly forked watcher to publish its pidfile and become live, up to `deadline`.

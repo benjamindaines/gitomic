@@ -349,7 +349,10 @@ fn terminate_watcher(git_dir: &Path) -> Res<bool> {
         sleep(Duration::from_millis(100));
     }
     proc::clear_pid(&sdir);
-    println!("  watcher exited after {:.1}s", start.elapsed().as_secs_f64());
+    println!(
+        "  watcher exited after {:.1}s",
+        start.elapsed().as_secs_f64()
+    );
     Ok(true)
 }
 

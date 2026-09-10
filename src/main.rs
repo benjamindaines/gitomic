@@ -37,7 +37,10 @@ fn dispatch(args: &[String]) -> Res<()> {
     let command = args.first().map(String::as_str).unwrap_or("");
 
     match command {
-        "init" | "start" => commands::init(&cwd),
+        "init" | "start" => {
+            let opts = InitOpts::parse(&args[1..])?;
+            commands::init(&cwd, opts.foreground, opts.verbose)
+        }
         "finish" | "commit" => {
             let opts = FinishOpts::parse(&args[1..])?;
             commands::finish(&cwd, opts.message, opts.numbering)
@@ -87,6 +90,34 @@ impl FinishOpts {
     }
 }
 
+// Parsed options for the init command.
+struct InitOpts {
+    foreground: bool,
+    verbose: bool,
+}
+
+impl InitOpts {
+    // Parse init arguments. `-f/--foreground` runs the watcher in the calling process with diagnostics on the
+    // terminal instead of detaching it into the background; `-v/--verbose` adds a per-event trace line.
+    // Foreground implies verbose, so the operator sees the event stream by default while reproducing a
+    // scenario; `-v` alone fattens the detached watcher's log without keeping the process in the foreground.
+    fn parse(rest: &[String]) -> Res<InitOpts> {
+        let mut foreground = false;
+        let mut verbose = false;
+        for arg in rest {
+            match arg.as_str() {
+                "-f" | "--foreground" => foreground = true,
+                "-v" | "--verbose" => verbose = true,
+                other => return Err(format!("unexpected argument '{other}' for init").into()),
+            }
+        }
+        Ok(InitOpts {
+            foreground,
+            verbose: verbose || foreground,
+        })
+    }
+}
+
 // Absolute path helper retained for potential future subcommands that accept an explicit repository path;
 // currently every command resolves the repository from the working directory.
 #[allow(dead_code)]
@@ -102,7 +133,7 @@ USAGE:
   gitomic <command> [options]     run inside a git repository (any subdirectory)
 
 COMMANDS:
-  init                 Mark HEAD as the session base and fork a background watcher. If a base already
+  init [options]       Mark HEAD as the session base and fork a background watcher. If a base already
                        exists without a running watcher, resume that session. Aliases: start.
   finish [options]     Stop the watcher and apply one message to every atomic commit in the session,
                        then clear the session. Aliases: commit.
@@ -110,6 +141,12 @@ COMMANDS:
   stop                 Stop the watcher but keep the base and recorded commits for later finish/resume.
   abort [--force]      Discard the session: reset the branch to the base and drop the atomic commits.
   help, --version
+
+INIT OPTIONS:
+  -f, --foreground       Run the watcher in this process with diagnostics on the terminal instead of
+                         detaching it; Ctrl-C stops it and preserves the session. Implies --verbose.
+  -v, --verbose          Trace every file-system event (kind, paths, and whether it armed the debounce
+                         timer or was ignored as git-internal). Usable with the detached watcher too.
 
 FINISH OPTIONS:
   -m, --message <text>   Use <text> as the message and skip the editor.

@@ -35,7 +35,7 @@ fn live_watcher(git_dir: &Path) -> Option<i32> {
 // Begin or resume a session: plant the base marker at HEAD if absent, then detach a background watcher. A
 // second invocation while a watcher already runs is a no-op with a notice. When the base already exists but no
 // watcher runs (for example after `stop`), the existing base is preserved and watching resumes from it.
-pub fn init(cwd: &Path) -> Res<()> {
+pub fn init(cwd: &Path, foreground: bool, verbose: bool) -> Res<()> {
     let root = git::work_tree(cwd)?;
     let git_dir = git::git_dir(cwd)?;
     let sdir = state_dir(&git_dir);
@@ -57,6 +57,32 @@ pub fn init(cwd: &Path) -> Res<()> {
 
     let cfg = Config::load()?;
     fs::create_dir_all(&sdir)?;
+
+    if foreground {
+        // Foreground session: the watcher runs in the calling process with diagnostics on the terminal rather
+        // than detaching and redirecting them to the log. This is a diagnostic mode: the operator sees the
+        // exact moment the recursive watch is established (the "watching ..." line), every event as it arrives
+        // under verbose tracing, and each commit cycle, while reproducing a scenario by hand. The pidfile is
+        // still written so status/finish/stop/abort invoked from another terminal observe and can signal this
+        // watcher; it is cleared on exit. Termination is by SIGINT (Ctrl-C) or a SIGTERM from `finish`/`stop`,
+        // both of which the installed handler turns into a clean loop exit; the session base and recorded
+        // atomic commits are preserved for a subsequent `finish` or `init` exactly as in the detached case.
+        let base = git::rev_parse(&root, BASE_REF)?;
+        let verb = if resuming { "resumed" } else { "started" };
+        println!("gitomic: foreground session {verb} for {}", root.display());
+        println!("  base:  {}", short(&base));
+        println!("  diagnostics stream to this terminal (not the log file) until Ctrl-C.");
+        if verbose {
+            println!("  verbose: every file-system event is traced before the git-internal filter.");
+        }
+        println!("  Ctrl-C stops the watcher; the session and its commits are preserved.");
+        proc::install_signal_handlers();
+        proc::write_pid(&sdir)?;
+        let res = watch::run(&root, &git_dir, &cfg, verbose);
+        proc::clear_pid(&sdir);
+        res?;
+        return Ok(());
+    }
 
     match proc::daemonize()? {
         Fork::Parent => {
@@ -84,7 +110,7 @@ pub fn init(cwd: &Path) -> Res<()> {
             proc::redirect_stdio(&proc::logfile(&sdir))?;
             proc::install_signal_handlers();
             if proc::write_pid(&sdir).is_ok() {
-                let _ = watch::run(&root, &git_dir, &cfg);
+                let _ = watch::run(&root, &git_dir, &cfg, verbose);
             }
             proc::clear_pid(&sdir);
             std::process::exit(0);

@@ -19,19 +19,29 @@ const POLL: Duration = Duration::from_millis(200);
 
 // Run the watch loop until a shutdown signal arrives. `root` is the work tree, `git_dir` the repository's git
 // directory. Diagnostics are written to the already-redirected stdout/stderr.
-pub fn run(root: &Path, git_dir: &Path, cfg: &Config) -> Res<()> {
+pub fn run(root: &Path, git_dir: &Path, cfg: &Config, verbose: bool) -> Res<()> {
     let debounce = Duration::from_millis(cfg.debounce_ms);
     let git_dir = git_dir.to_path_buf();
 
     let (tx, rx) = channel::<()>();
     // The event handler forwards only a wake token; the debounce timer, not the event payload, drives commits.
     // Events whose paths lie inside the git directory are filtered here so watcher-induced writes never rearm
-    // the timer.
+    // the timer. When verbose tracing is enabled, every received event is logged first, before the filter, so
+    // the operator sees changes that were ignored as git-internal as well as those that armed the timer.
     let gd = git_dir.clone();
-    let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-        if let Ok(event) = res {
-            if event.paths.iter().any(|p| !is_within(p, &gd)) {
+    let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| match res {
+        Ok(event) => {
+            let external = event.paths.iter().any(|p| !is_within(p, &gd));
+            if verbose {
+                trace_event(&event, external);
+            }
+            if external {
                 let _ = tx.send(());
+            }
+        }
+        Err(e) => {
+            if verbose {
+                log(&format!("watch error: {e}"));
             }
         }
     })?;
@@ -68,7 +78,10 @@ pub fn run(root: &Path, git_dir: &Path, cfg: &Config) -> Res<()> {
         }
         if let Some(t) = last_event {
             if t.elapsed() >= debounce {
-                commit_cycle(root, &git_dir, cfg);
+                if verbose {
+                    log("debounce window elapsed; running commit cycle");
+                }
+                commit_cycle(root, &git_dir, cfg, verbose);
                 last_event = None;
             }
         }
@@ -126,11 +139,18 @@ pub(crate) fn flush_once(root: &Path, git_dir: &Path, cfg: &Config) -> Flush {
 }
 
 // Attempt one atomic commit on the watcher's schedule, logging the outcome to the watcher's redirected log.
-fn commit_cycle(root: &Path, git_dir: &Path, cfg: &Config) {
+fn commit_cycle(root: &Path, git_dir: &Path, cfg: &Config, verbose: bool) {
     match flush_once(root, git_dir, cfg) {
         Flush::Committed(sha) if !sha.is_empty() => log(&format!("atomic commit {sha}")),
         Flush::Committed(_) => log("atomic commit recorded"),
-        Flush::Nothing => {}
+        // Nothing staged is the common quiescent outcome and is silent by default to keep the log terse; under
+        // verbose tracing it is reported so a burst that produced no committable change (only ignored files, or
+        // a change already reverted) is distinguishable from a burst that was never observed.
+        Flush::Nothing => {
+            if verbose {
+                log("debounce elapsed but nothing was staged (no commit)");
+            }
+        }
         Flush::Skipped(why) => log(&format!("{why}; skipping commit")),
         Flush::Failed(msg) => log(&msg),
     }
@@ -140,6 +160,17 @@ fn commit_cycle(root: &Path, git_dir: &Path, cfg: &Config) {
 // non-canonical base is tolerated because both derive from the same absolute git-dir query.
 fn is_within(path: &Path, base: &Path) -> bool {
     path.starts_with(base)
+}
+
+// Emit one diagnostic line per received file-system event under verbose tracing: the event kind and the paths
+// it names, tagged by whether any path lies outside the git directory (arming the debounce timer) or the event
+// was purely git-internal (ignored to avoid a commit feedback loop). This is the primary instrument for
+// confirming whether a given change — a patch application, an editor save, a scripted file write — is observed
+// by the watcher at all, as opposed to being lost before the recursive watch was established.
+fn trace_event(event: &notify::Event, external: bool) {
+    let tag = if external { "armed" } else { "ignored (git-internal)" };
+    let paths: Vec<String> = event.paths.iter().map(|p| p.display().to_string()).collect();
+    log(&format!("event {:?} [{}] -> {}", event.kind, paths.join(", "), tag));
 }
 
 // Emit a timestamped diagnostic line to the redirected log.

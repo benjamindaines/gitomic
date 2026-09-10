@@ -73,9 +73,7 @@ pub fn init(cwd: &Path, foreground: bool, verbose: bool) -> Res<()> {
         println!("  base:  {}", short(&base));
         println!("  diagnostics stream to this terminal (not the log file) until Ctrl-C.");
         if verbose {
-            println!(
-                "  verbose: every file-system event is traced before the git-internal filter."
-            );
+            println!("  verbose: every file-system event is traced before the git-internal filter.");
         }
         println!("  Ctrl-C stops the watcher; the session and its commits are preserved.");
         proc::install_signal_handlers();
@@ -118,6 +116,67 @@ pub fn init(cwd: &Path, foreground: bool, verbose: bool) -> Res<()> {
             std::process::exit(0);
         }
     }
+}
+
+// Run a wrapped command to completion in the work tree, then capture its full effect as one atomic commit
+// staging untracked files as well (`git add -A`), irrespective of include_untracked. This is the escape hatch
+// for the tracked-only watcher policy: a patch or generator that creates new files, run under a session with
+// include_untracked=false, would otherwise leave those files unstaged and produce no commit. Wrapping the
+// command declares its result as intended history, so the created files are recorded. Requires an active
+// session so the commit joins a batch that `finish` finalizes. The wrapped command's non-zero exit aborts the
+// capture: a patch that does not apply must not be followed by a commit of a partial tree.
+pub fn exec(cwd: &Path, argv: &[String], shell: bool) -> Res<()> {
+    let root = git::work_tree(cwd)?;
+    let git_dir = git::git_dir(cwd)?;
+
+    if argv.is_empty() {
+        return Err("exec: no command given".into());
+    }
+    if !git::rev_exists(&root, BASE_REF)? {
+        return Err("exec: no active session; run 'gitomic init' first so the captured change joins a batch".into());
+    }
+
+    let label = command_label(argv, shell);
+    let status = if shell {
+        // Shell mode mirrors `su -c`: the arguments are joined into one string interpreted by sh, so globs,
+        // pipelines, and redirections are honoured.
+        Command::new("sh")
+            .arg("-c")
+            .arg(argv.join(" "))
+            .current_dir(&root)
+            .status()?
+    } else {
+        // Direct mode executes argv without a shell, so no quoting or injection concerns arise for the common
+        // `gitomic exec git apply file.patch` form.
+        Command::new(&argv[0])
+            .args(&argv[1..])
+            .current_dir(&root)
+            .status()?
+    };
+    if !status.success() {
+        let how = status
+            .code()
+            .map(|c| format!("exited {c}"))
+            .unwrap_or_else(|| "terminated by signal".to_string());
+        return Err(format!("exec: '{label}' {how}; no capture performed").into());
+    }
+
+    match watch::flush_all(&root, &git_dir) {
+        watch::Flush::Committed(sha) if !sha.is_empty() => {
+            println!("gitomic: captured '{label}' as {sha}")
+        }
+        watch::Flush::Committed(_) => println!("gitomic: captured '{label}'"),
+        watch::Flush::Nothing => println!("gitomic: '{label}' produced no change to capture"),
+        watch::Flush::Skipped(why) => println!("gitomic: capture skipped: {why}"),
+        watch::Flush::Failed(msg) => return Err(format!("exec: capture failed: {msg}").into()),
+    }
+    Ok(())
+}
+
+// Render the wrapped command for diagnostics: the joined argv in both modes, which reads the same whether the
+// operator quoted a shell string or passed bare arguments.
+fn command_label(argv: &[String], _shell: bool) -> String {
+    argv.join(" ")
 }
 
 // Report session state without modifying it.

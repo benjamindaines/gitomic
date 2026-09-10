@@ -29,23 +29,22 @@ pub fn run(root: &Path, git_dir: &Path, cfg: &Config, verbose: bool) -> Res<()> 
     // the timer. When verbose tracing is enabled, every received event is logged first, before the filter, so
     // the operator sees changes that were ignored as git-internal as well as those that armed the timer.
     let gd = git_dir.clone();
-    let mut watcher =
-        notify::recommended_watcher(move |res: notify::Result<notify::Event>| match res {
-            Ok(event) => {
-                let external = event.paths.iter().any(|p| !is_within(p, &gd));
-                if verbose {
-                    trace_event(&event, external);
-                }
-                if external {
-                    let _ = tx.send(());
-                }
+    let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| match res {
+        Ok(event) => {
+            let external = event.paths.iter().any(|p| !is_within(p, &gd));
+            if verbose {
+                trace_event(&event, external);
             }
-            Err(e) => {
-                if verbose {
-                    log(&format!("watch error: {e}"));
-                }
+            if external {
+                let _ = tx.send(());
             }
-        })?;
+        }
+        Err(e) => {
+            if verbose {
+                log(&format!("watch error: {e}"));
+            }
+        }
+    })?;
     watcher.watch(root, RecursiveMode::Recursive)?;
 
     log(&format!(
@@ -103,12 +102,28 @@ pub(crate) enum Flush {
     Failed(String),
 }
 
-// Perform one capture and return its outcome without logging. Preconditions that make committing unsafe or
-// pointless are checked first: an in-progress merge/rebase/etc. stands the capture down, and a held index
-// lock defers. Staging respects .gitignore through git itself; an empty staged diff produces no commit. The
-// placeholder message is intentionally empty; finalize replaces it across the batch. Verification hooks are
-// bypassed so transient placeholder commits neither block on nor repeatedly trigger hooks.
+// Capture one atomic commit on the watcher's configured staging policy: all changes when include_untracked is
+// set, tracked-only otherwise. A thin selector over flush_staged, which holds the shared capture logic.
 pub(crate) fn flush_once(root: &Path, git_dir: &Path, cfg: &Config) -> Flush {
+    let add_arg = if cfg.include_untracked { "-A" } else { "-u" };
+    flush_staged(root, git_dir, add_arg)
+}
+
+// Capture one atomic commit staging every change including untracked files (`git add -A`), irrespective of
+// the include_untracked policy. Used by `exec`, where the operator has explicitly wrapped a command to record
+// its result: a file the command created is part of that intended result even under a tracked-only watcher
+// policy, so it must be staged. The watcher itself never calls this; it honours the configured policy.
+pub(crate) fn flush_all(root: &Path, git_dir: &Path) -> Flush {
+    flush_staged(root, git_dir, "-A")
+}
+
+// Shared capture body. `add_arg` selects the staging breadth (`-A` all, `-u` tracked-only). Preconditions that
+// make committing unsafe or pointless are checked first: an in-progress merge/rebase/etc. stands the capture
+// down, and a held index lock defers. Staging respects .gitignore through git itself; an empty staged diff
+// produces no commit. The placeholder message is intentionally empty; finalize replaces it across the batch.
+// Verification hooks are bypassed so transient placeholder commits neither block on nor repeatedly trigger
+// hooks.
+fn flush_staged(root: &Path, git_dir: &Path, add_arg: &str) -> Flush {
     if git::operation_in_progress(git_dir) {
         return Flush::Skipped("multi-step git operation in progress".to_string());
     }
@@ -116,7 +131,6 @@ pub(crate) fn flush_once(root: &Path, git_dir: &Path, cfg: &Config) -> Flush {
         return Flush::Skipped("index locked by another git process".to_string());
     }
 
-    let add_arg = if cfg.include_untracked { "-A" } else { "-u" };
     if let Err(e) = git::run(root, &["add", add_arg]) {
         return Flush::Failed(format!("stage failed: {e}"));
     }
@@ -169,22 +183,9 @@ fn is_within(path: &Path, base: &Path) -> bool {
 // confirming whether a given change — a patch application, an editor save, a scripted file write — is observed
 // by the watcher at all, as opposed to being lost before the recursive watch was established.
 fn trace_event(event: &notify::Event, external: bool) {
-    let tag = if external {
-        "armed"
-    } else {
-        "ignored (git-internal)"
-    };
-    let paths: Vec<String> = event
-        .paths
-        .iter()
-        .map(|p| p.display().to_string())
-        .collect();
-    log(&format!(
-        "event {:?} [{}] -> {}",
-        event.kind,
-        paths.join(", "),
-        tag
-    ));
+    let tag = if external { "armed" } else { "ignored (git-internal)" };
+    let paths: Vec<String> = event.paths.iter().map(|p| p.display().to_string()).collect();
+    log(&format!("event {:?} [{}] -> {}", event.kind, paths.join(", "), tag));
 }
 
 // Emit a timestamped diagnostic line to the redirected log.

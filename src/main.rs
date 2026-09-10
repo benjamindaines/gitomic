@@ -46,6 +46,16 @@ fn dispatch(args: &[String]) -> Res<()> {
             commands::finish(&cwd, opts.message, opts.numbering)
         }
         "status" => commands::status(&cwd),
+        "exec" | "run" => {
+            let rest = &args[1..];
+            // `-c` as the first token selects shell mode (the remaining tokens form one command string, su
+            // -style); otherwise the tokens are an argv executed directly without a shell.
+            let (shell, argv) = match rest.first().map(String::as_str) {
+                Some("-c") => (true, rest[1..].to_vec()),
+                _ => (false, rest.to_vec()),
+            };
+            commands::exec(&cwd, &argv, shell)
+        }
         "stop" => commands::stop(&cwd),
         "abort" => commands::abort(&cwd, args[1..].iter().any(|a| a == "--force" || a == "-f")),
         "-h" | "--help" | "help" | "" => {
@@ -138,6 +148,10 @@ COMMANDS:
   finish [options]     Stop the watcher and apply one message to every atomic commit in the session,
                        then clear the session. Aliases: commit.
   status               Show the session base, pending atomic-commit count, watcher state, and log path.
+  exec [-c] <cmd...>   Run <cmd> in the work tree, then capture its full effect as one atomic commit,
+                       staging untracked files as well regardless of include_untracked. Requires an active
+                       session. Use for patch/generator commands that create files. `-c` runs a shell
+                       string (su-style); otherwise <cmd> is an argv run without a shell. Aliases: run.
   stop                 Stop the watcher but keep the base and recorded commits for later finish/resume.
   abort [--force]      Discard the session: reset the branch to the base and drop the atomic commits.
   help, --version

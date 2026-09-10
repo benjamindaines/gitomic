@@ -1,0 +1,5 @@
+Setting this _Claude folder up as such:
+
+Files in the top directory are general information
+
+Directories references issues on the repo. If more info is required than the summary, there should be some more available in the thread's comments. 

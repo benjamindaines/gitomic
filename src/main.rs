@@ -46,6 +46,27 @@ fn dispatch(args: &[String]) -> Res<()> {
             commands::finish(&cwd, opts.message, opts.numbering)
         }
         "status" => commands::status(&cwd),
+        "build-safe" => {
+            // Scriptable session gate. Exit code is the primary signal: 0 when no session is open (safe to
+            // build), 1 when a session is open (not safe), 2 on error (e.g. not inside a repository), so a
+            // script can distinguish "session active" from "gitomic could not answer". The words true/false
+            // are printed for capture in a variable unless -q/--quiet is given. This arm sets the process exit
+            // code directly rather than routing through the Ok/Err reporter, since "session open" is a normal
+            // negative answer, not an error to be printed.
+            let quiet = args[1..].iter().any(|a| a == "-q" || a == "--quiet");
+            match commands::build_safe(&cwd) {
+                Ok(safe) => {
+                    if !quiet {
+                        println!("{}", if safe { "true" } else { "false" });
+                    }
+                    std::process::exit(if safe { 0 } else { 1 });
+                }
+                Err(e) => {
+                    eprintln!("gitomic: {e}");
+                    std::process::exit(2);
+                }
+            }
+        }
         "exec" | "run" => {
             let rest = &args[1..];
             // `-c` as the first token selects shell mode (the remaining tokens form one command string, su
@@ -148,6 +169,9 @@ COMMANDS:
   finish [options]     Stop the watcher and apply one message to every atomic commit in the session,
                        then clear the session. Aliases: commit.
   status               Show the session base, pending atomic-commit count, watcher state, and log path.
+  build-safe [-q]      Scriptable session gate for a build script. Prints 'true' when no session is open
+                       (exit 0), 'false' when one is (exit 1); exit 2 on error. -q/--quiet suppresses the
+                       word and returns the exit code only, e.g. 'gitomic build-safe -q || exit 1'.
   exec [-c] <cmd...>   Run <cmd> in the work tree, then capture its full effect as one atomic commit,
                        staging untracked files as well regardless of include_untracked. Requires an active
                        session. Use for patch/generator commands that create files. `-c` runs a shell

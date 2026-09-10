@@ -179,6 +179,17 @@ fn command_label(argv: &[String], _shell: bool) -> String {
     argv.join(" ")
 }
 
+// Whether the repository is free of a gitomic session, i.e. safe to run a build without the watcher sweeping
+// build outputs into the session, or a later finish/resume capturing them. A session is defined by the base
+// marker refs/gitomic/base and is independent of whether the watcher process is currently live: a session that
+// was stopped but not finished still holds the tree in a recording state, so it is reported as not build-safe.
+// Returns true when no base marker exists. Intended as a scriptable gate; the caller maps the boolean to a
+// process exit code.
+pub fn build_safe(cwd: &Path) -> Res<bool> {
+    let root = git::work_tree(cwd)?;
+    Ok(!git::rev_exists(&root, BASE_REF)?)
+}
+
 // Report session state without modifying it.
 pub fn status(cwd: &Path) -> Res<()> {
     let root = git::work_tree(cwd)?;

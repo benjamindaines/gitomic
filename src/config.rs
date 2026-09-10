@@ -19,6 +19,13 @@ pub struct Config {
     // When true, atomic commits stage untracked files as well as modifications (`git add -A`); when false,
     // only tracked-file changes are staged (`git add -u`).
     pub include_untracked: bool,
+    // When true, a watcher-triggered capture whose staged paths exactly match the paths recorded by the most
+    // recent atomic commit in the active session is folded into that commit (`commit --amend`) instead of
+    // starting a new one. This turns repeated debounce cycles that keep returning to the same file(s) into a
+    // single commit, while a capture that touches a different file (or file set) still starts a fresh one.
+    // Does not apply to `exec`, whose capture is a deliberate, explicitly requested result and always stands
+    // on its own.
+    pub coalesce_same_file: bool,
 }
 
 impl Default for Config {
@@ -27,6 +34,7 @@ impl Default for Config {
             debounce_ms: 1000,
             finalize_numbering: false,
             include_untracked: true,
+            coalesce_same_file: true,
         }
     }
 }
@@ -52,7 +60,7 @@ impl Config {
     // but malformed value is an error, so a typo surfaces immediately rather than being silently ignored.
     pub fn load() -> Res<Config> {
         match Self::path() {
-            Some(p) if p.exists() => Self::parse(&fs::read_to_string(&p)?),
+            Some(p) if p.exists() => Self::parse(&fs::read_to_string(p)?),
             _ => Ok(Config::default()),
         }
     }
@@ -81,6 +89,7 @@ impl Config {
                 }
                 "finalize_numbering" => cfg.finalize_numbering = parse_bool(value, lineno + 1)?,
                 "include_untracked" => cfg.include_untracked = parse_bool(value, lineno + 1)?,
+                "coalesce_same_file" => cfg.coalesce_same_file = parse_bool(value, lineno + 1)?,
                 // Reserved for a future always-on multi-repository mode; accepted and ignored so an
                 // aspirational configuration file does not break the current cwd-scoped tool.
                 "watch_dir" => {}
@@ -122,6 +131,7 @@ mod tests {
         assert_eq!(c.debounce_ms, 1000);
         assert!(!c.finalize_numbering);
         assert!(c.include_untracked);
+        assert!(c.coalesce_same_file);
     }
 
     #[test]
@@ -131,11 +141,13 @@ mod tests {
 
     #[test]
     fn overrides_apply() {
-        let text = "debounce_ms = 250\nfinalize_numbering = yes\ninclude_untracked = off\n";
+        let text = "debounce_ms = 250\nfinalize_numbering = yes\ninclude_untracked = off\n\
+                     coalesce_same_file = no\n";
         let c = Config::parse(text).unwrap();
         assert_eq!(c.debounce_ms, 250);
         assert!(c.finalize_numbering);
         assert!(!c.include_untracked);
+        assert!(!c.coalesce_same_file);
     }
 
     #[test]

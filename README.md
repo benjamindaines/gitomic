@@ -15,10 +15,12 @@ A session has two pieces of state, both inspectable with plain git:
 - A background watcher process, identified by a pidfile at `<git-dir>/gitomic/watch.pid`.
 
 `gitomic init` plants the base and forks the watcher. As the work tree settles after each burst of edits, the
-watcher records one commit with an empty placeholder message. `gitomic finish` stops the watcher, collects every
-commit in `base..HEAD`, obtains one message, and rebuilds the batch onto the base with that message applied to
-each commit (original tree and authorship preserved, fresh committer). The branch ref is advanced with a
-compare-and-swap and the base marker is removed.
+watcher records one commit with an empty placeholder message — unless the settled paths are exactly the paths
+recorded by the session's most recent commit, in which case the capture extends that commit instead (see
+`coalesce_same_file` below). `gitomic finish` stops the watcher, collects every commit in `base..HEAD`, obtains
+one message, and rebuilds the batch onto the base with that message applied to each commit (original tree and
+authorship preserved, fresh committer). The branch ref is advanced with a compare-and-swap and the base marker
+is removed.
 
 Because the batch is unpublished, rewriting the messages is safe. The result is N commits carrying the same
 message; each remains individually recoverable by hash and reflog. Enable numbering to append ` [i/N]` so the
@@ -56,12 +58,18 @@ default, so the file is optional. See `gitomic.cfg.example`.
 | `debounce_ms`        | `1000`  | Quiescence window; a burst of edits commits once this long has passed.  |
 | `finalize_numbering` | `false` | Append ` [i/N]` to each finalized message.                              |
 | `include_untracked`  | `true`  | Stage untracked files (`git add -A`) as well as modifications.          |
+| `coalesce_same_file` | `true`  | Extend the prior atomic commit instead of starting a new one when a capture's paths exactly match it. |
 
 ## Behaviour and ~~guarantees~~ Intentions
 (guarantees is a very strong word)
 
 - **Staging respects `.gitignore`** — the watcher uses git's own `add`, and a cycle that stages nothing
   produces no commit.
+- **Consecutive captures of the same file(s) share one commit** — when a debounce cycle's staged paths exactly
+  match the paths of the session's most recent atomic commit, the capture amends that commit rather than
+  starting a new one (`coalesce_same_file`, on by default). Editing a different file, or returning to an
+  earlier file after editing something else, still starts a fresh commit. Not applied to `exec`, whose capture
+  is a deliberate, explicitly requested result and always stands on its own.
 - **The watcher stands down during multi-step operations** — an in-progress merge, rebase, cherry-pick, revert,
   or bisect suspends auto-committing; a held `index.lock` defers to a later cycle.
 - **A detached HEAD is refused at `init`** — finalize needs a branch ref to advance.

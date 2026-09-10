@@ -7,6 +7,11 @@ use std::process::Command;
 
 use crate::Res;
 
+// Ref marking where the current gitomic session began (`base..HEAD` is the pending batch). Shared between
+// commands.rs, which owns the session lifecycle, and watch.rs, which needs to know whether a prior atomic
+// commit already exists in the active session before deciding whether to coalesce into it.
+pub const BASE_REF: &str = "refs/gitomic/base";
+
 // A NUL byte separates fields when a single git invocation must return several values, since commit metadata
 // may contain newlines but never a NUL. The byte is requested via git's %x00 format token so the argument
 // itself stays NUL-free (process arguments cannot contain NUL); git emits the NUL into its output, where it
@@ -159,6 +164,24 @@ pub fn operation_in_progress(git_dir: &Path) -> bool {
         "rebase-apply",
     ];
     MARKERS.iter().any(|m| git_dir.join(m).exists())
+}
+
+// Paths (relative to the work tree) changed by `commit` against its first parent. Used to compare a
+// candidate commit's staged paths with the paths recorded by the most recent atomic commit in the active
+// session, for the same-file coalescing policy in watch.rs. `commit` is expected to have a parent (true for
+// any commit reachable from a session base), so `commit~1` is a valid endpoint.
+pub fn commit_paths(dir: &Path, commit: &str) -> Res<Vec<String>> {
+    let out = run(
+        dir,
+        &["diff", "--name-only", &format!("{commit}~1"), commit],
+    )?;
+    Ok(out.lines().map(|l| l.to_string()).collect())
+}
+
+// Paths (relative to the work tree) currently staged in the index.
+pub fn staged_paths(dir: &Path) -> Res<Vec<String>> {
+    let out = run(dir, &["diff", "--cached", "--name-only"])?;
+    Ok(out.lines().map(|l| l.to_string()).collect())
 }
 
 // True when git holds the index lock, indicating another git process is mid-write. The watcher retries on a

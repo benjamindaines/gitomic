@@ -73,7 +73,9 @@ pub fn init(cwd: &Path, foreground: bool, verbose: bool) -> Res<()> {
         println!("  base:  {}", short(&base));
         println!("  diagnostics stream to this terminal (not the log file) until Ctrl-C.");
         if verbose {
-            println!("  verbose: every file-system event is traced before the git-internal filter.");
+            println!(
+                "  verbose: every file-system event is traced before the git-internal filter."
+            );
         }
         println!("  Ctrl-C stops the watcher; the session and its commits are preserved.");
         proc::install_signal_handlers();

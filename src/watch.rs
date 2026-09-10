@@ -29,22 +29,23 @@ pub fn run(root: &Path, git_dir: &Path, cfg: &Config, verbose: bool) -> Res<()> 
     // the timer. When verbose tracing is enabled, every received event is logged first, before the filter, so
     // the operator sees changes that were ignored as git-internal as well as those that armed the timer.
     let gd = git_dir.clone();
-    let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| match res {
-        Ok(event) => {
-            let external = event.paths.iter().any(|p| !is_within(p, &gd));
-            if verbose {
-                trace_event(&event, external);
+    let mut watcher =
+        notify::recommended_watcher(move |res: notify::Result<notify::Event>| match res {
+            Ok(event) => {
+                let external = event.paths.iter().any(|p| !is_within(p, &gd));
+                if verbose {
+                    trace_event(&event, external);
+                }
+                if external {
+                    let _ = tx.send(());
+                }
             }
-            if external {
-                let _ = tx.send(());
+            Err(e) => {
+                if verbose {
+                    log(&format!("watch error: {e}"));
+                }
             }
-        }
-        Err(e) => {
-            if verbose {
-                log(&format!("watch error: {e}"));
-            }
-        }
-    })?;
+        })?;
     watcher.watch(root, RecursiveMode::Recursive)?;
 
     log(&format!(
@@ -168,9 +169,22 @@ fn is_within(path: &Path, base: &Path) -> bool {
 // confirming whether a given change — a patch application, an editor save, a scripted file write — is observed
 // by the watcher at all, as opposed to being lost before the recursive watch was established.
 fn trace_event(event: &notify::Event, external: bool) {
-    let tag = if external { "armed" } else { "ignored (git-internal)" };
-    let paths: Vec<String> = event.paths.iter().map(|p| p.display().to_string()).collect();
-    log(&format!("event {:?} [{}] -> {}", event.kind, paths.join(", "), tag));
+    let tag = if external {
+        "armed"
+    } else {
+        "ignored (git-internal)"
+    };
+    let paths: Vec<String> = event
+        .paths
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect();
+    log(&format!(
+        "event {:?} [{}] -> {}",
+        event.kind,
+        paths.join(", "),
+        tag
+    ));
 }
 
 // Emit a timestamped diagnostic line to the redirected log.

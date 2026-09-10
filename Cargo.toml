@@ -3,7 +3,7 @@ name = "gitomic"
 version = "0.1.0"
 edition = "2021"
 description = "Session-scoped helper that records atomic commits as a repository changes, then stamps one message across the batch"
-license = "MIT"
+license = "GPL-2"
 
 [[bin]]
 name = "gitomic"

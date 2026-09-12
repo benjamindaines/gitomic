@@ -121,9 +121,11 @@ pub fn init(cwd: &Path, foreground: bool, verbose: bool) -> Res<()> {
 }
 
 // Run a wrapped command to completion in the work tree, then capture its full effect as one atomic commit
-// staging untracked files as well (`git add -A`), irrespective of include_untracked. This is the escape hatch
-// for the tracked-only watcher policy: a patch or generator that creates new files, run under a session with
-// include_untracked=false, would otherwise leave those files unstaged and produce no commit. Wrapping the
+// staging untracked files as well (`git add -A`), irrespective of the configured stage mode. This is the
+// escape hatch for `stage = tracked`: a patch or generator that creates new files, run under a tracked-only
+// session, would otherwise leave those files unstaged and produce no commit. Under the default `stage =
+// observed` a live watcher already captures such files directly (it observes the create), so exec is only
+// needed there to bind a command's whole effect into a single commit with no watcher running. Wrapping the
 // command declares its result as intended history, so the created files are recorded. Requires an active
 // session so the commit joins a batch that `finish` finalizes. The wrapped command's non-zero exit aborts the
 // capture: a patch that does not apply must not be followed by a commit of a partial tree.
@@ -458,9 +460,13 @@ fn terminate_watcher(git_dir: &Path) -> Res<bool> {
 
 // Perform one foreground capture and report its outcome to the operator's terminal. Used by `stop` and
 // `finish` after the watcher is confirmed gone, so the final capture and its result are visible rather than
-// buried in the watcher's redirected log.
+// buried in the watcher's redirected log. Under observed staging the paths the just-stopped watcher saw but
+// had not yet committed are recovered from the state directory and used for this capture, so a change made
+// after the watcher's last debounce cycle — including a rename, whose new half tracked-only staging would drop
+// — is still captured whole. For tracked/all modes the set is consumed and ignored.
 fn report_flush(root: &Path, git_dir: &Path, cfg: &Config) {
-    match watch::flush_once(root, git_dir, cfg) {
+    let observed = watch::take_pending_observed(&state_dir(git_dir));
+    match watch::flush_once(root, git_dir, cfg, &observed) {
         watch::Flush::Committed(sha) if !sha.is_empty() => {
             println!("  captured final change as {sha}")
         }

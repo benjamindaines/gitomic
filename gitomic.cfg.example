@@ -10,9 +10,13 @@ debounce_ms = 1000
 # distinguishable in the log. Overridable per run with --numbering / --no-numbering.
 finalize_numbering = false
 
-# Stage untracked files as well as modifications when recording an atomic commit. false stages only
-# changes to already-tracked files.
-include_untracked = true
+# Staging breadth for an atomic capture: observed | tracked | all.
+#   observed (default) stages only the paths the watcher saw change this cycle, intersected with the paths
+#                      git reports as changed. New files, file-manager renames, and copies that overwrite a
+#                      tracked file are captured; an untracked file the watcher never touched is left alone.
+#   tracked            stages modifications to already-tracked files only (git add -u).
+#   all                stages every change including untracked files (git add -A).
+stage = observed
 
 # Extend the prior atomic commit instead of starting a new one when a capture's staged paths exactly match
 # the paths recorded by the session's most recent commit. Turns a burst of debounce cycles that keeps

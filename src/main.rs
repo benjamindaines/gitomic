@@ -173,9 +173,10 @@ COMMANDS:
                        (exit 0), 'false' when one is (exit 1); exit 2 on error. -q/--quiet suppresses the
                        word and returns the exit code only, e.g. 'gitomic build-safe -q || exit 1'.
   exec [-c] <cmd...>   Run <cmd> in the work tree, then capture its full effect as one atomic commit,
-                       staging untracked files as well regardless of include_untracked. Requires an active
-                       session. Use for patch/generator commands that create files. `-c` runs a shell
-                       string (su-style); otherwise <cmd> is an argv run without a shell. Aliases: run.
+                       staging untracked files as well regardless of the configured stage mode. Requires an
+                       active session. Mainly for `stage = tracked`; under `stage = observed` a live watcher
+                       captures created files directly. `-c` runs a shell string (su-style); otherwise <cmd>
+                       is an argv run without a shell. Aliases: run.
   stop                 Stop the watcher but keep the base and recorded commits for later finish/resume.
   abort [--force]      Discard the session: reset the branch to the base and drop the atomic commits.
   help, --version

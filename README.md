@@ -57,7 +57,7 @@ default, so the file is optional. See `gitomic.cfg.example`.
 |----------------------|---------|-------------------------------------------------------------------------|
 | `debounce_ms`        | `1000`  | Quiescence window; a burst of edits commits once this long has passed.  |
 | `finalize_numbering` | `false` | Append ` [i/N]` to each finalized message.                              |
-| `include_untracked`  | `true`  | Stage untracked files (`git add -A`) as well as modifications.          |
+| `stage`              | `observed` | Staging breadth: `observed` (only the paths the watcher saw change, new/renamed/copy-over included), `tracked` (`git add -u`), or `all` (`git add -A`). |
 | `coalesce_same_file` | `true`  | Extend the prior atomic commit instead of starting a new one when a capture's paths exactly match it. |
 
 ## Behaviour and ~~guarantees~~ Intentions
@@ -65,6 +65,12 @@ default, so the file is optional. See `gitomic.cfg.example`.
 
 - **Staging respects `.gitignore`** — the watcher uses git's own `add`, and a cycle that stages nothing
   produces no commit.
+- **Staging is scoped to what the watcher saw change** — under the default `stage = observed`, a capture stages
+  only the paths that fired events this cycle, intersected with the paths git reports as changed. A file
+  created by a patch, a file-manager rename (delete of the old name plus creation of the new), or a copy that
+  overwrites a tracked file is captured, because the watcher observed it; an untracked file the watcher never
+  touched is left alone rather than swept into the session. `stage = tracked` restricts staging to already-
+  tracked paths (`git add -u`), and `stage = all` stages every change including untracked files (`git add -A`).
 - **Consecutive captures of the same file(s) share one commit** — when a debounce cycle's staged paths exactly
   match the paths of the session's most recent atomic commit, the capture amends that commit rather than
   starting a new one (`coalesce_same_file`, on by default). Editing a different file, or returning to an

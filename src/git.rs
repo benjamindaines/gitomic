@@ -2,8 +2,10 @@
 // .gitignore semantics, and object storage are inherited unchanged. All commands are scoped to an explicit
 // repository directory via `git -C <dir>` rather than relying on the process working directory.
 
+use std::collections::HashSet;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use crate::Res;
 
@@ -182,6 +184,70 @@ pub fn commit_paths(dir: &Path, commit: &str) -> Res<Vec<String>> {
 pub fn staged_paths(dir: &Path) -> Res<Vec<String>> {
     let out = run(dir, &["diff", "--cached", "--name-only"])?;
     Ok(out.lines().map(|l| l.to_string()).collect())
+}
+
+// The set of work-tree-relative paths git reports as changed (porcelain v1, NUL-delimited). Ignored files are
+// omitted by porcelain and unchanged files never appear, so intersecting an observed-path set with this set
+// yields exactly the real, non-ignored changes among the observed paths — the basis of observed staging. A
+// rename or copy record contributes both its destination and its source path, so either half of a rename can
+// match an observed path.
+pub fn status_paths(dir: &Path) -> Res<HashSet<String>> {
+    // -z uses NUL terminators and suppresses path quoting, so paths with spaces or unusual bytes are parsed
+    // verbatim rather than through git's C-style quoting.
+    let out = run(dir, &["status", "--porcelain", "-z"])?;
+    let mut set = HashSet::new();
+    let mut fields = out.split(NUL).filter(|s| !s.is_empty());
+    while let Some(entry) = fields.next() {
+        // Each record is "XY <path>": two status columns, a separator space, then the path.
+        if entry.len() < 4 {
+            continue;
+        }
+        let status = &entry[..2];
+        set.insert(entry[3..].to_string());
+        // A rename/copy record is followed by its source path as a separate NUL-terminated field; consume and
+        // record it so a rename observed as delete+create matches on either name.
+        if status.as_bytes().iter().any(|&b| b == b'R' || b == b'C') {
+            if let Some(src) = fields.next() {
+                set.insert(src.to_string());
+            }
+        }
+    }
+    Ok(set)
+}
+
+// Stage the given work-tree-relative paths as one operation. `-A` breadth within the supplied pathspec records
+// modifications, deletions, and newly created files alike, so a rename observed as a delete plus a create is
+// staged as a rename. Paths are fed NUL-delimited on stdin (`--pathspec-from-file=-` with `--pathspec-file-nul`)
+// to sidestep argument-length limits and any quoting concerns. Callers pass only paths git already reports as
+// changed, so no pathspec fails to match; an empty list is a no-op.
+pub fn add_pathspec(dir: &Path, paths: &[&str]) -> Res<()> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let mut input = String::new();
+    for p in paths {
+        input.push_str(p);
+        input.push(NUL);
+    }
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["add", "-A", "--pathspec-from-file=-", "--pathspec-file-nul"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    {
+        // The pipe is closed by dropping the handle at the end of this block, signalling end-of-input to git.
+        let mut stdin = child.stdin.take().ok_or("git add: stdin unavailable")?;
+        stdin.write_all(input.as_bytes())?;
+    }
+    let out = child.wait_with_output()?;
+    if !out.status.success() {
+        let msg = String::from_utf8_lossy(&out.stderr);
+        return Err(format!("git add (pathspec): {}", msg.trim()).into());
+    }
+    Ok(())
 }
 
 // True when git holds the index lock, indicating another git process is mid-write. The watcher retries on a

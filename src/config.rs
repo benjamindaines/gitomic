@@ -8,6 +8,19 @@ use std::path::PathBuf;
 
 use crate::Res;
 
+// Staging breadth for a watcher capture. See the `stage` field on Config for the meaning of each variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StageMode {
+    // Stage only the paths the watcher observed changing this cycle, intersected with the paths git reports
+    // as actually changed. New, renamed, and copy-over files are captured; untracked files the watcher never
+    // saw are left alone.
+    Observed,
+    // Stage modifications to already-tracked paths only (`git add -u`).
+    Tracked,
+    // Stage every change including untracked files (`git add -A`).
+    All,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     // Quiescence window in milliseconds. A batch of file-system events is committed once no further event has
@@ -16,9 +29,12 @@ pub struct Config {
     // When true, finalize appends " [i/N]" to each commit message so that otherwise identical messages remain
     // distinguishable in `git log`. When false, every commit in the batch receives the identical message.
     pub finalize_numbering: bool,
-    // When true, atomic commits stage untracked files as well as modifications (`git add -A`); when false,
-    // only tracked-file changes are staged (`git add -u`).
-    pub include_untracked: bool,
+    // Staging breadth for an atomic capture. `Observed` (the default) stages only the paths the watcher saw
+    // change this cycle, intersected with the paths git reports as actually changed, so new, renamed, and
+    // copy-over files are captured while untracked files the watcher never saw are left alone. `Tracked`
+    // stages modifications to already-tracked paths only (`git add -u`). `All` stages every change including
+    // untracked files (`git add -A`).
+    pub stage: StageMode,
     // When true, a watcher-triggered capture whose staged paths exactly match the paths recorded by the most
     // recent atomic commit in the active session is folded into that commit (`commit --amend`) instead of
     // starting a new one. This turns repeated debounce cycles that keep returning to the same file(s) into a
@@ -33,7 +49,7 @@ impl Default for Config {
         Config {
             debounce_ms: 1000,
             finalize_numbering: false,
-            include_untracked: true,
+            stage: StageMode::Observed,
             coalesce_same_file: true,
         }
     }
@@ -88,7 +104,7 @@ impl Config {
                     })?;
                 }
                 "finalize_numbering" => cfg.finalize_numbering = parse_bool(value, lineno + 1)?,
-                "include_untracked" => cfg.include_untracked = parse_bool(value, lineno + 1)?,
+                "stage" => cfg.stage = parse_stage(value, lineno + 1)?,
                 "coalesce_same_file" => cfg.coalesce_same_file = parse_bool(value, lineno + 1)?,
                 // Reserved for a future always-on multi-repository mode; accepted and ignored so an
                 // aspirational configuration file does not break the current cwd-scoped tool.
@@ -121,6 +137,20 @@ fn parse_bool(value: &str, lineno: usize) -> Res<bool> {
     }
 }
 
+// Parse the staging mode. Accepts observed/tracked/all, case-insensitively.
+fn parse_stage(value: &str, lineno: usize) -> Res<StageMode> {
+    match value.to_ascii_lowercase().as_str() {
+        "observed" => Ok(StageMode::Observed),
+        "tracked" => Ok(StageMode::Tracked),
+        "all" => Ok(StageMode::All),
+        _ => Err(format!(
+            "gitomic.cfg line {}: stage must be observed, tracked, or all",
+            lineno
+        )
+        .into()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -130,7 +160,7 @@ mod tests {
         let c = Config::default();
         assert_eq!(c.debounce_ms, 1000);
         assert!(!c.finalize_numbering);
-        assert!(c.include_untracked);
+        assert_eq!(c.stage, StageMode::Observed);
         assert!(c.coalesce_same_file);
     }
 
@@ -141,13 +171,34 @@ mod tests {
 
     #[test]
     fn overrides_apply() {
-        let text = "debounce_ms = 250\nfinalize_numbering = yes\ninclude_untracked = off\n\
+        let text = "debounce_ms = 250\nfinalize_numbering = yes\nstage = tracked\n\
                      coalesce_same_file = no\n";
         let c = Config::parse(text).unwrap();
         assert_eq!(c.debounce_ms, 250);
         assert!(c.finalize_numbering);
-        assert!(!c.include_untracked);
+        assert_eq!(c.stage, StageMode::Tracked);
         assert!(!c.coalesce_same_file);
+    }
+
+    #[test]
+    fn stage_modes_parse() {
+        assert_eq!(
+            Config::parse("stage = observed\n").unwrap().stage,
+            StageMode::Observed
+        );
+        assert_eq!(
+            Config::parse("stage = tracked\n").unwrap().stage,
+            StageMode::Tracked
+        );
+        assert_eq!(
+            Config::parse("stage = ALL\n").unwrap().stage,
+            StageMode::All
+        );
+    }
+
+    #[test]
+    fn invalid_stage_is_rejected() {
+        assert!(Config::parse("stage = sometimes\n").is_err());
     }
 
     #[test]

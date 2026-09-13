@@ -1,30 +1,28 @@
 // Command implementations. Each entry point resolves the target repository from the working directory, then
-// operates through the git wrappers and process-control helpers. Session state is two artefacts: the ref
-// refs/gitomic/base marking where the session began, and a pidfile under <git-dir>/gitomic identifying the
-// live watcher. Their presence or absence fully describes the session, so recovery after an unclean exit is a
-// matter of inspecting them rather than reconstructing hidden state.
+// operates through the git wrappers and process-control helpers. Session state is two artefacts per branch:
+// the ref refs/gitomic/base/<branch> marking where that branch's session began, and a pidfile under
+// <git-dir>/gitomic/<branch> identifying that branch's live watcher (issue #4). Their presence or absence
+// fully describes the session, so recovery after an unclean exit is a matter of inspecting them rather than
+// reconstructing hidden state. Every command below infers its target branch from the checked-out HEAD, so
+// `finish`/`stop`/`abort`/`exec`/`build-safe` act on the session for whichever branch is currently checked
+// out; `status` is the exception and reports every branch with an open session, since inspecting a session
+// that is not currently checked out is exactly the case per-branch scoping is meant to make safe.
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 use crate::config::Config;
+use crate::git::state_dir;
 use crate::proc::{self, Fork};
 use crate::{git, watch, Res};
 
-const BASE_REF: &str = git::BASE_REF;
-
-// Directory holding gitomic's per-repository state (pidfile, log, finalize template).
-fn state_dir(git_dir: &Path) -> PathBuf {
-    git_dir.join("gitomic")
-}
-
-// The pid of a live watcher for this repository, or None when no watcher is running. A pidfile whose process
+// The pid of a live watcher for `branch`, or None when no watcher is running for it. A pidfile whose process
 // has died is treated as absent, so a crash leaves no lingering "running" illusion.
-fn live_watcher(git_dir: &Path) -> Option<i32> {
-    let pid = proc::read_pid(&state_dir(git_dir))?;
+fn live_watcher(git_dir: &Path, branch: &str) -> Option<i32> {
+    let pid = proc::read_pid(&state_dir(git_dir, branch))?;
     if proc::alive(pid) {
         Some(pid)
     } else {
@@ -38,21 +36,23 @@ fn live_watcher(git_dir: &Path) -> Option<i32> {
 pub fn init(cwd: &Path, foreground: bool, verbose: bool) -> Res<()> {
     let root = git::work_tree(cwd)?;
     let git_dir = git::git_dir(cwd)?;
-    let sdir = state_dir(&git_dir);
-    git::current_branch(&root)?; // rejects a detached HEAD before any state is written
+    let branch = git::current_branch(&root)?; // rejects a detached HEAD before any state is written
+    let sdir = state_dir(&git_dir, &branch);
+    let base_ref = git::base_ref(&branch);
+    reject_legacy_session(&root)?;
 
-    if let Some(pid) = live_watcher(&git_dir) {
+    if let Some(pid) = live_watcher(&git_dir, &branch) {
         println!(
-            "gitomic: watcher already running (pid {pid}) for {}",
+            "gitomic: watcher already running (pid {pid}) for {} [{branch}]",
             root.display()
         );
         return Ok(());
     }
 
-    let resuming = git::rev_exists(&root, BASE_REF)?;
+    let resuming = git::rev_exists(&root, &base_ref)?;
     if !resuming {
         let head = git::rev_parse(&root, "HEAD")?;
-        git::update_ref(&root, BASE_REF, &head, "gitomic init")?;
+        git::update_ref(&root, &base_ref, &head, "gitomic init")?;
     }
 
     let cfg = Config::load()?;
@@ -67,9 +67,12 @@ pub fn init(cwd: &Path, foreground: bool, verbose: bool) -> Res<()> {
         // watcher; it is cleared on exit. Termination is by SIGINT (Ctrl-C) or a SIGTERM from `finish`/`stop`,
         // both of which the installed handler turns into a clean loop exit; the session base and recorded
         // atomic commits are preserved for a subsequent `finish` or `init` exactly as in the detached case.
-        let base = git::rev_parse(&root, BASE_REF)?;
+        let base = git::rev_parse(&root, &base_ref)?;
         let verb = if resuming { "resumed" } else { "started" };
-        println!("gitomic: foreground session {verb} for {}", root.display());
+        println!(
+            "gitomic: foreground session {verb} for {} [{branch}]",
+            root.display()
+        );
         println!("  base:  {}", short(&base));
         println!("  diagnostics stream to this terminal (not the log file) until Ctrl-C.");
         if verbose {
@@ -80,7 +83,7 @@ pub fn init(cwd: &Path, foreground: bool, verbose: bool) -> Res<()> {
         println!("  Ctrl-C stops the watcher; the session and its commits are preserved.");
         proc::install_signal_handlers();
         proc::write_pid(&sdir)?;
-        let res = watch::run(&root, &git_dir, &cfg, verbose);
+        let res = watch::run(&root, &git_dir, &branch, &cfg, verbose);
         proc::clear_pid(&sdir);
         res?;
         return Ok(());
@@ -88,13 +91,13 @@ pub fn init(cwd: &Path, foreground: bool, verbose: bool) -> Res<()> {
 
     match proc::daemonize()? {
         Fork::Parent => {
-            let started = wait_for_watcher(&git_dir, Duration::from_secs(3));
-            let base = git::rev_parse(&root, BASE_REF)?;
+            let started = wait_for_watcher(&git_dir, &branch, Duration::from_secs(3));
+            let base = git::rev_parse(&root, &base_ref)?;
             let verb = if resuming { "resumed" } else { "started" };
-            println!("gitomic: session {verb} for {}", root.display());
+            println!("gitomic: session {verb} for {} [{branch}]", root.display());
             println!("  base:  {}", short(&base));
             if started {
-                if let Some(pid) = live_watcher(&git_dir) {
+                if let Some(pid) = live_watcher(&git_dir, &branch) {
                     println!("  watcher pid: {pid}");
                 }
             } else {
@@ -112,7 +115,7 @@ pub fn init(cwd: &Path, foreground: bool, verbose: bool) -> Res<()> {
             proc::redirect_stdio(&proc::logfile(&sdir))?;
             proc::install_signal_handlers();
             if proc::write_pid(&sdir).is_ok() {
-                let _ = watch::run(&root, &git_dir, &cfg, verbose);
+                let _ = watch::run(&root, &git_dir, &branch, &cfg, verbose);
             }
             proc::clear_pid(&sdir);
             std::process::exit(0);
@@ -132,12 +135,16 @@ pub fn init(cwd: &Path, foreground: bool, verbose: bool) -> Res<()> {
 pub fn exec(cwd: &Path, argv: &[String], shell: bool) -> Res<()> {
     let root = git::work_tree(cwd)?;
     let git_dir = git::git_dir(cwd)?;
+    let branch = git::current_branch(&root)?;
 
     if argv.is_empty() {
         return Err("exec: no command given".into());
     }
-    if !git::rev_exists(&root, BASE_REF)? {
-        return Err("exec: no active session; run 'gitomic init' first so the captured change joins a batch".into());
+    if !git::rev_exists(&root, &git::base_ref(&branch))? {
+        return Err(format!(
+            "exec: no active session on '{branch}'; run 'gitomic init' first so the captured change joins a batch"
+        )
+        .into());
     }
 
     let label = command_label(argv, shell);
@@ -183,38 +190,84 @@ fn command_label(argv: &[String], _shell: bool) -> String {
     argv.join(" ")
 }
 
-// Whether the repository is free of a gitomic session, i.e. safe to run a build without the watcher sweeping
-// build outputs into the session, or a later finish/resume capturing them. A session is defined by the base
-// marker refs/gitomic/base and is independent of whether the watcher process is currently live: a session that
-// was stopped but not finished still holds the tree in a recording state, so it is reported as not build-safe.
-// Returns true when no base marker exists. Intended as a scriptable gate; the caller maps the boolean to a
-// process exit code.
+// Whether the checked-out branch is free of a gitomic session, i.e. safe to run a build without that branch's
+// watcher sweeping build outputs into the session, or a later finish/resume capturing them. A session is
+// defined by that branch's base marker and is independent of whether the watcher process is currently live: a
+// session that was stopped but not finished still holds the tree in a recording state, so it is reported as
+// not build-safe. Scoped to the checked-out branch rather than the whole repository: another branch's open
+// session cannot touch the current work tree, since its watcher stands down whenever that branch is not the
+// one checked out (see watch::run). Detached HEAD is reported safe unconditionally, since `init` refuses to
+// start a session without a named branch, so none can exist there. Intended as a scriptable gate; the caller
+// maps the boolean to a process exit code.
 pub fn build_safe(cwd: &Path) -> Res<bool> {
     let root = git::work_tree(cwd)?;
-    Ok(!git::rev_exists(&root, BASE_REF)?)
+    match git::current_branch(&root) {
+        Ok(branch) => Ok(!git::rev_exists(&root, &git::base_ref(&branch))?),
+        Err(_) => Ok(true),
+    }
 }
 
-// Report session state without modifying it.
+// Report every branch holding an open session, without modifying anything. Unlike the other commands, status
+// is not scoped to the checked-out branch: with one watcher per branch (issue #4), a session can sit open and
+// untouched on a branch that is not currently checked out, and that is exactly the case an operator most needs
+// surfaced rather than hidden behind whichever branch they happen to be on right now.
 pub fn status(cwd: &Path) -> Res<()> {
     let root = git::work_tree(cwd)?;
     let git_dir = git::git_dir(cwd)?;
-    let sdir = state_dir(&git_dir);
+    let current = git::current_branch(&root).ok(); // None on detached HEAD; other branches' sessions still list
+    let branches = git::session_branches(&root)?;
+    let legacy = git::rev_exists(&root, git::LEGACY_BASE_REF)?;
 
-    if !git::rev_exists(&root, BASE_REF)? {
+    if branches.is_empty() {
         println!("gitomic: no active session in {}", root.display());
-        return Ok(());
+    } else {
+        let plural = if branches.len() == 1 { "" } else { "s" };
+        println!(
+            "gitomic: {} session{plural} open in {}",
+            branches.len(),
+            root.display()
+        );
+        for branch in &branches {
+            let base_ref = git::base_ref(branch);
+            let base = git::rev_parse(&root, &base_ref)?;
+            // The branch's own tip, not HEAD: a session's commits land there only while that branch is
+            // checked out, but this report must be meaningful for a branch that currently is not.
+            let pending = git::count(&root, &format!("{base_ref}..refs/heads/{branch}"))?;
+            let marker = if current.as_deref() == Some(branch.as_str()) {
+                " (current)"
+            } else {
+                ""
+            };
+            println!("  {branch}{marker}");
+            println!("    base:            {}", short(&base));
+            println!("    pending commits: {pending}");
+            match live_watcher(&git_dir, branch) {
+                Some(pid) => println!("    watcher:         running (pid {pid})"),
+                None => println!("    watcher:         stopped"),
+            }
+            println!(
+                "    log:             {}",
+                proc::logfile(&state_dir(&git_dir, branch)).display()
+            );
+        }
     }
 
-    let base = git::rev_parse(&root, BASE_REF)?;
-    let pending = git::count(&root, &format!("{BASE_REF}..HEAD"))?;
-    println!("gitomic: session active in {}", root.display());
-    println!("  base:              {}", short(&base));
-    println!("  pending commits:   {pending}");
-    match live_watcher(&git_dir) {
-        Some(pid) => println!("  watcher:           running (pid {pid})"),
-        None => println!("  watcher:           stopped"),
+    if legacy {
+        let base = git::rev_parse(&root, git::LEGACY_BASE_REF)?;
+        println!(
+            "  legacy session marker present (pre-#4 fix, base {}):",
+            short(&base)
+        );
+        println!(
+            "    not used by this version; inspect with 'git log {}..HEAD' against whichever",
+            git::LEGACY_BASE_REF
+        );
+        println!(
+            "    branch it was recorded against, then remove with 'git update-ref -d {}'",
+            git::LEGACY_BASE_REF
+        );
+        println!("    once any pending work is recovered.");
     }
-    println!("  log:               {}", proc::logfile(&sdir).display());
     Ok(())
 }
 
@@ -223,20 +276,28 @@ pub fn status(cwd: &Path) -> Res<()> {
 pub fn stop(cwd: &Path) -> Res<()> {
     let root = git::work_tree(cwd)?;
     let git_dir = git::git_dir(cwd)?;
+    let branch = git::current_branch(&root)?;
+    let base_ref = git::base_ref(&branch);
     let cfg = Config::load()?;
 
-    let stopped = terminate_watcher(&git_dir)?;
+    let stopped = terminate_watcher(&git_dir, &branch)?;
     if !stopped {
-        println!("gitomic: no watcher running in {}", root.display());
+        println!(
+            "gitomic: no watcher running for '{branch}' in {}",
+            root.display()
+        );
     } else {
-        println!("gitomic: watcher stopped in {}", root.display());
+        println!(
+            "gitomic: watcher stopped for '{branch}' in {}",
+            root.display()
+        );
     }
     // Foreground capture of any change observed after the watcher's last debounce cycle, run only once the
     // watcher is confirmed gone so the two never contend for the index. Skipped when no session is active,
     // since there is no base against which the recorded commit would be finalized.
-    if git::rev_exists(&root, BASE_REF)? {
-        report_flush(&root, &git_dir, &cfg);
-        let pending = git::count(&root, &format!("{BASE_REF}..HEAD"))?;
+    if git::rev_exists(&root, &base_ref)? {
+        report_flush(&root, &git_dir, &branch, &cfg);
+        let pending = git::count(&root, &format!("{base_ref}..HEAD"))?;
         println!("  {pending} atomic commit(s) preserved; run 'gitomic finish' to finalize or 'gitomic init' to resume");
     }
     Ok(())
@@ -253,17 +314,22 @@ pub fn stop(cwd: &Path) -> Res<()> {
 pub fn abort(cwd: &Path, force: bool) -> Res<()> {
     let root = git::work_tree(cwd)?;
     let git_dir = git::git_dir(cwd)?;
+    let branch = git::current_branch(&root)?;
+    let base_ref = git::base_ref(&branch);
 
-    if !git::rev_exists(&root, BASE_REF)? {
-        println!("gitomic: no active session in {}", root.display());
+    if !git::rev_exists(&root, &base_ref)? {
+        println!(
+            "gitomic: no active session for '{branch}' in {}",
+            root.display()
+        );
         return Ok(());
     }
-    let base = git::rev_parse(&root, BASE_REF)?;
-    let pending = git::count(&root, &format!("{BASE_REF}..HEAD"))?;
+    let base = git::rev_parse(&root, &base_ref)?;
+    let pending = git::count(&root, &format!("{base_ref}..HEAD"))?;
 
     if !force {
         println!(
-            "gitomic: abort would move {} back to {} and discard {pending} atomic commit(s).",
+            "gitomic: abort would move {} back to {} and discard {pending} atomic commit(s) on '{branch}'.",
             root.display(),
             short(&base)
         );
@@ -274,16 +340,16 @@ pub fn abort(cwd: &Path, force: bool) -> Res<()> {
         return Ok(());
     }
 
-    terminate_watcher(&git_dir)?;
+    terminate_watcher(&git_dir, &branch)?;
     // A mixed reset moves the branch and index to the base while leaving every working-tree file in place, so
     // no file on disk is deleted by the abort. A hard reset would remove files that exist only in the
     // discarded commits. No final capture is performed: the session is being discarded, so committing the
     // last changes only to reset past them would be pointless.
     git::run(&root, &["reset", "--mixed", &base])?;
-    git::delete_ref(&root, BASE_REF)?;
-    proc::clear_pid(&state_dir(&git_dir));
+    git::delete_ref(&root, &base_ref)?;
+    proc::clear_pid(&state_dir(&git_dir, &branch));
     println!(
-        "gitomic: session aborted; {} reset to {}",
+        "gitomic: session aborted; {} reset to {} on '{branch}'",
         root.display(),
         short(&base)
     );
@@ -295,27 +361,31 @@ pub fn abort(cwd: &Path, force: bool) -> Res<()> {
 pub fn finish(cwd: &Path, message: Option<String>, numbering_override: Option<bool>) -> Res<()> {
     let root = git::work_tree(cwd)?;
     let git_dir = git::git_dir(cwd)?;
-    let sdir = state_dir(&git_dir);
+    let branch = git::current_branch(&root)?;
+    let sdir = state_dir(&git_dir, &branch);
+    let base_ref = git::base_ref(&branch);
     let cfg = Config::load()?;
 
-    if !git::rev_exists(&root, BASE_REF)? {
-        println!("gitomic: no active session in {}", root.display());
+    if !git::rev_exists(&root, &base_ref)? {
+        println!(
+            "gitomic: no active session for '{branch}' in {}",
+            root.display()
+        );
         return Ok(());
     }
 
-    terminate_watcher(&git_dir)?;
+    terminate_watcher(&git_dir, &branch)?;
     // Foreground capture before the batch is enumerated, so a change made after the watcher's last cycle is
     // included in the finalized batch rather than lost. Visible to the operator, unlike the former in-watcher
     // shutdown flush.
-    report_flush(&root, &git_dir, &cfg);
+    report_flush(&root, &git_dir, &branch, &cfg);
 
-    let branch = git::current_branch(&root)?;
-    let base = git::rev_parse(&root, BASE_REF)?;
+    let base = git::rev_parse(&root, &base_ref)?;
     let head = git::rev_parse(&root, "HEAD")?;
-    let commits = git::rev_list_reverse(&root, &format!("{BASE_REF}..HEAD"))?;
+    let commits = git::rev_list_reverse(&root, &format!("{base_ref}..HEAD"))?;
 
     if commits.is_empty() {
-        git::delete_ref(&root, BASE_REF)?;
+        git::delete_ref(&root, &base_ref)?;
         proc::clear_pid(&sdir);
         println!("gitomic: no atomic commits recorded this session; session cleared");
         return Ok(());
@@ -339,7 +409,7 @@ pub fn finish(cwd: &Path, message: Option<String>, numbering_override: Option<bo
         &head,
         "gitomic finalize",
     )?;
-    git::delete_ref(&root, BASE_REF)?;
+    git::delete_ref(&root, &base_ref)?;
     proc::clear_pid(&sdir);
 
     println!(
@@ -423,8 +493,8 @@ fn template(commits: &[String]) -> String {
 // watcher is still live. Confirming the watcher has exited before returning is what lets a caller safely run a
 // subsequent reset without racing a live watcher over the index. A genuinely wedged watcher is interrupted by
 // the operator (Ctrl-C) rather than by a timer.
-fn terminate_watcher(git_dir: &Path) -> Res<bool> {
-    let sdir = state_dir(git_dir);
+fn terminate_watcher(git_dir: &Path, branch: &str) -> Res<bool> {
+    let sdir = state_dir(git_dir, branch);
     let pid = match proc::read_pid(&sdir) {
         Some(p) => p,
         None => return Ok(false),
@@ -464,9 +534,9 @@ fn terminate_watcher(git_dir: &Path) -> Res<bool> {
 // had not yet committed are recovered from the state directory and used for this capture, so a change made
 // after the watcher's last debounce cycle — including a rename, whose new half tracked-only staging would drop
 // — is still captured whole. For tracked/all modes the set is consumed and ignored.
-fn report_flush(root: &Path, git_dir: &Path, cfg: &Config) {
-    let observed = watch::take_pending_observed(&state_dir(git_dir));
-    match watch::flush_once(root, git_dir, cfg, &observed) {
+fn report_flush(root: &Path, git_dir: &Path, branch: &str, cfg: &Config) {
+    let observed = watch::take_pending_observed(&state_dir(git_dir, branch));
+    match watch::flush_once(root, git_dir, &git::base_ref(branch), cfg, &observed) {
         watch::Flush::Committed(sha) if !sha.is_empty() => {
             println!("  captured final change as {sha}")
         }
@@ -478,15 +548,36 @@ fn report_flush(root: &Path, git_dir: &Path, cfg: &Config) {
 }
 
 // Poll for a freshly forked watcher to publish its pidfile and become live, up to `deadline`.
-fn wait_for_watcher(git_dir: &Path, deadline: Duration) -> bool {
+fn wait_for_watcher(git_dir: &Path, branch: &str, deadline: Duration) -> bool {
     let start = Instant::now();
     while start.elapsed() < deadline {
-        if live_watcher(git_dir).is_some() {
+        if live_watcher(git_dir, branch).is_some() {
             return true;
         }
         sleep(Duration::from_millis(50));
     }
     false
+}
+
+// Guard against starting a per-branch session while a pre-#4 unscoped session marker is still present. The two
+// ref schemes cannot coexist on disk (see git::LEGACY_BASE_REF), so proceeding would otherwise fail on a raw
+// ref-conflict error from `update-ref` with no indication of what it means or how to resolve it.
+fn reject_legacy_session(root: &Path) -> Res<()> {
+    if !git::rev_exists(root, git::LEGACY_BASE_REF)? {
+        return Ok(());
+    }
+    let base = git::rev_parse(root, git::LEGACY_BASE_REF)?;
+    let pending = git::count(root, &format!("{}..HEAD", git::LEGACY_BASE_REF))?;
+    Err(format!(
+        "a pre-branch-scoped session marker exists ({}, base {}, {pending} pending commit(s) against the \
+         branch it was recorded on). Recover any pending work — 'git log {}..HEAD' shows the commits — then \
+         remove the marker with 'git update-ref -d {}' before starting a new session.",
+        git::LEGACY_BASE_REF,
+        short(&base),
+        git::LEGACY_BASE_REF,
+        git::LEGACY_BASE_REF
+    )
+    .into())
 }
 
 // Abbreviate an object id for display, matching git's conventional short length.

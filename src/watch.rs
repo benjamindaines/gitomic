@@ -9,6 +9,15 @@
 // originating inside the git directory are discarded to prevent a feedback loop, since committing itself
 // writes to that directory. On a shutdown signal the watcher does not commit; it persists any observed-but-
 // uncommitted paths so the foreground `finish`/`stop` capture can stage them, then exits.
+//
+// Each watcher is bound to the branch it was started for (issue #4). A single work tree can only have one
+// branch checked out at a time, so a mid-session `git checkout`/`git switch` is detected, not prevented: on
+// every debounce-elapsed cycle and on shutdown, the watcher compares the currently checked-out branch against
+// its own and stands down (skips the capture, or drops rather than persists observed-but-uncommitted paths)
+// whenever they differ, rather than blindly committing onto whatever branch happens to be current. Running
+// `gitomic init` again on the newly checked-out branch starts (or resumes) that branch's own watcher with its
+// own pidfile and base marker; switching back makes the original watcher active again with no re-init needed,
+// since it never stopped polling — it was only refusing to act while its branch was not the one checked out.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -25,10 +34,12 @@ use crate::{git, proc, Res};
 const POLL: Duration = Duration::from_millis(200);
 
 // Run the watch loop until a shutdown signal arrives. `root` is the work tree, `git_dir` the repository's git
-// directory. Diagnostics are written to the already-redirected stdout/stderr.
-pub fn run(root: &Path, git_dir: &Path, cfg: &Config, verbose: bool) -> Res<()> {
+// directory, `branch` the branch this watcher's session belongs to (the branch checked out when `gitomic init`
+// started it). Diagnostics are written to the already-redirected stdout/stderr.
+pub fn run(root: &Path, git_dir: &Path, branch: &str, cfg: &Config, verbose: bool) -> Res<()> {
     let debounce = Duration::from_millis(cfg.debounce_ms);
     let git_dir = git_dir.to_path_buf();
+    let base_ref = git::base_ref(branch);
 
     let (tx, rx) = channel::<Vec<PathBuf>>();
     // The event handler forwards the external paths each event names; the debounce timer, not the event
@@ -61,10 +72,10 @@ pub fn run(root: &Path, git_dir: &Path, cfg: &Config, verbose: bool) -> Res<()> 
             }
         })?;
     watcher.watch(root, RecursiveMode::Recursive)?;
-    let sdir = state_dir(&git_dir);
+    let sdir = git::state_dir(&git_dir, branch);
 
     log(&format!(
-        "watching {} (debounce {} ms)",
+        "watching {} for branch '{branch}' (debounce {} ms)",
         root.display(),
         cfg.debounce_ms
     ));
@@ -81,8 +92,14 @@ pub fn run(root: &Path, git_dir: &Path, cfg: &Config, verbose: bool) -> Res<()> 
             // visible to the operator and no in-flight staging blocks the watcher's exit. This keeps watcher
             // shutdown bounded by at most one already-running commit cycle rather than by a fresh flush of the
             // whole tree. The observed-but-uncommitted set is handed to that foreground capture through the
-            // state directory; an empty set clears any stale file from a prior session.
-            if observed.is_empty() {
+            // state directory; an empty set clears any stale file from a prior session. If the checked-out
+            // branch no longer matches this watcher's branch, whatever was observed happened while this
+            // session was not the active one and belongs to no capture of this watcher's — it is dropped
+            // rather than persisted, the same as an empty set.
+            let on_branch = git::current_branch(root)
+                .map(|c| c == branch)
+                .unwrap_or(false);
+            if !on_branch || observed.is_empty() {
                 let _ = std::fs::remove_file(pending_observed_path(&sdir));
             } else {
                 persist_pending_observed(&sdir, &observed);
@@ -108,10 +125,25 @@ pub fn run(root: &Path, git_dir: &Path, cfg: &Config, verbose: bool) -> Res<()> 
         }
         if let Some(t) = last_event {
             if t.elapsed() >= debounce {
-                if verbose {
-                    log("debounce window elapsed; running commit cycle");
+                // A mid-session `checkout`/`switch` away from this watcher's branch must not commit onto
+                // whatever branch is now checked out (issue #4's root cause). Observed paths from a mismatched
+                // period describe changes on someone else's branch or session and are simply discarded, not
+                // captured under any base; capture resumes automatically once `branch` is checked out again.
+                match git::current_branch(root) {
+                    Ok(cur) if cur == branch => {
+                        if verbose {
+                            log("debounce window elapsed; running commit cycle");
+                        }
+                        commit_cycle(root, &git_dir, &base_ref, cfg, verbose, &observed);
+                    }
+                    Ok(cur) => log(&format!(
+                        "checked-out branch is '{cur}', this session is for '{branch}'; skipping capture until \
+                         '{branch}' is checked out again"
+                    )),
+                    Err(_) => log(&format!(
+                        "HEAD is detached; this session is for '{branch}'; skipping capture"
+                    )),
                 }
-                commit_cycle(root, &git_dir, cfg, verbose, &observed);
                 observed.clear();
                 last_event = None;
             }
@@ -131,11 +163,6 @@ fn record_observed(observed: &mut BTreeSet<String>, root: &Path, paths: Vec<Path
             }
         }
     }
-}
-
-// The state directory holding gitomic's per-repository files, mirroring commands.rs::state_dir.
-fn state_dir(git_dir: &Path) -> PathBuf {
-    git_dir.join("gitomic")
 }
 
 // File under the state directory holding paths observed but not yet committed when the watcher exits.
@@ -202,6 +229,7 @@ enum Breadth<'a> {
 pub(crate) fn flush_once(
     root: &Path,
     git_dir: &Path,
+    base_ref: &str,
     cfg: &Config,
     observed: &BTreeSet<String>,
 ) -> Flush {
@@ -210,7 +238,7 @@ pub(crate) fn flush_once(
         StageMode::Tracked => Breadth::Tracked,
         StageMode::All => Breadth::All,
     };
-    flush_staged(root, git_dir, breadth, cfg.coalesce_same_file)
+    flush_staged(root, git_dir, base_ref, breadth, cfg.coalesce_same_file)
 }
 
 // Capture one atomic commit staging every change including untracked files (`git add -A`), irrespective of the
@@ -218,9 +246,10 @@ pub(crate) fn flush_once(
 // result: a file the command created is part of that intended result, so it must be staged. The watcher itself
 // never calls this; it honours the configured policy. Same-file coalescing is never applied here: an exec
 // capture is a deliberate, explicitly requested result and always stands on its own, whether or not it happens
-// to touch the same paths as the preceding commit.
+// to touch the same paths as the preceding commit. Coalescing is off, so no base ref is needed to evaluate it;
+// the empty string is passed and never read (see flush_staged).
 pub(crate) fn flush_all(root: &Path, git_dir: &Path) -> Flush {
-    flush_staged(root, git_dir, Breadth::All, false)
+    flush_staged(root, git_dir, "", Breadth::All, false)
 }
 
 // Stage the paths the watcher observed changing this cycle, intersected with the paths git reports as actually
@@ -253,7 +282,15 @@ fn stage_observed(root: &Path, observed: &BTreeSet<String>) -> Res<()> {
 // git itself; an empty staged diff produces no commit. The placeholder message is intentionally empty;
 // finalize replaces it across the batch. Verification hooks are bypassed so transient placeholder commits
 // neither block on nor repeatedly trigger hooks.
-fn flush_staged(root: &Path, git_dir: &Path, breadth: Breadth, coalesce: bool) -> Flush {
+// `base_ref` names the active session's base marker, used only when `coalesce` is true (see
+// same_paths_as_last_commit); a caller that never coalesces (flush_all) may pass an empty string.
+fn flush_staged(
+    root: &Path,
+    git_dir: &Path,
+    base_ref: &str,
+    breadth: Breadth,
+    coalesce: bool,
+) -> Flush {
     if git::operation_in_progress(git_dir) {
         return Flush::Skipped("multi-step git operation in progress".to_string());
     }
@@ -276,7 +313,7 @@ fn flush_staged(root: &Path, git_dir: &Path, breadth: Breadth, coalesce: bool) -
         Err(e) => return Flush::Failed(format!("diff check failed: {e}")),
     }
 
-    if coalesce && same_paths_as_last_commit(root) {
+    if coalesce && same_paths_as_last_commit(root, base_ref) {
         return match git::run(
             root,
             &[
@@ -312,8 +349,8 @@ fn flush_staged(root: &Path, git_dir: &Path, breadth: Breadth, coalesce: bool) -
 // is nothing yet to coalesce into: no active session, or HEAD still sitting at the session base with no prior
 // atomic commit. Any failure to read git state is treated as "not a match" so coalescing degrades to the
 // always-safe behaviour of a fresh commit rather than guessing.
-fn same_paths_as_last_commit(root: &Path) -> bool {
-    let base = match git::rev_parse(root, git::BASE_REF) {
+fn same_paths_as_last_commit(root: &Path, base_ref: &str) -> bool {
+    let base = match git::rev_parse(root, base_ref) {
         Ok(b) if !b.is_empty() => b,
         _ => return false,
     };
@@ -340,11 +377,12 @@ fn same_paths_as_last_commit(root: &Path) -> bool {
 fn commit_cycle(
     root: &Path,
     git_dir: &Path,
+    base_ref: &str,
     cfg: &Config,
     verbose: bool,
     observed: &BTreeSet<String>,
 ) {
-    match flush_once(root, git_dir, cfg, observed) {
+    match flush_once(root, git_dir, base_ref, cfg, observed) {
         Flush::Committed(sha) if !sha.is_empty() => log(&format!("atomic commit {sha}")),
         Flush::Committed(_) => log("atomic commit recorded"),
         // Nothing staged is the common quiescent outcome and is silent by default to keep the log terse; under

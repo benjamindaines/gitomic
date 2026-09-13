@@ -9,10 +9,51 @@ use std::process::{Command, Stdio};
 
 use crate::Res;
 
-// Ref marking where the current gitomic session began (`base..HEAD` is the pending batch). Shared between
-// commands.rs, which owns the session lifecycle, and watch.rs, which needs to know whether a prior atomic
-// commit already exists in the active session before deciding whether to coalesce into it.
-pub const BASE_REF: &str = "refs/gitomic/base";
+// Ref marking where a branch's gitomic session began (`base_ref(branch)..tip` is that branch's pending batch).
+// One marker per branch, so a session on one branch is unaffected by another branch's session and by which
+// branch happens to be checked out at any given moment (issue #4: a single, unscoped marker let a mid-session
+// branch switch silently misattribute commits to whatever branch was current when the watcher next ran).
+// Shared between commands.rs, which owns session lifecycle, and watch.rs, which needs to know whether a prior
+// atomic commit already exists in the active session before deciding whether to coalesce into it.
+pub fn base_ref(branch: &str) -> String {
+    format!("refs/gitomic/base/{branch}")
+}
+
+// The single, unscoped session marker used before issue #4's fix. A loose ref at this exact path and the
+// per-branch refs under refs/gitomic/base/ cannot coexist (git cannot make "base" both a file and a
+// directory), so the two schemes are mutually exclusive on disk. Retained only so `init` and `status` can
+// detect a marker left behind by an older binary and report it plainly instead of either failing on the
+// resulting ref conflict with an opaque git error, or silently proceeding as if no session existed.
+pub const LEGACY_BASE_REF: &str = "refs/gitomic/base";
+
+// Branch names (with the refs/gitomic/base/ prefix stripped) of every branch currently holding an open
+// session, in for-each-ref's lexical order. An empty vector means no branch has one; it says nothing about
+// LEGACY_BASE_REF, which callers check separately. Backs `status`'s all-branches listing.
+pub fn session_branches(dir: &Path) -> Res<Vec<String>> {
+    let out = run(
+        dir,
+        &[
+            "for-each-ref",
+            "--format=%(refname:strip=3)",
+            "refs/gitomic/base",
+        ],
+    )?;
+    Ok(out
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+// Per-branch state directory: pidfile, log, and finalize template for one branch's session, nested under the
+// repository-wide gitomic state directory by branch name. Shared by commands.rs and watch.rs so the two never
+// drift onto different paths for the same session. Branch names cannot contain characters that are unsafe as
+// path components (git itself forbids the ones that would be), so no sanitisation is needed; a branch name
+// containing '/' (e.g. "feature/foo") nests as subdirectories, mirroring how it already nests under
+// refs/heads/.
+pub fn state_dir(git_dir: &Path, branch: &str) -> PathBuf {
+    git_dir.join("gitomic").join(branch)
+}
 
 // A NUL byte separates fields when a single git invocation must return several values, since commit metadata
 // may contain newlines but never a NUL. The byte is requested via git's %x00 format token so the argument

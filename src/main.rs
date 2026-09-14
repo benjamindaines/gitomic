@@ -164,11 +164,16 @@ USAGE:
   gitomic <command> [options]     run inside a git repository (any subdirectory)
 
 COMMANDS:
-  init [options]       Mark HEAD as the session base and fork a background watcher. If a base already
-                       exists without a running watcher, resume that session. Aliases: start.
+  init [options]       Mark HEAD as the session base for the checked-out branch and fork a watcher bound to
+                       that branch. If a base already exists for it without a running watcher, resume that
+                       session. Sessions are independent per branch: switching branches leaves this one's
+                       watcher running but idle until it is checked out again, and 'init' on the new branch
+                       starts (or resumes) that branch's own session. Aliases: start.
   finish [options]     Stop the watcher and apply one message to every atomic commit in the session,
                        then clear the session. Aliases: commit.
-  status               Show the session base, pending atomic-commit count, watcher state, and log path.
+  status               Show every branch with an open session (base, pending atomic-commit count, watcher
+                       state, log path), marking whichever is currently checked out. A branch with no open
+                       session is omitted.
   build-safe [-q]      Scriptable session gate for a build script. Prints 'true' when no session is open
                        (exit 0), 'false' when one is (exit 1); exit 2 on error. -q/--quiet suppresses the
                        word and returns the exit code only, e.g. 'gitomic build-safe -q || exit 1'.

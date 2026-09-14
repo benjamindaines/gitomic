@@ -46,6 +46,11 @@ fn dispatch(args: &[String]) -> Res<()> {
             commands::finish(&cwd, opts.message, opts.numbering)
         }
         "status" => commands::status(&cwd),
+        "active" => commands::active(),
+        "diff" => {
+            let stat = args[1..].iter().any(|a| a == "--stat");
+            commands::diff(&cwd, stat)
+        }
         "build-safe" => {
             // Scriptable session gate. Exit code is the primary signal: 0 when no session is open (safe to
             // build), 1 when a session is open (not safe), 2 on error (e.g. not inside a repository), so a
@@ -174,6 +179,12 @@ COMMANDS:
   status               Show every branch with an open session (base, pending atomic-commit count, watcher
                        state, log path), marking whichever is currently checked out. A branch with no open
                        session is omitted.
+  active               List every live gitomic watcher on this machine, across every repository — does not
+                       need to be run from inside a repository. Prints nothing when nothing is running, so
+                       it is quiet by default; meant to be called from a shell profile on new-terminal open.
+  diff [--stat]        Show the consolidated diff of the checked-out branch's pending batch (base..HEAD) —
+                       the atomic commits recorded so far this session, not the working tree. --stat prints
+                       a summary instead of the full patch. Requires an active session.
   build-safe [-q]      Scriptable session gate for a build script. Prints 'true' when no session is open
                        (exit 0), 'false' when one is (exit 1); exit 2 on error. -q/--quiet suppresses the
                        word and returns the exit code only, e.g. 'gitomic build-safe -q || exit 1'.

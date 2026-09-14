@@ -56,20 +56,24 @@ impl Default for Config {
 }
 
 impl Config {
+    // Standard configuration directory: $XDG_CONFIG_HOME/gitomic, falling back to $HOME/.config/gitomic.
+    // Shared with anything else that belongs beside the configuration file rather than under any one
+    // repository's .git — the cross-repository session registry (proc::registry_path) is the first such case.
+    pub fn dir() -> Option<PathBuf> {
+        if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
+            if !xdg.is_empty() {
+                return Some(PathBuf::from(xdg).join("gitomic"));
+            }
+        }
+        std::env::var("HOME")
+            .ok()
+            .map(|h| PathBuf::from(h).join(".config").join("gitomic"))
+    }
+
     // Standard configuration path: $XDG_CONFIG_HOME/gitomic/gitomic.cfg, falling back to
     // $HOME/.config/gitomic/gitomic.cfg.
     pub fn path() -> Option<PathBuf> {
-        if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
-            if !xdg.is_empty() {
-                return Some(PathBuf::from(xdg).join("gitomic").join("gitomic.cfg"));
-            }
-        }
-        std::env::var("HOME").ok().map(|h| {
-            PathBuf::from(h)
-                .join(".config")
-                .join("gitomic")
-                .join("gitomic.cfg")
-        })
+        Self::dir().map(|d| d.join("gitomic.cfg"))
     }
 
     // Load configuration from the standard path. A missing file is not an error and yields defaults; a present

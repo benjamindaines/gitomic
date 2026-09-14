@@ -81,6 +81,14 @@ pub fn succeeds(dir: &Path, args: &[&str]) -> Res<bool> {
     Ok(out.status.success())
 }
 
+// Run git with every standard stream inherited from this process, rather than captured. Every other wrapper
+// in this file captures stdout because its result feeds back into gitomic's own logic; this one is for output
+// meant to go straight to a human terminal — `diff` is the first such case — so the caller's pager and color
+// configuration apply exactly as they would for git invoked directly, not gitomic's own re-printed text.
+pub fn spawn_inherit(dir: &Path, args: &[&str]) -> Res<std::process::ExitStatus> {
+    Ok(Command::new("git").arg("-C").arg(dir).args(args).status()?)
+}
+
 // Absolute path to the repository work tree containing `start`. Errors when `start` is not inside a work tree.
 pub fn work_tree(start: &Path) -> Res<PathBuf> {
     let dir = run(start, &["rev-parse", "--show-toplevel"])?;

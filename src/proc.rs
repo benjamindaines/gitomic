@@ -145,7 +145,6 @@ pub fn write_pid(gitomic_dir: &Path) -> Res<()> {
 pub fn clear_pid(gitomic_dir: &Path) {
     let _ = fs::remove_file(pidfile(gitomic_dir));
 }
-
 fn io_err(what: &str) -> Box<dyn std::error::Error> {
     format!("{}: {}", what, std::io::Error::last_os_error()).into()
 }
@@ -191,6 +190,7 @@ fn with_registry<F: FnOnce(&mut File)>(f: F) {
     }
     let mut file = match OpenOptions::new()
         .create(true)
+        .truncate(true)
         .read(true)
         .write(true)
         .open(&path)

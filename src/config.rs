@@ -42,7 +42,34 @@ pub struct Config {
     // Does not apply to `exec`, whose capture is a deliberate, explicitly requested result and always stands
     // on its own.
     pub coalesce_same_file: bool,
+    // Glob patterns (see `glob_match`) matched against a changed path's basename; a match is dropped at the
+    // watcher's event source before it can arm the debounce timer or enter the observed-path set (issue #8).
+    // Seeded from `DEFAULT_IGNORE_PATTERNS` and extended, never replaced, by the `ignore_patterns` config key,
+    // so a configuration file that adds one project-specific pattern is not obliged to re-list the defaults.
+    // Applies only under `StageMode::Observed`, the only mode that consults the observed-path set at all;
+    // `Tracked` and `All` stage by `git add -u`/`-A` directly and never route through this list.
+    pub ignore_patterns: Vec<String>,
 }
+
+// Editor swap, lock, and backup file conventions excluded from watcher observation by default. These files
+// are transient artifacts of the editing process, not of the edit itself: including them in the observed set
+// does two kinds of damage. Their own churn arms the debounce timer independently of the file actually being
+// edited, and — because `coalesce_same_file` requires the staged path set to match the prior commit's
+// exactly — a swap file's create/remove cycle interleaved with the real file's changes means the two path
+// sets never repeat, so `coalesce_same_file` never fires and every debounce cycle becomes its own commit.
+// Covers vim (`.swp`/`.swo`/`.swx`/`.un~`), Kate (`.kate-swp`, matched with or without the leading dot since
+// `glob_match`'s `*` is not dot-excluding), Emacs (`#*#` auto-save, `.#*` lock symlink), and the generic `~`
+// backup suffix several editors share (gedit and others).
+pub const DEFAULT_IGNORE_PATTERNS: &[&str] = &[
+    "*.swp",
+    "*.swo",
+    "*.swx",
+    "*.un~",
+    "*.kate-swp",
+    "#*#",
+    ".#*",
+    "*~",
+];
 
 impl Default for Config {
     fn default() -> Self {
@@ -51,6 +78,10 @@ impl Default for Config {
             finalize_numbering: false,
             stage: StageMode::Observed,
             coalesce_same_file: true,
+            ignore_patterns: DEFAULT_IGNORE_PATTERNS
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
         }
     }
 }
@@ -110,6 +141,16 @@ impl Config {
                 "finalize_numbering" => cfg.finalize_numbering = parse_bool(value, lineno + 1)?,
                 "stage" => cfg.stage = parse_stage(value, lineno + 1)?,
                 "coalesce_same_file" => cfg.coalesce_same_file = parse_bool(value, lineno + 1)?,
+                // Comma-separated glob patterns, extending (never replacing) DEFAULT_IGNORE_PATTERNS. A blank
+                // entry from stray comma placement (",," or a trailing comma) is dropped rather than becoming
+                // a pattern that matches everything.
+                "ignore_patterns" => cfg.ignore_patterns.extend(
+                    value
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string),
+                ),
                 // Reserved for a future always-on multi-repository mode; accepted and ignored so an
                 // aspirational configuration file does not break the current cwd-scoped tool.
                 "watch_dir" => {}
@@ -118,6 +159,44 @@ impl Config {
         }
         Ok(cfg)
     }
+}
+
+// Matches `name` against a glob pattern restricted to the `*` wildcard (matches any sequence of characters,
+// including none). This is the entire vocabulary `ignore_patterns` needs — editor swap/backup conventions are
+// prefix/suffix shapes, never character classes or `?` — so a hand-rolled matcher keeps the dependency budget
+// at `libc` + `notify` rather than pulling in a glob crate for one wildcard. `*` is not dot-excluding here,
+// unlike a shell glob: "*.kate-swp" matches both "file.kate-swp" and ".file.kate-swp", which is the desired
+// behaviour since Kate's swap file for a dotfile would otherwise need its own pattern.
+//
+// Standard two-pointer wildcard match: `star` records the most recent `*` seen in the pattern and `star_ni`
+// the text position it last matched from, so a mismatch can backtrack by re-trying that `*` against one more
+// character of text instead of full recursion.
+pub fn glob_match(pattern: &str, name: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let n: Vec<char> = name.chars().collect();
+    let (mut pi, mut ni) = (0usize, 0usize);
+    let mut star: Option<usize> = None;
+    let mut star_ni = 0usize;
+    while ni < n.len() {
+        if pi < p.len() && p[pi] == n[ni] {
+            pi += 1;
+            ni += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star = Some(pi);
+            star_ni = ni;
+            pi += 1;
+        } else if let Some(s) = star {
+            pi = s + 1;
+            star_ni += 1;
+            ni = star_ni;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
 }
 
 // Remove an inline '#' comment and everything after it. A '#' only introduces a comment when preceded by
@@ -166,6 +245,13 @@ mod tests {
         assert!(!c.finalize_numbering);
         assert_eq!(c.stage, StageMode::Observed);
         assert!(c.coalesce_same_file);
+        assert_eq!(
+            c.ignore_patterns,
+            DEFAULT_IGNORE_PATTERNS
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -225,5 +311,32 @@ mod tests {
     #[test]
     fn non_integer_debounce_is_rejected() {
         assert!(Config::parse("debounce_ms = soon\n").is_err());
+    }
+
+    #[test]
+    fn ignore_patterns_extend_rather_than_replace_defaults() {
+        let c = Config::parse("ignore_patterns = *.bak, build/*.o\n").unwrap();
+        assert_eq!(c.ignore_patterns.len(), DEFAULT_IGNORE_PATTERNS.len() + 2);
+        assert!(c.ignore_patterns.contains(&"*.kate-swp".to_string()));
+        assert!(c.ignore_patterns.contains(&"*.bak".to_string()));
+        assert!(c.ignore_patterns.contains(&"build/*.o".to_string()));
+    }
+
+    #[test]
+    fn ignore_patterns_drops_blank_entries() {
+        let c = Config::parse("ignore_patterns = *.bak,,  ,\n").unwrap();
+        assert_eq!(c.ignore_patterns.len(), DEFAULT_IGNORE_PATTERNS.len() + 1);
+    }
+
+    #[test]
+    fn glob_match_handles_leading_and_trailing_star() {
+        assert!(glob_match("*.kate-swp", "install.sh.kate-swp"));
+        assert!(glob_match("*.kate-swp", ".install.sh.kate-swp"));
+        assert!(!glob_match("*.kate-swp", "install.sh.kate-swpx"));
+        assert!(glob_match("#*#", "#scratch.el#"));
+        assert!(glob_match(".#*", ".#scratch.el"));
+        assert!(glob_match("*~", "notes.txt~"));
+        assert!(!glob_match("*~", "notes.txt"));
+        assert!(glob_match("*", "anything.at.all"));
     }
 }

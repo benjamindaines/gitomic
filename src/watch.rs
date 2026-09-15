@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 
 use notify::{RecursiveMode, Watcher};
 
-use crate::config::{Config, StageMode};
+use crate::config::{glob_match, Config, StageMode};
 use crate::{git, proc, Res};
 
 // Upper bound on how long the loop sleeps between shutdown-flag checks, so a termination signal is observed
@@ -42,24 +42,30 @@ pub fn run(root: &Path, git_dir: &Path, branch: &str, cfg: &Config, verbose: boo
     let base_ref = git::base_ref(branch);
 
     let (tx, rx) = channel::<Vec<PathBuf>>();
-    // The event handler forwards the external paths each event names; the debounce timer, not the event
-    // payload, drives commits, but the paths are retained so observed staging can act on exactly the paths
-    // that changed. Paths inside the git directory are filtered here so watcher-induced writes never rearm the
-    // timer or enter the observed set. When verbose tracing is enabled, every received event is logged first,
-    // before the filter, so the operator sees changes that were ignored as git-internal as well as those that
-    // armed the timer.
+    // The event handler forwards the external, non-ignored paths each event names; the debounce timer, not
+    // the event payload, drives commits, but the paths are retained so observed staging can act on exactly
+    // the paths that changed. Two filters run here rather than at staging time: paths inside the git
+    // directory, so watcher-induced writes never rearm the timer or enter the observed set, and paths matching
+    // a configured ignore pattern (issue #8) — editor swap/lock/backup files whose own create/remove churn
+    // would otherwise arm the timer independently of the file actually being edited, and whose alternation
+    // with that file's real changes defeats coalesce_same_file's exact-set match. Filtering here, rather than
+    // in stage_observed, means such churn never enters the observed set at all, so debounce cycles form around
+    // the real edits instead of being fragmented by the noise around them. When verbose tracing is enabled,
+    // every received event is logged first, before the filter, so the operator sees changes that were dropped
+    // for either reason as well as those that armed the timer.
     let gd = git_dir.clone();
+    let ignore_patterns = cfg.ignore_patterns.clone();
     let mut watcher =
         notify::recommended_watcher(move |res: notify::Result<notify::Event>| match res {
             Ok(event) => {
                 let external: Vec<PathBuf> = event
                     .paths
                     .iter()
-                    .filter(|p| !is_within(p, &gd))
+                    .filter(|p| !is_within(p, &gd) && !is_ignored_path(p, &ignore_patterns))
                     .cloned()
                     .collect();
                 if verbose {
-                    trace_event(&event, !external.is_empty());
+                    trace_event(&event, &gd, &ignore_patterns);
                 }
                 if !external.is_empty() {
                     let _ = tx.send(external);
@@ -404,28 +410,39 @@ fn is_within(path: &Path, base: &Path) -> bool {
     path.starts_with(base)
 }
 
+// Whether `path`'s basename matches one of `patterns` (see `config::glob_match`). A path with no basename
+// component is never matched on that account alone. Standalone rather than a `Config` method so the event
+// closure can capture just the cloned pattern list, not the whole `Config`.
+fn is_ignored_path(path: &Path, patterns: &[String]) -> bool {
+    match path.file_name().and_then(|n| n.to_str()) {
+        Some(name) => patterns.iter().any(|p| glob_match(p, name)),
+        None => false,
+    }
+}
+
 // Emit one diagnostic line per received file-system event under verbose tracing: the event kind and the paths
-// it names, tagged by whether any path lies outside the git directory (arming the debounce timer) or the event
-// was purely git-internal (ignored to avoid a commit feedback loop). This is the primary instrument for
-// confirming whether a given change — a patch application, an editor save, a scripted file write — is observed
-// by the watcher at all, as opposed to being lost before the recursive watch was established.
-fn trace_event(event: &notify::Event, external: bool) {
-    let tag = if external {
-        "armed"
-    } else {
-        "ignored (git-internal)"
-    };
-    let paths: Vec<String> = event
+// it names, tagged by whether the path lies outside the git directory and does not match a configured ignore
+// pattern (arming the debounce timer), lies inside the git directory (ignored to avoid a commit feedback
+// loop), or matches an ignore pattern (ignored as editor swap/lock/backup noise, issue #8). This is the
+// primary instrument for confirming whether a given change — a patch application, an editor save, a scripted
+// file write — is observed by the watcher at all, as opposed to being lost before the recursive watch was
+// established or filtered as noise.
+fn trace_event(event: &notify::Event, git_dir: &Path, ignore_patterns: &[String]) {
+    let tagged: Vec<String> = event
         .paths
         .iter()
-        .map(|p| p.display().to_string())
+        .map(|p| {
+            let tag = if is_within(p, git_dir) {
+                "ignored (git-internal)"
+            } else if is_ignored_path(p, ignore_patterns) {
+                "ignored (editor swap/lock/backup pattern)"
+            } else {
+                "armed"
+            };
+            format!("{} [{}]", p.display(), tag)
+        })
         .collect();
-    log(&format!(
-        "event {:?} [{}] -> {}",
-        event.kind,
-        paths.join(", "),
-        tag
-    ));
+    log(&format!("event {:?} -> {}", event.kind, tagged.join(", ")));
 }
 
 // Emit a timestamped diagnostic line to the redirected log.
@@ -439,4 +456,53 @@ fn now() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::DEFAULT_IGNORE_PATTERNS;
+
+    fn default_patterns() -> Vec<String> {
+        DEFAULT_IGNORE_PATTERNS
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn ignores_kate_swap_file_by_basename() {
+        let patterns = default_patterns();
+        assert!(is_ignored_path(
+            Path::new("/repo/rom/.install.sh.kate-swp"),
+            &patterns
+        ));
+    }
+
+    #[test]
+    fn does_not_ignore_the_real_file() {
+        let patterns = default_patterns();
+        assert!(!is_ignored_path(
+            Path::new("/repo/rom/install.sh"),
+            &patterns
+        ));
+    }
+
+    #[test]
+    fn ignore_check_is_basename_only_not_full_path() {
+        // A directory that happens to be named like a pattern must not make every file beneath it ignored;
+        // only the basename is tested.
+        let patterns = vec!["*.kate-swp".to_string()];
+        assert!(!is_ignored_path(
+            Path::new("/repo/foo.kate-swp/real_file.rs"),
+            &patterns
+        ));
+    }
+
+    #[test]
+    fn is_within_matches_git_dir_prefix() {
+        let git_dir = Path::new("/repo/.git");
+        assert!(is_within(Path::new("/repo/.git/index.lock"), git_dir));
+        assert!(!is_within(Path::new("/repo/src/main.rs"), git_dir));
+    }
 }

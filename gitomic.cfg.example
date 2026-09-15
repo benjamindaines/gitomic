@@ -24,6 +24,15 @@ stage = observed
 # a fresh commit. Never applied to `exec`, whose capture always stands on its own.
 coalesce_same_file = true
 
+# Comma-separated glob patterns (only the `*` wildcard is supported) matched against a changed path's
+# basename; a match is dropped before it can arm the debounce timer or enter the observed-path set, so it
+# never gets staged under `stage = observed` (issue #8 — an editor's swap/lock file otherwise interleaves
+# with the real file's changes and defeats coalesce_same_file's exact-set match). Only applies under
+# `stage = observed`. Extends the built-in default list below rather than replacing it, so adding one
+# project-specific pattern doesn't require re-listing the defaults:
+#   *.swp, *.swo, *.swx, *.un~, *.kate-swp, #*#, .#*, *~
+# ignore_patterns = *.bak, *.generated
+
 # Reserved for a future always-on multi-repository mode; currently accepted and ignored. The manual,
 # cwd-scoped model supersedes it.
 # watch_dir = /home/ben/code

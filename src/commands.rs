@@ -83,7 +83,9 @@ pub fn init(cwd: &Path, foreground: bool, verbose: bool) -> Res<()> {
         println!("  Ctrl-C stops the watcher; the session and its commits are preserved.");
         proc::install_signal_handlers();
         proc::write_pid(&sdir)?;
+        proc::announce_active(&root, &branch);
         let res = watch::run(&root, &git_dir, &branch, &cfg, verbose);
+        proc::retire_active(&root, &branch);
         proc::clear_pid(&sdir);
         res?;
         return Ok(());
@@ -115,7 +117,9 @@ pub fn init(cwd: &Path, foreground: bool, verbose: bool) -> Res<()> {
             proc::redirect_stdio(&proc::logfile(&sdir))?;
             proc::install_signal_handlers();
             if proc::write_pid(&sdir).is_ok() {
+                proc::announce_active(&root, &branch);
                 let _ = watch::run(&root, &git_dir, &branch, &cfg, verbose);
+                proc::retire_active(&root, &branch);
             }
             proc::clear_pid(&sdir);
             std::process::exit(0);
@@ -267,6 +271,47 @@ pub fn status(cwd: &Path) -> Res<()> {
             git::LEGACY_BASE_REF
         );
         println!("    once any pending work is recovered.");
+    }
+    Ok(())
+}
+
+// Report every live gitomic watcher on the machine, across every repository, without needing to be run from
+// inside any one of them (see main.rs's dispatch: this is the one command that does not resolve a repository
+// from the working directory first). Backs a shell-profile hook run on new-terminal open: prints nothing when
+// nothing is running, so it stays quiet on the common case instead of announcing "all clear" every time.
+pub fn active() -> Res<()> {
+    for s in proc::active_sessions() {
+        println!("{}  [{}]  pid {}", s.repo, s.branch, s.pid);
+    }
+    Ok(())
+}
+
+// Show the consolidated diff of the checked-out branch's pending batch (base..HEAD) — the accumulated effect
+// of every atomic commit recorded this session so far, not the working tree (plain `git diff` already shows
+// that). Runs with inherited stdio so the operator's pager and color configuration apply exactly as they
+// would for `git diff` invoked directly, rather than gitomic capturing and re-printing the output itself.
+pub fn diff(cwd: &Path, stat: bool) -> Res<()> {
+    let root = git::work_tree(cwd)?;
+    let branch = git::current_branch(&root)?;
+    let base_ref = git::base_ref(&branch);
+
+    if !git::rev_exists(&root, &base_ref)? {
+        return Err(format!(
+            "diff: no active session for '{branch}' in {}",
+            root.display()
+        )
+        .into());
+    }
+
+    let range = format!("{base_ref}..HEAD");
+    let mut args: Vec<&str> = vec!["diff"];
+    if stat {
+        args.push("--stat");
+    }
+    args.push(&range);
+    let status = git::spawn_inherit(&root, &args)?;
+    if !status.success() {
+        return Err("diff: git diff exited non-zero".into());
     }
     Ok(())
 }

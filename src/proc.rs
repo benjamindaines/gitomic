@@ -188,9 +188,15 @@ fn with_registry<F: FnOnce(&mut File)>(f: F) {
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
+    // `.truncate(false)` is explicit, not the default omission: truncation happens on open, before
+    // the flock below is taken and before `f` has read anything, so `.truncate(true)` here was
+    // wiping the registry on every call — including a pure read such as `active_sessions` — before
+    // observing (or leaving behind) an empty file. Existing content must survive an open; callers
+    // that need to shrink or clear the file do so explicitly via `file.set_len(0)` once they hold
+    // the lock (see `retire_active` and `active_sessions`).
     let mut file = match OpenOptions::new()
         .create(true)
-        .truncate(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .open(&path)
@@ -333,5 +339,45 @@ mod registry_tests {
         let text =
             "START\t/repo/a\tmain\t111\nSTART\t/repo/a\tmain\t111\nSTOP\t/repo/a\tmain\t111\n";
         assert!(parse_registry(text).is_empty());
+    }
+
+    // Regression test for issue #11: a pure read of the registry (what `active_sessions` performs)
+    // must not erase content a prior call wrote. `with_registry` used to open the file with
+    // `.truncate(true)`, which discards existing content at open() time — before the flock is taken
+    // and before the closure runs — so every subsequent open, including a read-only one, wiped
+    // whatever the previous call had appended. `XDG_CONFIG_HOME` is pointed at a fresh temp directory
+    // per test to isolate `registry_path()` from the real environment and from other tests; env vars
+    // are process-wide, so this could race a concurrently running test that also sets it — none
+    // currently does.
+    #[test]
+    fn with_registry_read_does_not_erase_prior_writes() {
+        let tmp = std::env::temp_dir().join(format!("gitomic-test-registry-{}", pid()));
+        let _ = fs::remove_dir_all(&tmp);
+        std::env::set_var("XDG_CONFIG_HOME", &tmp);
+
+        let self_pid = pid();
+        announce_active(Path::new("/repo/a"), "main");
+
+        // A second, read-only call (mirrors what `active_sessions` does) must see the entry the
+        // first call wrote, not an empty file.
+        let sessions = active_sessions();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].repo, "/repo/a");
+        assert_eq!(sessions[0].branch, "main");
+        assert_eq!(sessions[0].pid, self_pid);
+
+        // And the file on disk must still carry the entry after that read, not have been wiped.
+        let mut text = String::new();
+        File::open(registry_path().unwrap())
+            .unwrap()
+            .read_to_string(&mut text)
+            .unwrap();
+        assert!(text.contains("START\t/repo/a\tmain\t"));
+
+        retire_active(Path::new("/repo/a"), "main");
+        assert!(active_sessions().is_empty());
+
+        std::env::remove_var("XDG_CONFIG_HOME");
+        let _ = fs::remove_dir_all(&tmp);
     }
 }

@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 libc = "0.2"
 notify = "6"
+ratatui = "0.30.2"
 
 [profile.release]
 strip = true

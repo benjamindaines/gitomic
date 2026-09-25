@@ -75,6 +75,39 @@ by the `finish` editor template, `gitomic diff`, or `git log`.
 
 Requires git 2.38 or newer (`git merge-tree --write-tree`).
 
+#### Interactive picker
+
+`gitomic drop` with no hash opens a two-pane picker over the same eligible commits: the list on the left
+(newest first, as in `git log`), the highlighted commit's header, stat and patch on the right. Marked
+commits are shown in red with `[x]`.
+
+| pane | key | action |
+|------|-----|--------|
+| list | `j` `k` (or arrows) | move; `g` / `G` jump to first / last |
+| list | `space` | mark or unmark the commit |
+| list | `l` (or Right) | move to the diff pane |
+| list | `Enter` | submit the marked commits; a `y`/`n` prompt follows |
+| list | `q`, `Esc` | quit (asks first when commits are marked) |
+| diff | `j` `k` | scroll up and down, stopping at the ends |
+| diff | `h` `l` | scroll left and right, stopping at the edges |
+| diff | `Enter`, `n` | next commit down the list |
+| diff | `Shift-Enter`, `N` | next commit up the list |
+| diff | `space` | mark or unmark the commit being viewed |
+| diff | `h` at the left edge, `Esc` | back to the list pane |
+| diff | `g` `G`, `Ctrl-d` `Ctrl-u` | top / bottom, half a page |
+
+- Pressing `Enter` on the list first runs the same dependency check as `drop`. A selection that cannot be
+  dropped (a later commit depends on a marked one) is reported on the bottom line and stays editable; the
+  `y`/`n` prompt appears only for a selection that can be dropped.
+- Only `y` and `n` answer the prompt. `Enter`, `space` and every other key are ignored, so an accidental
+  Return cannot confirm anything. `n` and `Esc` cancel and keep the marks.
+- Leaving the diff pane with `h` requires a press that is not part of a run of `h` presses that was still
+  scrolling, so holding `h` to reach the left edge stops there rather than jumping to the list.
+- `Shift-Enter` is delivered only by terminals that support the kitty keyboard protocol (kitty, foot,
+  WezTerm, Ghostty and others); elsewhere it arrives as a plain `Enter`, and `N` does the same job.
+- `-n/--dry-run` applies to the picker as well: the confirmation is shown, then nothing is modified.
+- Needs a terminal on stdin and stdout; otherwise the command stops with an error rather than waiting.
+
 ## Configuration
 
 `${XDG_CONFIG_HOME:-~/.config}/gitomic/gitomic.cfg`, a flat `key = value` file. Every key has a compiled-in

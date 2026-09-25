@@ -509,12 +509,21 @@ fn resolve_drop_targets(
     Ok((candidates, ordered))
 }
 
-// The rewrite proper, run with the watcher already stopped. Selectors are resolved again here
-// because the final capture may have amended the newest atomic commit, changing its id.
-fn drop_locked(root: &Path, branch: &str, selectors: &[String], dry_run: bool) -> Res<()> {
-    let (candidates, targets) = resolve_drop_targets(root, branch, selectors).map_err(|e| {
-        format!("{e} (a capture of pending edits may have amended the newest commit; re-check it)")
-    })?;
+// The outcome of planning a drop: what the branch tip would become, computed without modifying the
+// branch, the index, or the work tree. Only new commit objects are written, and an unreferenced
+// object is inert until garbage collection.
+pub struct DropPlan {
+    old_head: String,
+    new_head: String,
+    targets: Vec<String>,
+    replayed: usize,
+}
+
+// Resolve the selectors and replay every later commit onto the surviving parent, in the object
+// database only. Fails, with nothing modified, on an ineligible selector, on a merge or root commit
+// in the affected range, or on a later commit that does not apply without a dropped change.
+fn plan_drop(root: &Path, branch: &str, selectors: &[String]) -> Res<DropPlan> {
+    let (candidates, targets) = resolve_drop_targets(root, branch, selectors)?;
     let first = candidates
         .iter()
         .position(|(c, _)| targets.contains(c))
@@ -550,13 +559,61 @@ fn drop_locked(root: &Path, branch: &str, selectors: &[String], dry_run: bool) -
             git::Pick::Conflict => {
                 return Err(format!(
                     "drop: {} does not apply without the change being dropped; nothing was \
-                     modified. Add its hash to the command to drop it as well.",
+                     modified. Drop it too to proceed.",
                     short(commit)
                 )
                 .into());
             }
         }
     }
+    Ok(DropPlan {
+        old_head,
+        new_head: parent,
+        targets,
+        replayed,
+    })
+}
+
+// Verify, without modifying anything, that the given commits can be dropped together. Backs the
+// interactive picker, which reports a failure to the operator before committing to the operation.
+// Returns the number of later commits that would be re-applied.
+pub fn check_drop(cwd: &Path, selectors: &[String]) -> Res<usize> {
+    let root = git::work_tree(cwd)?;
+    let git_dir = git::git_dir(cwd)?;
+    let branch = git::current_branch(&root)?;
+    if git::operation_in_progress(&git_dir) {
+        return Err("drop: a merge, rebase, cherry-pick, revert, or bisect is in progress".into());
+    }
+    Ok(plan_drop(&root, &branch, selectors)?.replayed)
+}
+
+// The commits `drop` would accept on the checked-out branch, newest first (the order `git log`
+// prints), as (full id, subject) pairs. An empty subject stands for a placeholder atomic commit.
+pub fn drop_choices(cwd: &Path) -> Res<Vec<(String, String)>> {
+    let root = git::work_tree(cwd)?;
+    let branch = git::current_branch(&root)?;
+    let (candidates, _) = drop_candidates(&root, &branch)?;
+    let mut out = Vec::with_capacity(candidates.len());
+    for (commit, _) in candidates.iter().rev() {
+        let message = git::commit_message(&root, commit)?;
+        let subject = message.lines().next().unwrap_or("").trim().to_string();
+        out.push((commit.clone(), subject));
+    }
+    Ok(out)
+}
+
+// The rewrite proper, run with the watcher already stopped. Selectors are resolved again here
+// because the final capture may have amended the newest atomic commit, changing its id.
+fn drop_locked(root: &Path, branch: &str, selectors: &[String], dry_run: bool) -> Res<()> {
+    let plan = plan_drop(root, branch, selectors).map_err(|e| {
+        format!("{e} (a capture of pending edits may have amended the newest commit; re-check it)")
+    })?;
+    let DropPlan {
+        old_head,
+        new_head: parent,
+        targets,
+        replayed,
+    } = plan;
 
     if dry_run {
         println!("gitomic: dry run; nothing was modified");

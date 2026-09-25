@@ -41,10 +41,10 @@ use ratatui::{DefaultTerminal, Frame};
 use crate::{commands, Res};
 
 // Columns moved by one horizontal scroll key press.
-const H_STEP: usize = 8;
+pub(crate) const H_STEP: usize = 8;
 // Two h presses closer together than this are treated as one continuous run (key auto-repeat or a
 // held key), so the second cannot switch panes if the first was still scrolling.
-const RUN_WINDOW: Duration = Duration::from_millis(200);
+pub(crate) const RUN_WINDOW: Duration = Duration::from_millis(200);
 // Diffs longer than this are cut off, so that a commit touching a generated file cannot stall the
 // picker or exhaust memory. The cut is announced on the final line.
 const MAX_DIFF_LINES: usize = 20_000;
@@ -121,9 +121,9 @@ struct Entry {
 }
 
 // A commit's text, pre-styled once, with the width of its widest line for horizontal scroll limits.
-struct DiffView {
-    lines: Vec<Line<'static>>,
-    max_width: usize,
+pub(crate) struct DiffView {
+    pub(crate) lines: Vec<Line<'static>>,
+    pub(crate) max_width: usize,
 }
 
 pub struct App {
@@ -513,7 +513,7 @@ impl App {
 // escape sequence in a diffed file would otherwise be interpreted by the terminal. Patch lines are
 // coloured only after the first `diff --git` line, so a commit message that happens to begin with
 // '+' or '-' keeps the default style.
-fn style_diff(text: &str) -> DiffView {
+pub(crate) fn style_diff(text: &str) -> DiffView {
     let mut lines = Vec::new();
     let mut max_width = 0;
     let mut in_patch = false;
@@ -563,6 +563,25 @@ fn style_diff(text: &str) -> DiffView {
     DiffView { lines, max_width }
 }
 
+// Run `body` on the real terminal: alternate screen and raw mode on entry, both restored on exit
+// whether `body` succeeds or fails (ratatui also restores them on panic). Shared by every
+// interactive screen in the program.
+pub(crate) fn with_terminal<T>(body: impl FnOnce(&mut DefaultTerminal) -> Res<T>) -> Res<T> {
+    let mut terminal = ratatui::try_init()?;
+    // Terminals that speak the kitty keyboard protocol then report Shift-Enter as such; others send
+    // a plain Return for it, and N covers that case. The flag is pushed without first asking the
+    // terminal whether it is supported: the query blocks until the terminal answers, and a terminal
+    // that does not know the sequence ignores the push and the matching pop.
+    let _ = execute!(
+        std::io::stdout(),
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+    );
+    let result = body(&mut terminal);
+    let _ = execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
+    ratatui::restore();
+    result
+}
+
 // Run the picker on the real terminal. Returns the full ids of the commits the operator marked and
 // confirmed, or None when the picker was left without confirming anything. Errors when there is no
 // terminal to draw on or no commit that could be dropped.
@@ -581,18 +600,7 @@ pub fn run(cwd: &Path) -> Res<Option<Vec<String>>> {
     };
     let mut app = App::new(choices);
 
-    let mut terminal = ratatui::try_init()?;
-    // Terminals that speak the kitty keyboard protocol then report Shift-Enter as such; others send
-    // a plain Return for it, and N covers that case. The flag is pushed without first asking the
-    // terminal whether it is supported: the query blocks until the terminal answers, and a terminal
-    // that does not know the sequence ignores the push and the matching pop.
-    let _ = execute!(
-        std::io::stdout(),
-        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
-    );
-    let result = event_loop(&mut terminal, &mut app, &mut src);
-    let _ = execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
-    ratatui::restore();
+    let result = with_terminal(|terminal| event_loop(terminal, &mut app, &mut src));
 
     match result? {
         Outcome::Submit(ids) => Ok(Some(ids)),

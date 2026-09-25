@@ -38,6 +38,7 @@ gitomic finish               # same, but open $GIT_EDITOR for the message
 gitomic stop                 # stop watching, keep the base and commits for later finish/resume
 gitomic abort --force        # discard the session: reset the branch to the base
 gitomic drop <hash>...       # delete individual unpublished commits (alias: rm)
+gitomic cherry-pick [<hash>...]  # bring commits from another branch, via a patch file (alias: pick)
 ```
 
 Running `init` again when a base already exists but no watcher is live **resumes** that session rather than
@@ -107,6 +108,52 @@ commits are shown in red with `[x]`.
   WezTerm, Ghostty and others); elsewhere it arrives as a plain `Enter`, and `N` does the same job.
 - `-n/--dry-run` applies to the picker as well: the confirmation is shown, then nothing is modified.
 - Needs a terminal on stdin and stdout; otherwise the command stops with an error rather than waiting.
+
+### cherry-pick
+
+`gitomic cherry-pick` brings commits from another branch onto the checked-out one. The chosen commits are
+replayed onto the current `HEAD` in the object database, the result is written as a patch file, and the patch
+is applied to the work tree. History is not rewritten, so the operation is safe with unpushed commits and with
+a live session.
+
+- **Without a session** the change is left in the work tree, uncommitted (the effect of `git cherry-pick -n`).
+- **With a session** (live or stopped) it is recorded as one atomic commit with the usual empty placeholder
+  message, which `finish` stamps like any other step. Only the patch's own paths are committed; other staged
+  changes stay out. A live watcher is stopped for the duration, as for `drop`, and restarted afterwards.
+- **`HEAD` moved after the selection** (the watcher committed, or a commit was made by hand): the patch is
+  recomputed against the new `HEAD` before it is applied, reusing every conflict decision whose conflict
+  recurs unchanged. A conflict that was not decided stops the operation before anything is modified.
+- **Local edits**: the patch is checked against the work tree first. An uncommitted edit that overlaps a file
+  the patch touches refuses the pick with nothing modified.
+- **Patch files** are kept in `.git/gitomic-picks/`. Each starts with a `# gitomic-patch 1` header naming its
+  base, its source commits and the conflict decisions taken; `git apply` ignores it, and it is what allows the
+  patch to be recomputed against another base. A pick is undone with `git apply -R <patch file>` (or
+  `gitomic drop` once recorded).
+- Merge commits are not offered, and commits whose change `HEAD` already holds under another id are hidden.
+- Options: `--from <branch>` lists that branch first; `-n/--dry-run` reports the patch and applies nothing;
+  `-p/--patch-only` writes the patch file and stops. With commits named on the command line (replayed in the
+  order given) no terminal is needed, and any conflict is refused.
+
+#### Interactive screen
+
+`gitomic cherry-pick` with no commit opens the same two-pane screen as the `drop` picker, with the same
+vim-style keys, `space` to mark and the same rule that only `y`/`n` answer a prompt. What differs:
+
+- `Tab` opens an overlay listing the other local and remote-tracking branches, most recently updated first.
+  `j`/`k` move, `Enter` uses the branch (marks are cleared), `Esc` closes it. Without `--from` the overlay is
+  the first thing shown.
+- The right pane shows what each commit would change relative to the `HEAD` that was current when the screen
+  opened, not the commit's own diff. A commit that would conflict is announced above its diff.
+- `Enter` on the list replays the marked commits, oldest first. A clean result goes straight to the `y`/`n`
+  prompt, which names the number of commits and the size of the change.
+- **Conflicts** open a decision screen: the conflicted files on the left, one entry per conflict hunk, and the
+  hunk on the right with a few lines of context and both sides one above the other. `a` keeps the tree copy,
+  `b` takes the picked commit's version, `c` keeps both (tree copy first), `u` undoes, `j`/`k` move between
+  conflicts and `Enter` continues once every one is decided. A file that cannot be split into hunks (binary
+  content, or one side deleted the file) is decided as a whole with `a`/`b`. A later commit in the selection
+  that conflicts opens the screen again.
+- Conflicts with no A/B meaning (a file renamed differently on both sides, a file/directory clash) are
+  reported and the selection is refused; `git cherry-pick` handles those.
 
 ## Configuration
 

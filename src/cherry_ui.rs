@@ -1,0 +1,1589 @@
+// Interactive screen for `gitomic cherry-pick` when no commit is named (issue #13). It follows the
+// layout and keys of the `drop` picker (pick.rs): commits on the left, the highlighted commit's
+// diff on the right, vim-style movement, space to mark, Enter to submit behind a y/n confirmation
+// that Enter cannot answer. Three things are added: Tab opens an overlay that chooses the branch to
+// pick from, the diff shows what the commit would change relative to the HEAD that was current when
+// the screen opened, and a conflict opens a decision screen where each conflict hunk is settled
+// with a single key.
+//
+// As in pick.rs, everything except the terminal is testable. `App` consumes key events and reports
+// an `Outcome`; git is reached only through the `Source` trait, and rendering takes any ratatui
+// backend. The screen prepares a `Spec` (which commits, against which base, with which decisions)
+// and returns it; building and applying the patch is the command layer's job (cherry.rs), so the
+// same code path serves the interactive and the command-line forms.
+//
+// Keys, list pane:
+//   j/k, arrows  move            g/G  first/last          space  toggle the mark
+//   l, Right     open the diff   Tab  choose the source branch
+//   Enter        prepare the marked commits (conflicts are decided first), then confirm with y/n
+//   q, Esc       quit (confirmed first when commits are marked)
+// Keys, diff pane: as for `drop` (j/k h/l g/G Ctrl-d/u, Enter/n next, N previous, space, Tab).
+// Keys, branch overlay:
+//   j/k, g/G     move     Enter  use the branch (marks are cleared)     Esc, Tab, q  close
+// Keys, decision screen:
+//   j/k          previous/next conflict     a  keep the tree copy     b  take the picked commit's
+//   c            keep both (text conflicts)  u  undo the decision      Ctrl-d/u  scroll
+//   Enter        continue once every conflict is decided               Esc, q  leave
+
+use std::collections::HashMap;
+use std::io::IsTerminal;
+use std::path::{Path, PathBuf};
+use std::time::Instant;
+
+use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph};
+use ratatui::{DefaultTerminal, Frame};
+
+use crate::conflict::{Segment, Side};
+use crate::patch::{Body, FileConflict, Job, Spec, Step};
+use crate::pick::{style_diff, with_terminal, DiffView, H_STEP, RUN_WINDOW};
+use crate::{cherry, git, Res};
+
+// Lines of unchanged text shown above and below a conflict hunk.
+const CONTEXT: usize = 3;
+
+// Where a replay stands after the picks were submitted.
+pub enum Flow {
+    // Every conflict is decided; carries the `git diff --stat` summary of the patch.
+    Ready(String),
+    // A pick conflicts and needs decisions.
+    Conflicts(Vec<FileConflict>),
+    // The selection cannot be applied.
+    Refused(String),
+}
+
+// What the screen needs from git.
+pub trait Source {
+    fn branches(&mut self) -> Result<Vec<String>, String>;
+    // Commits on `branch` that HEAD lacks, newest first.
+    fn commits(&mut self, branch: &str) -> Result<Vec<(String, String)>, String>;
+    // The preview text for one commit.
+    fn diff(&mut self, commit: &str) -> Result<String, String>;
+    // Begin replaying `picks` (oldest first) and report where it stops.
+    fn start(&mut self, picks: &[(String, String)]) -> Result<Flow, String>;
+    // Supply decisions for the conflict last reported and continue.
+    fn resolve(&mut self, files: Vec<FileConflict>) -> Result<Flow, String>;
+    // The recipe for the patch once the replay is `Ready`.
+    fn spec(&mut self) -> Result<Spec, String>;
+}
+
+struct GitSource {
+    cwd: PathBuf,
+    root: PathBuf,
+    // HEAD when the screen opened; every preview and the replay are relative to it.
+    base: String,
+    job: Option<Job>,
+    picks: Vec<(String, String)>,
+    // Decisions carried across restarts of the replay, so a cancelled confirmation does not lose
+    // them.
+    decided: Vec<(String, Side)>,
+}
+
+impl GitSource {
+    fn flow(&mut self, step: Step) -> Result<Flow, String> {
+        match step {
+            Step::Done => {
+                let job = self.job.as_ref().ok_or("no replay in progress")?;
+                let patch = job.patch(&self.picks).map_err(|e| e.to_string())?;
+                if patch.is_empty() {
+                    return Ok(Flow::Refused(
+                        "the selection changes nothing relative to HEAD".to_string(),
+                    ));
+                }
+                Ok(Flow::Ready(patch.stat))
+            }
+            Step::Conflicts(files) => Ok(Flow::Conflicts(files)),
+            Step::Unsupported(list) => Ok(Flow::Refused(format!(
+                "a conflict has no A/B decision ({}); use 'git cherry-pick' for it",
+                list.join("; ")
+            ))),
+        }
+    }
+}
+
+impl Source for GitSource {
+    fn branches(&mut self) -> Result<Vec<String>, String> {
+        cherry::branches(&self.cwd).map_err(|e| e.to_string())
+    }
+
+    fn commits(&mut self, branch: &str) -> Result<Vec<(String, String)>, String> {
+        cherry::candidates(&self.cwd, branch).map_err(|e| e.to_string())
+    }
+
+    fn diff(&mut self, commit: &str) -> Result<String, String> {
+        cherry::preview(&self.root, &self.base, commit).map_err(|e| e.to_string())
+    }
+
+    fn start(&mut self, picks: &[(String, String)]) -> Result<Flow, String> {
+        self.picks = picks.to_vec();
+        let ids: Vec<String> = picks.iter().map(|(id, _)| id.clone()).collect();
+        let mut job = Job::new(&self.root, &self.base, &ids, &self.decided);
+        let step = job.advance().map_err(|e| e.to_string())?;
+        self.decided = job.decisions().to_vec();
+        self.job = Some(job);
+        self.flow(step)
+    }
+
+    fn resolve(&mut self, files: Vec<FileConflict>) -> Result<Flow, String> {
+        let job = self.job.as_mut().ok_or("no replay in progress")?;
+        job.resolve(&files).map_err(|e| e.to_string())?;
+        let step = job.advance().map_err(|e| e.to_string())?;
+        self.decided = job.decisions().to_vec();
+        self.flow(step)
+    }
+
+    fn spec(&mut self) -> Result<Spec, String> {
+        let job = self.job.as_ref().ok_or("no replay in progress")?;
+        job.patch(&self.picks)
+            .map(|p| p.spec)
+            .map_err(|e| e.to_string())
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Focus {
+    List,
+    Diff,
+}
+
+// What the screen is waiting for. Only `Browse` interprets navigation keys; the confirmations
+// accept y or n and ignore everything else, Enter included.
+#[derive(Clone, PartialEq, Debug)]
+enum Mode {
+    Browse,
+    Overlay,
+    Resolve,
+    ConfirmApply { summary: String },
+    ConfirmQuit,
+}
+
+#[derive(PartialEq, Debug)]
+pub enum Outcome {
+    Continue,
+    Quit,
+    Submit(Spec),
+}
+
+struct Entry {
+    full: String,
+    subject: String,
+    marked: bool,
+}
+
+struct Overlay {
+    names: Vec<String>,
+    cursor: usize,
+}
+
+// The decision screen's state: the conflicted files of the pick being replayed and a cursor over
+// their individual decisions.
+struct Resolver {
+    files: Vec<FileConflict>,
+    // (file index, unit index) for every decision, in display order.
+    units: Vec<(usize, usize)>,
+    cursor: usize,
+    vscroll: usize,
+}
+
+impl Resolver {
+    fn new(files: Vec<FileConflict>) -> Resolver {
+        let units = files
+            .iter()
+            .enumerate()
+            .flat_map(|(fi, f)| (0..f.units()).map(move |u| (fi, u)))
+            .collect();
+        let mut r = Resolver {
+            files,
+            units,
+            cursor: 0,
+            vscroll: 0,
+        };
+        r.cursor = (0..r.units.len())
+            .find(|&i| r.choice_at(i).is_none())
+            .unwrap_or(0);
+        r
+    }
+
+    fn choice_at(&self, i: usize) -> Option<Side> {
+        let (f, u) = self.units[i];
+        self.files[f].choice(u)
+    }
+
+    fn undecided(&self) -> usize {
+        self.files.iter().map(FileConflict::unresolved).sum()
+    }
+
+    fn move_by(&mut self, delta: isize) {
+        let last = self.units.len().saturating_sub(1);
+        let next = self.cursor.saturating_add_signed(delta).min(last);
+        if next != self.cursor {
+            self.cursor = next;
+            self.vscroll = 0;
+        }
+    }
+
+    // Record `side` for the current decision and, when deciding (not undoing), move on to the next
+    // undecided one if any remains. Returns false when the side is not available here.
+    fn decide(&mut self, side: Option<Side>) -> bool {
+        let Some(&(f, u)) = self.units.get(self.cursor) else {
+            return false;
+        };
+        if !self.files[f].set(u, side) {
+            return false;
+        }
+        if side.is_some() {
+            let after = (self.cursor + 1..self.units.len()).find(|&i| self.choice_at(i).is_none());
+            let before = (0..self.cursor).find(|&i| self.choice_at(i).is_none());
+            if let Some(i) = after.or(before) {
+                self.cursor = i;
+                self.vscroll = 0;
+            }
+        }
+        true
+    }
+
+    // Rows of the left pane: one per decision.
+    fn rows(&self) -> Vec<Line<'static>> {
+        self.units
+            .iter()
+            .enumerate()
+            .map(|(i, &(f, u))| {
+                let file = &self.files[f];
+                let mark = self.choice_at(i).map_or(' ', Side::letter);
+                let of = if file.units() > 1 {
+                    format!("  {}/{}", u + 1, file.units())
+                } else {
+                    String::new()
+                };
+                let color = if mark == ' ' {
+                    Color::Yellow
+                } else {
+                    Color::Green
+                };
+                Line::from(Span::styled(
+                    format!("[{mark}] {}{of}", file.path),
+                    Style::new().fg(color),
+                ))
+            })
+            .collect()
+    }
+
+    // The right pane for the current decision.
+    fn detail(&self, pick: &str) -> Vec<Line<'static>> {
+        let Some(&(f, u)) = self.units.get(self.cursor) else {
+            return Vec::new();
+        };
+        let file = &self.files[f];
+        let choice = file.choice(u);
+        let mut out = vec![
+            Line::from(Span::styled(
+                format!(
+                    " {}  decision {} of {}",
+                    file.path,
+                    self.cursor + 1,
+                    self.units.len()
+                ),
+                Style::new().add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+        ];
+        match &file.body {
+            Body::Hunks(segs) => out.extend(hunk_lines(segs, u, choice, pick)),
+            Body::Whole { ours, theirs, .. } => out.extend(whole_lines(ours, theirs, choice, pick)),
+        }
+        out
+    }
+}
+
+// Replace anything a terminal would interpret. Same policy as the diff pane.
+fn clean(raw: &str) -> String {
+    raw.chars()
+        .flat_map(|c| match c {
+            '\t' => vec![' '; 4],
+            c if c.is_control() => vec!['\u{b7}'],
+            c => vec![c],
+        })
+        .collect()
+}
+
+fn side_header(label: &str, chosen: bool, color: Color) -> Line<'static> {
+    let mut style = Style::new().fg(color).add_modifier(Modifier::BOLD);
+    let mut text = format!("---- {label} ----");
+    if chosen {
+        style = style.add_modifier(Modifier::REVERSED);
+        text.push_str("  <- chosen");
+    }
+    Line::from(Span::styled(text, style))
+}
+
+fn body_lines(bytes: &[u8], color: Color, chosen: bool) -> Vec<Line<'static>> {
+    let mut style = Style::new().fg(color);
+    if !chosen {
+        style = style.add_modifier(Modifier::DIM);
+    }
+    String::from_utf8_lossy(bytes)
+        .lines()
+        .map(|l| Line::from(Span::styled(clean(l), style)))
+        .collect()
+}
+
+// The `unit`-th conflict hunk of a file with a few lines of surrounding text, both sides laid out
+// one above the other.
+fn hunk_lines(
+    segs: &[Segment],
+    unit: usize,
+    choice: Option<Side>,
+    pick: &str,
+) -> Vec<Line<'static>> {
+    let mut out = Vec::new();
+    let mut seen = 0;
+    for (i, seg) in segs.iter().enumerate() {
+        let Segment::Hunk(h) = seg else { continue };
+        if seen != unit {
+            seen += 1;
+            continue;
+        }
+        let dim = Style::new().fg(Color::DarkGray);
+        if let Some(Segment::Text(t)) = i.checked_sub(1).and_then(|p| segs.get(p)) {
+            let lines: Vec<String> = String::from_utf8_lossy(t)
+                .lines()
+                .map(str::to_string)
+                .collect();
+            let start = lines.len().saturating_sub(CONTEXT);
+            for l in &lines[start..] {
+                out.push(Line::from(Span::styled(format!("  {}", clean(l)), dim)));
+            }
+        }
+        let a = matches!(choice, Some(Side::A | Side::Both));
+        let b = matches!(choice, Some(Side::B | Side::Both));
+        out.push(side_header(
+            "A  tree copy (checked-out branch)",
+            a,
+            Color::Cyan,
+        ));
+        out.extend(body_lines(&h.ours, Color::Cyan, choice.is_none() || a));
+        out.push(side_header(
+            &format!("B  from picked commit {pick}"),
+            b,
+            Color::Magenta,
+        ));
+        out.extend(body_lines(&h.theirs, Color::Magenta, choice.is_none() || b));
+        out.push(Line::from(Span::styled("---- end ----", dim)));
+        if let Some(Segment::Text(t)) = segs.get(i + 1) {
+            for l in String::from_utf8_lossy(t).lines().take(CONTEXT) {
+                out.push(Line::from(Span::styled(format!("  {}", clean(l)), dim)));
+            }
+        }
+        return out;
+    }
+    out
+}
+
+// The decision text for a file that is settled as a whole.
+fn whole_lines(
+    ours: &Option<crate::patch::Blob>,
+    theirs: &Option<crate::patch::Blob>,
+    choice: Option<Side>,
+    pick: &str,
+) -> Vec<Line<'static>> {
+    let (what, a_text, b_text) = match (ours, theirs) {
+        (Some(_), None) => (
+            "The tree has this file; the picked commit deletes it.",
+            "keep the tree's file".to_string(),
+            "delete the file, as the picked commit does".to_string(),
+        ),
+        (None, Some(_)) => (
+            "The tree lacks this file; the picked commit changes it.",
+            "leave the file deleted".to_string(),
+            "take the picked commit's file".to_string(),
+        ),
+        _ => (
+            "Both sides changed this file and its content cannot be merged line by line.",
+            "keep the tree's copy".to_string(),
+            "take the picked commit's copy".to_string(),
+        ),
+    };
+    let a = choice == Some(Side::A);
+    let b = choice == Some(Side::B);
+    vec![
+        Line::from(what),
+        Line::from(""),
+        side_header(&format!("A  {a_text}"), a, Color::Cyan),
+        side_header(&format!("B  {b_text} (commit {pick})"), b, Color::Magenta),
+    ]
+}
+
+pub struct App {
+    source_label: Option<String>,
+    entries: Vec<Entry>,
+    truncated: bool,
+    cursor: usize,
+    focus: Focus,
+    mode: Mode,
+    views: HashMap<String, DiffView>,
+    vscroll: usize,
+    hscroll: usize,
+    view_h: usize,
+    view_w: usize,
+    last_h: Option<Instant>,
+    status: String,
+    status_is_error: bool,
+    list_state: ListState,
+    overlay: Option<Overlay>,
+    resolver: Option<Resolver>,
+}
+
+impl App {
+    pub fn new() -> App {
+        App {
+            source_label: None,
+            entries: Vec::new(),
+            truncated: false,
+            cursor: 0,
+            focus: Focus::List,
+            mode: Mode::Browse,
+            views: HashMap::new(),
+            vscroll: 0,
+            hscroll: 0,
+            view_h: 20,
+            view_w: 80,
+            last_h: None,
+            status: String::new(),
+            status_is_error: false,
+            list_state: ListState::default(),
+            overlay: None,
+            resolver: None,
+        }
+    }
+
+    // Use the commits of `branch` (newest first). Marks, cached previews and scroll positions
+    // belong to the previous source and are dropped.
+    pub fn set_source(&mut self, branch: &str, commits: Vec<(String, String)>) {
+        self.truncated = commits.len() >= cherry::MAX_CANDIDATES;
+        self.entries = commits
+            .into_iter()
+            .map(|(full, subject)| Entry {
+                full,
+                subject,
+                marked: false,
+            })
+            .collect();
+        self.source_label = Some(branch.to_string());
+        self.views.clear();
+        self.cursor = 0;
+        self.vscroll = 0;
+        self.hscroll = 0;
+        self.focus = Focus::List;
+    }
+
+    // Open the branch overlay on `names`.
+    pub fn open_overlay(&mut self, names: Vec<String>) {
+        self.overlay = Some(Overlay { names, cursor: 0 });
+        self.mode = Mode::Overlay;
+    }
+
+    fn marked_count(&self) -> usize {
+        self.entries.iter().filter(|e| e.marked).count()
+    }
+
+    // The marked commits, oldest first, which is the order they are replayed in.
+    fn marked_picks(&self) -> Vec<(String, String)> {
+        self.entries
+            .iter()
+            .rev()
+            .filter(|e| e.marked)
+            .map(|e| (e.full.clone(), e.subject.clone()))
+            .collect()
+    }
+
+    pub fn ensure_diff(&mut self, src: &mut dyn Source) {
+        let Some(entry) = self.entries.get(self.cursor) else {
+            return;
+        };
+        if self.views.contains_key(&entry.full) {
+            return;
+        }
+        let full = entry.full.clone();
+        let view = match src.diff(&full) {
+            Ok(text) => style_diff(&text),
+            Err(e) => style_diff(&format!("could not show {full}: {e}")),
+        };
+        self.views.insert(full, view);
+    }
+
+    fn view(&self) -> Option<&DiffView> {
+        self.entries
+            .get(self.cursor)
+            .and_then(|e| self.views.get(&e.full))
+    }
+
+    fn max_v(&self) -> usize {
+        self.view()
+            .map_or(0, |v| v.lines.len().saturating_sub(self.view_h))
+    }
+
+    fn max_h(&self) -> usize {
+        self.view()
+            .map_or(0, |v| v.max_width.saturating_sub(self.view_w))
+    }
+
+    fn clamp_scroll(&mut self) {
+        self.vscroll = self.vscroll.min(self.max_v());
+        self.hscroll = self.hscroll.min(self.max_h());
+    }
+
+    fn step(&mut self, delta: isize) {
+        if self.entries.is_empty() {
+            return;
+        }
+        let last = self.entries.len() - 1;
+        let next = self.cursor.saturating_add_signed(delta).min(last);
+        self.jump(next);
+    }
+
+    fn jump(&mut self, index: usize) {
+        if index != self.cursor {
+            self.cursor = index;
+            self.vscroll = 0;
+            self.hscroll = 0;
+        }
+    }
+
+    fn toggle(&mut self) {
+        if let Some(e) = self.entries.get_mut(self.cursor) {
+            e.marked = !e.marked;
+        }
+    }
+
+    fn say(&mut self, text: impl Into<String>, is_error: bool) {
+        self.status = text.into();
+        self.status_is_error = is_error;
+    }
+
+    pub fn handle_key(&mut self, key: KeyEvent, now: Instant, src: &mut dyn Source) -> Outcome {
+        if key.kind == KeyEventKind::Release {
+            return Outcome::Continue;
+        }
+        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            return Outcome::Quit;
+        }
+        match self.mode.clone() {
+            Mode::Overlay => {
+                self.key_overlay(key, src);
+                return Outcome::Continue;
+            }
+            Mode::Resolve => {
+                self.key_resolve(key, src);
+                return Outcome::Continue;
+            }
+            Mode::ConfirmApply { .. } => return self.key_confirm_apply(key, src),
+            Mode::ConfirmQuit => return self.key_confirm_quit(key),
+            Mode::Browse => {}
+        }
+        self.status.clear();
+        match self.focus {
+            Focus::List => self.key_list(key, src),
+            Focus::Diff => self.key_diff(key, now, src),
+        }
+    }
+
+    fn open_branches(&mut self, src: &mut dyn Source) {
+        match src.branches() {
+            Ok(names) if names.is_empty() => {
+                self.say("there is no other branch to pick from", true)
+            }
+            Ok(names) => self.open_overlay(names),
+            Err(e) => self.say(e, true),
+        }
+    }
+
+    fn key_list(&mut self, key: KeyEvent, src: &mut dyn Source) -> Outcome {
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down => self.step(1),
+            KeyCode::Char('k') | KeyCode::Up => self.step(-1),
+            KeyCode::Char('g') | KeyCode::Home => self.jump(0),
+            KeyCode::Char('G') | KeyCode::End => self.jump(self.entries.len().saturating_sub(1)),
+            KeyCode::Char(' ') => self.toggle(),
+            KeyCode::Char('l') | KeyCode::Right => self.focus = Focus::Diff,
+            KeyCode::Tab => self.open_branches(src),
+            KeyCode::Enter => self.submit(src),
+            KeyCode::Char('q') | KeyCode::Esc => return self.request_quit(),
+            _ => {}
+        }
+        Outcome::Continue
+    }
+
+    fn key_diff(&mut self, key: KeyEvent, now: Instant, src: &mut dyn Source) -> Outcome {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.vscroll = (self.vscroll + 1).min(self.max_v())
+            }
+            KeyCode::Char('k') | KeyCode::Up => self.vscroll = self.vscroll.saturating_sub(1),
+            KeyCode::Char('d') if ctrl => {
+                self.vscroll = (self.vscroll + self.view_h / 2).min(self.max_v())
+            }
+            KeyCode::Char('u') if ctrl => {
+                self.vscroll = self.vscroll.saturating_sub(self.view_h / 2)
+            }
+            KeyCode::Char('g') | KeyCode::Home => self.vscroll = 0,
+            KeyCode::Char('G') | KeyCode::End => self.vscroll = self.max_v(),
+            KeyCode::Char('l') | KeyCode::Right => {
+                self.hscroll = (self.hscroll + H_STEP).min(self.max_h())
+            }
+            KeyCode::Char('h') | KeyCode::Left => self.left(now),
+            KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => self.step(-1),
+            KeyCode::Enter | KeyCode::Char('n') => self.step(1),
+            KeyCode::Char('N') => self.step(-1),
+            KeyCode::Char(' ') => self.toggle(),
+            KeyCode::Tab => self.open_branches(src),
+            KeyCode::Esc => self.focus = Focus::List,
+            KeyCode::Char('q') => return self.request_quit(),
+            _ => {}
+        }
+        Outcome::Continue
+    }
+
+    // Same rule as the `drop` picker: an h that follows another within RUN_WINDOW is part of one
+    // run and never leaves the diff, so holding h to reach the left edge cannot overshoot.
+    fn left(&mut self, now: Instant) {
+        let in_run = self
+            .last_h
+            .is_some_and(|t| now.saturating_duration_since(t) < RUN_WINDOW);
+        self.last_h = Some(now);
+        if self.hscroll > 0 {
+            self.hscroll = self.hscroll.saturating_sub(H_STEP);
+        } else if !in_run {
+            self.focus = Focus::List;
+        }
+    }
+
+    fn key_overlay(&mut self, key: KeyEvent, src: &mut dyn Source) {
+        let Some(ov) = self.overlay.as_mut() else {
+            self.mode = Mode::Browse;
+            return;
+        };
+        let last = ov.names.len().saturating_sub(1);
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down => ov.cursor = (ov.cursor + 1).min(last),
+            KeyCode::Char('k') | KeyCode::Up => ov.cursor = ov.cursor.saturating_sub(1),
+            KeyCode::Char('g') | KeyCode::Home => ov.cursor = 0,
+            KeyCode::Char('G') | KeyCode::End => ov.cursor = last,
+            KeyCode::Enter => {
+                let name = ov.names[ov.cursor].clone();
+                match src.commits(&name) {
+                    Ok(commits) if commits.is_empty() => {
+                        self.say(format!("{name} has no commit that HEAD lacks"), true);
+                    }
+                    Ok(commits) => {
+                        self.set_source(&name, commits);
+                        self.overlay = None;
+                        self.mode = Mode::Browse;
+                        self.status.clear();
+                    }
+                    Err(e) => self.say(e, true),
+                }
+            }
+            KeyCode::Esc | KeyCode::Tab | KeyCode::Char('q') => {
+                self.overlay = None;
+                self.mode = Mode::Browse;
+            }
+            _ => {}
+        }
+    }
+
+    // Enter in the browse screen: replay the marked commits and report where that stops.
+    fn submit(&mut self, src: &mut dyn Source) {
+        let picks = self.marked_picks();
+        if picks.is_empty() {
+            self.say("nothing is marked; press space on a commit first", true);
+            return;
+        }
+        let flow = src.start(&picks);
+        self.after_flow(flow);
+    }
+
+    fn after_flow(&mut self, flow: Result<Flow, String>) {
+        match flow {
+            Ok(Flow::Ready(summary)) => {
+                self.resolver = None;
+                self.mode = Mode::ConfirmApply { summary };
+            }
+            Ok(Flow::Conflicts(files)) => {
+                self.resolver = Some(Resolver::new(files));
+                self.mode = Mode::Resolve;
+            }
+            Ok(Flow::Refused(reason)) => {
+                self.resolver = None;
+                self.mode = Mode::Browse;
+                self.say(reason, true);
+            }
+            Err(e) => {
+                self.mode = Mode::Browse;
+                self.say(e, true);
+            }
+        }
+    }
+
+    fn key_resolve(&mut self, key: KeyEvent, src: &mut dyn Source) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let Some(res) = self.resolver.as_mut() else {
+            self.mode = Mode::Browse;
+            return;
+        };
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down => res.move_by(1),
+            KeyCode::Char('k') | KeyCode::Up => res.move_by(-1),
+            KeyCode::Char('g') | KeyCode::Home => res.move_by(-(res.units.len() as isize)),
+            KeyCode::Char('G') | KeyCode::End => res.move_by(res.units.len() as isize),
+            KeyCode::Char('d') if ctrl => res.vscroll += self.view_h / 2,
+            KeyCode::Char('u') if ctrl => res.vscroll = res.vscroll.saturating_sub(self.view_h / 2),
+            KeyCode::Char('a') => {
+                res.decide(Some(Side::A));
+            }
+            KeyCode::Char('b') => {
+                res.decide(Some(Side::B));
+            }
+            KeyCode::Char('c') => {
+                if !res.decide(Some(Side::Both)) {
+                    self.status = "keeping both is offered for text conflicts only".to_string();
+                    self.status_is_error = true;
+                }
+            }
+            KeyCode::Char('u') => {
+                res.decide(None);
+            }
+            KeyCode::Enter => {
+                let left = res.undecided();
+                if left > 0 {
+                    self.say(format!("{left} conflict(s) still need a decision"), true);
+                    return;
+                }
+                let files = std::mem::take(&mut res.files);
+                self.resolver = None;
+                let flow = src.resolve(files);
+                self.after_flow(flow);
+            }
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.resolver = None;
+                self.mode = Mode::Browse;
+                self.say("decisions abandoned; selection kept", false);
+            }
+            _ => {}
+        }
+    }
+
+    // Only y and n answer. Every other key, Enter included, is ignored.
+    fn key_confirm_apply(&mut self, key: KeyEvent, src: &mut dyn Source) -> Outcome {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => match src.spec() {
+                Ok(spec) => Outcome::Submit(spec),
+                Err(e) => {
+                    self.mode = Mode::Browse;
+                    self.say(e, true);
+                    Outcome::Continue
+                }
+            },
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                self.mode = Mode::Browse;
+                self.say("cancelled; selection kept", false);
+                Outcome::Continue
+            }
+            _ => Outcome::Continue,
+        }
+    }
+
+    fn request_quit(&mut self) -> Outcome {
+        if self.marked_count() == 0 {
+            Outcome::Quit
+        } else {
+            self.mode = Mode::ConfirmQuit;
+            Outcome::Continue
+        }
+    }
+
+    fn key_confirm_quit(&mut self, key: KeyEvent) -> Outcome {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => Outcome::Quit,
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                self.mode = Mode::Browse;
+                Outcome::Continue
+            }
+            _ => Outcome::Continue,
+        }
+    }
+
+    pub fn render(&mut self, frame: &mut Frame) {
+        let area = frame.area();
+        let rows = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(area);
+        let left_w = (area.width * 2 / 5).clamp(28, 60).min(area.width / 2);
+        let cols =
+            Layout::horizontal([Constraint::Length(left_w), Constraint::Min(1)]).split(rows[0]);
+
+        if self.mode == Mode::Resolve {
+            self.render_resolve(frame, cols[0], cols[1]);
+        } else {
+            self.render_browse(frame, cols[0], cols[1]);
+        }
+        self.render_bar(frame, rows[1]);
+        if self.mode == Mode::Overlay {
+            self.render_overlay(frame, area);
+        }
+    }
+
+    fn render_browse(&mut self, frame: &mut Frame, left: Rect, right: Rect) {
+        let focused = self.focus;
+        let focus_style = |f: Focus| {
+            if focused == f {
+                Style::new().fg(Color::Cyan)
+            } else {
+                Style::new().fg(Color::DarkGray)
+            }
+        };
+
+        let items: Vec<ListItem> = self
+            .entries
+            .iter()
+            .map(|e| {
+                let subject = if e.subject.is_empty() {
+                    "(no message)"
+                } else {
+                    &e.subject
+                };
+                let mark = if e.marked { 'x' } else { ' ' };
+                let text = format!("[{mark}] {} {subject}", &e.full[..e.full.len().min(8)]);
+                let style = if e.marked {
+                    Style::new().fg(Color::Green)
+                } else {
+                    Style::new()
+                };
+                ListItem::new(Line::from(Span::styled(text, style)))
+            })
+            .collect();
+        let cursor_style = if self.focus == Focus::List {
+            Style::new().add_modifier(Modifier::REVERSED)
+        } else {
+            Style::new().add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+        };
+        let title = match &self.source_label {
+            Some(name) => format!(
+                " {name}  {} of {} marked{} ",
+                self.marked_count(),
+                self.entries.len(),
+                if self.truncated {
+                    "  (list capped)"
+                } else {
+                    ""
+                }
+            ),
+            None => " Commits  (Tab: choose a branch) ".to_string(),
+        };
+        let list = List::new(items)
+            .block(
+                Block::bordered()
+                    .title(title)
+                    .border_style(focus_style(Focus::List)),
+            )
+            .highlight_style(cursor_style);
+        self.list_state.select(Some(self.cursor));
+        frame.render_stateful_widget(list, left, &mut self.list_state);
+
+        let inner_h = right.height.saturating_sub(2) as usize;
+        let inner_w = right.width.saturating_sub(2) as usize;
+        self.view_h = inner_h.max(1);
+        self.view_w = inner_w.max(1);
+        self.clamp_scroll();
+        let (visible, total): (Vec<Line>, usize) = match self.view() {
+            Some(v) => (
+                v.lines
+                    .iter()
+                    .skip(self.vscroll)
+                    .take(inner_h)
+                    .cloned()
+                    .collect(),
+                v.lines.len(),
+            ),
+            None => (
+                vec![Line::from(
+                    "Press Tab to choose the branch to pick commits from.",
+                )],
+                0,
+            ),
+        };
+        let heading = match self.entries.get(self.cursor) {
+            Some(e) => format!(
+                " {}  line {}/{}  col {} ",
+                &e.full[..e.full.len().min(8)],
+                (self.vscroll + 1).min(total.max(1)),
+                total,
+                self.hscroll + 1
+            ),
+            None => " no commit ".to_string(),
+        };
+        let diff = Paragraph::new(visible)
+            .block(
+                Block::bordered()
+                    .title(heading)
+                    .border_style(focus_style(Focus::Diff)),
+            )
+            .scroll((0, self.hscroll.min(u16::MAX as usize) as u16));
+        frame.render_widget(diff, right);
+    }
+
+    fn render_resolve(&mut self, frame: &mut Frame, left: Rect, right: Rect) {
+        let Some(res) = self.resolver.as_mut() else {
+            return;
+        };
+        let items: Vec<ListItem> = res.rows().into_iter().map(ListItem::new).collect();
+        let title = format!(
+            " Conflicts  {} of {} decided ",
+            res.units.len() - res.undecided(),
+            res.units.len()
+        );
+        let list = List::new(items)
+            .block(
+                Block::bordered()
+                    .title(title)
+                    .border_style(Style::new().fg(Color::Cyan)),
+            )
+            .highlight_style(Style::new().add_modifier(Modifier::REVERSED));
+        let mut state = ListState::default();
+        state.select(Some(res.cursor));
+        frame.render_stateful_widget(list, left, &mut state);
+
+        let pick = self
+            .entries
+            .iter()
+            .find(|e| e.marked)
+            .map_or(String::new(), |e| e.full[..e.full.len().min(8)].to_string());
+        let lines = res.detail(&pick);
+        let inner_h = right.height.saturating_sub(2) as usize;
+        self.view_h = inner_h.max(1);
+        res.vscroll = res.vscroll.min(lines.len().saturating_sub(self.view_h));
+        let visible: Vec<Line> = lines.into_iter().skip(res.vscroll).take(inner_h).collect();
+        let detail = Paragraph::new(visible).block(
+            Block::bordered()
+                .title(" Decide: a = tree copy, b = picked commit ")
+                .border_style(Style::new().fg(Color::Cyan)),
+        );
+        frame.render_widget(detail, right);
+    }
+
+    fn render_overlay(&mut self, frame: &mut Frame, area: Rect) {
+        let Some(ov) = self.overlay.as_ref() else {
+            return;
+        };
+        let w = (area.width * 3 / 5).clamp(30.min(area.width), area.width);
+        let h = (area.height * 3 / 5).clamp(6.min(area.height), area.height);
+        let popup = Rect {
+            x: area.x + (area.width - w) / 2,
+            y: area.y + (area.height - h) / 2,
+            width: w,
+            height: h,
+        };
+        let items: Vec<ListItem> = ov.names.iter().map(|n| ListItem::new(n.as_str())).collect();
+        let list = List::new(items)
+            .block(
+                Block::bordered()
+                    .title(" Pick from which branch?  (Enter use, Esc close) ")
+                    .border_style(Style::new().fg(Color::Yellow)),
+            )
+            .highlight_style(Style::new().add_modifier(Modifier::REVERSED));
+        let mut state = ListState::default();
+        state.select(Some(ov.cursor));
+        frame.render_widget(Clear, popup);
+        frame.render_stateful_widget(list, popup, &mut state);
+    }
+
+    fn render_bar(&self, frame: &mut Frame, area: Rect) {
+        let prompt = Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD);
+        let bar = match &self.mode {
+            Mode::ConfirmApply { summary } => {
+                let last = summary.lines().last().unwrap_or("").trim();
+                Line::from(Span::styled(
+                    format!(
+                        " Apply {} commit(s) as a patch? {last} [y/n] ",
+                        self.marked_count()
+                    ),
+                    prompt,
+                ))
+            }
+            Mode::ConfirmQuit => Line::from(Span::styled(
+                format!(" Quit and discard {} mark(s)? [y/n] ", self.marked_count()),
+                prompt,
+            )),
+            _ if !self.status.is_empty() => {
+                let color = if self.status_is_error {
+                    Color::Red
+                } else {
+                    Color::Green
+                };
+                Line::from(Span::styled(
+                    format!(" {} ", self.status),
+                    Style::new().fg(color).add_modifier(Modifier::BOLD),
+                ))
+            }
+            Mode::Overlay => hint(" j/k move  Enter use branch  Esc close "),
+            Mode::Resolve => hint(
+                " j/k conflict  a tree copy  b picked  c both  u undo  Enter continue  Esc leave ",
+            ),
+            Mode::Browse => match self.focus {
+                Focus::List => {
+                    hint(" j/k move  space mark  l diff  Tab branch  Enter pick marked  q quit ")
+                }
+                Focus::Diff => {
+                    hint(" j/k h/l scroll  Enter/n next  N prev  space mark  Tab branch  q quit")
+                }
+            },
+        };
+        frame.render_widget(Paragraph::new(bar), area);
+    }
+}
+
+fn hint(text: &'static str) -> Line<'static> {
+    Line::from(Span::styled(text, Style::new().fg(Color::DarkGray)))
+}
+
+// Run the screen on the real terminal. Returns the recipe of the patch the operator confirmed, or
+// None when the screen was left without confirming. `from` names the branch to list at once;
+// without it the branch overlay opens first.
+pub fn run(cwd: &Path, from: Option<&str>) -> Res<Option<Spec>> {
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        return Err(
+            "cherry-pick: no commit given, and the interactive screen needs a terminal".into(),
+        );
+    }
+    let root = git::work_tree(cwd)?;
+    let base = git::rev_parse(&root, "HEAD")?;
+    let mut src = GitSource {
+        cwd: cwd.to_path_buf(),
+        root,
+        base,
+        job: None,
+        picks: Vec::new(),
+        decided: Vec::new(),
+    };
+    let mut app = App::new();
+    match from {
+        Some(branch) => {
+            let commits = src.commits(branch)?;
+            if commits.is_empty() {
+                return Err(
+                    format!("cherry-pick: '{branch}' has no commit that HEAD lacks").into(),
+                );
+            }
+            app.set_source(branch, commits);
+        }
+        None => {
+            let names = src.branches()?;
+            if names.is_empty() {
+                return Err("cherry-pick: there is no other branch to pick from".into());
+            }
+            app.open_overlay(names);
+        }
+    }
+
+    let result = with_terminal(|terminal| event_loop(terminal, &mut app, &mut src));
+    match result? {
+        Outcome::Submit(spec) => Ok(Some(spec)),
+        _ => Ok(None),
+    }
+}
+
+fn event_loop(term: &mut DefaultTerminal, app: &mut App, src: &mut dyn Source) -> Res<Outcome> {
+    loop {
+        app.ensure_diff(src);
+        term.draw(|f| app.render(f))?;
+        if let Event::Key(key) = event::read()? {
+            match app.handle_key(key, Instant::now(), src) {
+                Outcome::Continue => {}
+                done => return Ok(done),
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::conflict;
+    use crate::patch::Blob;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+    use std::collections::VecDeque;
+
+    struct Fake {
+        branches: Vec<String>,
+        commits: Vec<(String, String)>,
+        flows: VecDeque<Result<Flow, String>>,
+        started: Vec<Vec<(String, String)>>,
+        resolved: Vec<Vec<FileConflict>>,
+    }
+
+    impl Fake {
+        fn new() -> Fake {
+            Fake {
+                branches: vec!["feat".to_string(), "origin/dev".to_string()],
+                commits: vec![
+                    (id('a'), "newest".to_string()),
+                    (id('b'), String::new()),
+                    (id('c'), "oldest".to_string()),
+                ],
+                flows: VecDeque::new(),
+                started: Vec::new(),
+                resolved: Vec::new(),
+            }
+        }
+    }
+
+    impl Source for Fake {
+        fn branches(&mut self) -> Result<Vec<String>, String> {
+            Ok(self.branches.clone())
+        }
+
+        fn commits(&mut self, branch: &str) -> Result<Vec<(String, String)>, String> {
+            if branch == "empty" {
+                Ok(Vec::new())
+            } else {
+                Ok(self.commits.clone())
+            }
+        }
+
+        fn diff(&mut self, commit: &str) -> Result<String, String> {
+            Ok(format!(
+                "commit {commit}\nAuthor: T <t@e.invalid>\nDate:   now\n\n    msg\n\n \
+                 a.txt | 1 +\n\ndiff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n\
+                 @@ -1 +1 @@\n-old\n+new\n"
+            ))
+        }
+
+        fn start(&mut self, picks: &[(String, String)]) -> Result<Flow, String> {
+            self.started.push(picks.to_vec());
+            self.flows
+                .pop_front()
+                .unwrap_or(Ok(Flow::Ready("1 file changed".into())))
+        }
+
+        fn resolve(&mut self, files: Vec<FileConflict>) -> Result<Flow, String> {
+            self.resolved.push(files);
+            self.flows
+                .pop_front()
+                .unwrap_or(Ok(Flow::Ready("1 file changed".into())))
+        }
+
+        fn spec(&mut self) -> Result<Spec, String> {
+            Ok(Spec {
+                base: id('0'),
+                picks: self.started.last().cloned().unwrap_or_default(),
+                decisions: Vec::new(),
+            })
+        }
+    }
+
+    fn id(c: char) -> String {
+        c.to_string().repeat(40)
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn ch(c: char) -> KeyCode {
+        KeyCode::Char(c)
+    }
+
+    fn press(app: &mut App, fake: &mut Fake, code: KeyCode) -> Outcome {
+        let out = app.handle_key(key(code), Instant::now(), fake);
+        app.ensure_diff(fake);
+        out
+    }
+
+    // An app already showing the fake's commits.
+    fn app() -> (App, Fake) {
+        let mut fake = Fake::new();
+        let mut app = App::new();
+        app.set_source("feat", fake.commits.clone());
+        app.view_h = 10;
+        app.view_w = 40;
+        app.ensure_diff(&mut fake);
+        (app, fake)
+    }
+
+    fn text_conflict(path: &str, src: &str) -> FileConflict {
+        FileConflict {
+            path: path.to_string(),
+            mode: "100644".to_string(),
+            body: Body::Hunks(conflict::parse(src.as_bytes()).unwrap()),
+        }
+    }
+
+    fn whole_conflict(path: &str) -> FileConflict {
+        let blob = |o: &str| {
+            Some(Blob {
+                mode: "100644".to_string(),
+                oid: o.repeat(40),
+            })
+        };
+        FileConflict {
+            path: path.to_string(),
+            mode: "100644".to_string(),
+            body: Body::Whole {
+                ours: blob("1"),
+                theirs: None,
+                choice: None,
+            },
+        }
+    }
+
+    const TWO_HUNKS: &str = "a\n<<<<<<< HEAD\nA1\n=======\nB1\n>>>>>>> x\nmid\n\
+         <<<<<<< HEAD\nA2\n=======\nB2\n>>>>>>> x\n";
+
+    // Mark the first commit and press Enter with the given flows queued.
+    fn submit_with(flows: Vec<Result<Flow, String>>) -> (App, Fake) {
+        let (mut app, mut fake) = app();
+        fake.flows = flows.into();
+        press(&mut app, &mut fake, ch(' '));
+        press(&mut app, &mut fake, KeyCode::Enter);
+        (app, fake)
+    }
+
+    #[test]
+    fn tab_opens_the_overlay_and_enter_switches_source_clearing_marks() {
+        let (mut a, mut f) = app();
+        press(&mut a, &mut f, ch(' '));
+        assert_eq!(a.marked_count(), 1);
+
+        press(&mut a, &mut f, KeyCode::Tab);
+        assert_eq!(a.mode, Mode::Overlay);
+        press(&mut a, &mut f, ch('j'));
+        press(&mut a, &mut f, ch('j'));
+        assert_eq!(
+            a.overlay.as_ref().unwrap().cursor,
+            1,
+            "stops at the last branch"
+        );
+        press(&mut a, &mut f, KeyCode::Enter);
+
+        assert_eq!(a.mode, Mode::Browse);
+        assert_eq!(a.source_label.as_deref(), Some("origin/dev"));
+        assert_eq!(a.marked_count(), 0);
+        assert_eq!(a.cursor, 0);
+    }
+
+    #[test]
+    fn escape_closes_the_overlay_without_changing_anything() {
+        let (mut a, mut f) = app();
+        press(&mut a, &mut f, ch(' '));
+        press(&mut a, &mut f, KeyCode::Tab);
+        press(&mut a, &mut f, KeyCode::Esc);
+        assert_eq!(a.mode, Mode::Browse);
+        assert_eq!(a.source_label.as_deref(), Some("feat"));
+        assert_eq!(a.marked_count(), 1);
+    }
+
+    #[test]
+    fn tab_works_from_the_diff_pane_and_a_branch_without_commits_is_refused() {
+        let (mut a, mut f) = app();
+        f.branches = vec!["empty".to_string()];
+        press(&mut a, &mut f, ch('l'));
+        press(&mut a, &mut f, KeyCode::Tab);
+        assert_eq!(a.mode, Mode::Overlay);
+        press(&mut a, &mut f, KeyCode::Enter);
+        assert_eq!(a.mode, Mode::Overlay, "stays open");
+        assert!(a.status_is_error);
+        assert_eq!(a.source_label.as_deref(), Some("feat"));
+    }
+
+    #[test]
+    fn with_no_other_branch_tab_says_so() {
+        let (mut a, mut f) = app();
+        f.branches.clear();
+        press(&mut a, &mut f, KeyCode::Tab);
+        assert_eq!(a.mode, Mode::Browse);
+        assert!(a.status.contains("no other branch"));
+    }
+
+    #[test]
+    fn enter_with_nothing_marked_explains_and_starts_nothing() {
+        let (mut a, mut f) = app();
+        press(&mut a, &mut f, KeyCode::Enter);
+        assert!(a.status.contains("nothing is marked"));
+        assert!(f.started.is_empty());
+    }
+
+    #[test]
+    fn marked_commits_are_submitted_oldest_first() {
+        let (mut a, mut f) = app();
+        press(&mut a, &mut f, ch(' '));
+        press(&mut a, &mut f, ch('G'));
+        press(&mut a, &mut f, ch(' '));
+        press(&mut a, &mut f, KeyCode::Enter);
+        let picks: Vec<String> = f.started[0].iter().map(|(i, _)| i.clone()).collect();
+        assert_eq!(picks, vec![id('c'), id('a')]);
+    }
+
+    #[test]
+    fn a_clean_selection_asks_for_confirmation_that_only_y_can_give() {
+        let (mut a, mut f) = submit_with(vec![Ok(Flow::Ready("2 files changed".into()))]);
+        assert!(matches!(a.mode, Mode::ConfirmApply { .. }));
+        for code in [KeyCode::Enter, ch(' '), ch('j'), ch('x')] {
+            assert_eq!(press(&mut a, &mut f, code), Outcome::Continue);
+            assert!(matches!(a.mode, Mode::ConfirmApply { .. }));
+        }
+        match press(&mut a, &mut f, ch('y')) {
+            Outcome::Submit(spec) => assert_eq!(spec.picks.len(), 1),
+            other => panic!("expected a submit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn n_and_escape_cancel_the_confirmation_and_keep_the_marks() {
+        for code in [ch('n'), ch('N'), KeyCode::Esc] {
+            let (mut a, mut f) = submit_with(vec![Ok(Flow::Ready(String::new()))]);
+            assert_eq!(press(&mut a, &mut f, code), Outcome::Continue);
+            assert_eq!(a.mode, Mode::Browse);
+            assert_eq!(a.marked_count(), 1);
+        }
+    }
+
+    #[test]
+    fn a_refused_selection_is_reported_with_the_marks_intact() {
+        let (a, _) = submit_with(vec![Ok(Flow::Refused("cannot".into()))]);
+        assert_eq!(a.mode, Mode::Browse);
+        assert!(a.status_is_error);
+        assert_eq!(a.status, "cannot");
+        assert_eq!(a.marked_count(), 1);
+    }
+
+    #[test]
+    fn a_conflict_opens_the_decision_screen_on_the_first_undecided_unit() {
+        let (a, _) = submit_with(vec![Ok(Flow::Conflicts(vec![text_conflict(
+            "f.txt", TWO_HUNKS,
+        )]))]);
+        assert_eq!(a.mode, Mode::Resolve);
+        let res = a.resolver.as_ref().unwrap();
+        assert_eq!(res.units.len(), 2);
+        assert_eq!(res.cursor, 0);
+        assert_eq!(res.undecided(), 2);
+    }
+
+    #[test]
+    fn deciding_moves_on_and_enter_waits_until_everything_is_decided() {
+        let (mut a, mut f) = submit_with(vec![Ok(Flow::Conflicts(vec![text_conflict(
+            "f.txt", TWO_HUNKS,
+        )]))]);
+        press(&mut a, &mut f, ch('b'));
+        assert_eq!(
+            a.resolver.as_ref().unwrap().cursor,
+            1,
+            "advances to the next undecided"
+        );
+        press(&mut a, &mut f, KeyCode::Enter);
+        assert!(a.status.contains("1 conflict(s) still need a decision"));
+        assert_eq!(a.mode, Mode::Resolve);
+        assert!(f.resolved.is_empty());
+
+        f.flows.push_back(Ok(Flow::Ready("done".into())));
+        press(&mut a, &mut f, ch('a'));
+        press(&mut a, &mut f, KeyCode::Enter);
+        assert!(matches!(a.mode, Mode::ConfirmApply { .. }));
+        let sent = &f.resolved[0][0];
+        assert_eq!(sent.choice(0), Some(Side::B));
+        assert_eq!(sent.choice(1), Some(Side::A));
+    }
+
+    #[test]
+    fn navigation_undo_and_both_work_in_the_decision_screen() {
+        let (mut a, mut f) = submit_with(vec![Ok(Flow::Conflicts(vec![text_conflict(
+            "f.txt", TWO_HUNKS,
+        )]))]);
+        press(&mut a, &mut f, ch('j'));
+        assert_eq!(a.resolver.as_ref().unwrap().cursor, 1);
+        press(&mut a, &mut f, ch('j'));
+        assert_eq!(a.resolver.as_ref().unwrap().cursor, 1, "stops at the last");
+        press(&mut a, &mut f, ch('k'));
+        press(&mut a, &mut f, ch('c'));
+        assert_eq!(a.resolver.as_ref().unwrap().choice_at(0), Some(Side::Both));
+        // Deciding moved the cursor on to the other hunk; go back and undo.
+        press(&mut a, &mut f, ch('k'));
+        press(&mut a, &mut f, ch('u'));
+        assert_eq!(a.resolver.as_ref().unwrap().choice_at(0), None);
+        assert_eq!(a.resolver.as_ref().unwrap().undecided(), 2);
+    }
+
+    #[test]
+    fn a_whole_file_conflict_refuses_keeping_both() {
+        let (mut a, mut f) =
+            submit_with(vec![Ok(Flow::Conflicts(vec![whole_conflict("gone.txt")]))]);
+        press(&mut a, &mut f, ch('c'));
+        assert!(a.status_is_error);
+        assert_eq!(a.resolver.as_ref().unwrap().undecided(), 1);
+        press(&mut a, &mut f, ch('a'));
+        assert_eq!(a.resolver.as_ref().unwrap().undecided(), 0);
+    }
+
+    #[test]
+    fn a_later_pick_can_raise_another_conflict_after_the_first_is_resolved() {
+        let (mut a, mut f) = submit_with(vec![
+            Ok(Flow::Conflicts(vec![whole_conflict("one.txt")])),
+            Ok(Flow::Conflicts(vec![text_conflict("two.txt", TWO_HUNKS)])),
+        ]);
+        press(&mut a, &mut f, ch('b'));
+        press(&mut a, &mut f, KeyCode::Enter);
+        assert_eq!(a.mode, Mode::Resolve);
+        assert_eq!(a.resolver.as_ref().unwrap().files[0].path, "two.txt");
+    }
+
+    #[test]
+    fn leaving_the_decision_screen_returns_to_browsing_with_marks_kept() {
+        for code in [KeyCode::Esc, ch('q')] {
+            let (mut a, mut f) =
+                submit_with(vec![Ok(Flow::Conflicts(vec![whole_conflict("g.txt")]))]);
+            assert_eq!(press(&mut a, &mut f, code), Outcome::Continue);
+            assert_eq!(a.mode, Mode::Browse);
+            assert_eq!(a.marked_count(), 1);
+            assert!(a.resolver.is_none());
+        }
+    }
+
+    #[test]
+    fn quitting_asks_only_when_something_is_marked() {
+        let (mut a, mut f) = app();
+        assert_eq!(press(&mut a, &mut f, ch('q')), Outcome::Quit);
+
+        let (mut a, mut f) = app();
+        press(&mut a, &mut f, ch(' '));
+        assert_eq!(press(&mut a, &mut f, ch('q')), Outcome::Continue);
+        assert_eq!(a.mode, Mode::ConfirmQuit);
+        assert_eq!(press(&mut a, &mut f, KeyCode::Enter), Outcome::Continue);
+        assert_eq!(press(&mut a, &mut f, ch('y')), Outcome::Quit);
+    }
+
+    #[test]
+    fn ctrl_c_quits_from_any_screen() {
+        let (mut a, mut f) = submit_with(vec![Ok(Flow::Conflicts(vec![whole_conflict("g.txt")]))]);
+        let ctrl_c = KeyEvent::new(ch('c'), KeyModifiers::CONTROL);
+        assert_eq!(a.handle_key(ctrl_c, Instant::now(), &mut f), Outcome::Quit);
+    }
+
+    #[test]
+    fn diff_pane_keys_match_the_drop_picker() {
+        let (mut a, mut f) = app();
+        press(&mut a, &mut f, ch('l'));
+        assert_eq!(a.focus, Focus::Diff);
+        press(&mut a, &mut f, ch('n'));
+        assert_eq!(a.cursor, 1);
+        press(&mut a, &mut f, ch('N'));
+        assert_eq!(a.cursor, 0);
+        press(&mut a, &mut f, ch('h'));
+        assert_eq!(a.focus, Focus::List);
+    }
+
+    fn render_text(a: &mut App, w: u16, h: u16) -> String {
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| a.render(f)).unwrap();
+        let buf = term.backend().buffer().clone();
+        (0..h)
+            .map(|y| {
+                (0..w)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn browse_screen_shows_source_marks_diff_and_hints() {
+        let (mut a, mut f) = app();
+        press(&mut a, &mut f, ch(' '));
+        let screen = render_text(&mut a, 100, 20);
+        assert!(screen.contains("feat  1 of 3 marked"), "{screen}");
+        assert!(screen.contains("[x] aaaaaaaa newest"), "{screen}");
+        assert!(screen.contains("(no message)"), "{screen}");
+        assert!(screen.contains("+new"), "{screen}");
+        assert!(screen.contains("Tab branch"), "{screen}");
+    }
+
+    #[test]
+    fn overlay_lists_the_branches_over_the_browse_screen() {
+        let (mut a, mut f) = app();
+        press(&mut a, &mut f, KeyCode::Tab);
+        let screen = render_text(&mut a, 100, 20);
+        assert!(screen.contains("Pick from which branch?"), "{screen}");
+        assert!(screen.contains("origin/dev"), "{screen}");
+    }
+
+    #[test]
+    fn without_a_source_the_screen_points_at_tab() {
+        let mut a = App::new();
+        let screen = render_text(&mut a, 100, 12);
+        assert!(screen.contains("Tab: choose a branch"), "{screen}");
+        assert!(
+            screen.contains("Press Tab to choose the branch"),
+            "{screen}"
+        );
+    }
+
+    #[test]
+    fn decision_screen_shows_both_sides_context_and_the_chosen_one() {
+        let (mut a, mut f) = submit_with(vec![Ok(Flow::Conflicts(vec![text_conflict(
+            "f.txt", TWO_HUNKS,
+        )]))]);
+        let screen = render_text(&mut a, 110, 24);
+        assert!(screen.contains("Conflicts  0 of 2 decided"), "{screen}");
+        assert!(screen.contains("[ ] f.txt  1/2"), "{screen}");
+        assert!(screen.contains("A  tree copy"), "{screen}");
+        assert!(
+            screen.contains("B  from picked commit aaaaaaaa"),
+            "{screen}"
+        );
+        assert!(screen.contains("A1") && screen.contains("B1"), "{screen}");
+        assert!(!screen.contains("<- chosen"));
+
+        press(&mut a, &mut f, ch('b'));
+        press(&mut a, &mut f, ch('k'));
+        let screen = render_text(&mut a, 110, 24);
+        assert!(screen.contains("[B] f.txt  1/2"), "{screen}");
+        assert!(screen.contains("<- chosen"), "{screen}");
+        assert!(screen.contains("1 of 2 decided"), "{screen}");
+    }
+
+    #[test]
+    fn decision_screen_describes_a_whole_file_conflict() {
+        let (mut a, _) = submit_with(vec![Ok(Flow::Conflicts(vec![whole_conflict("gone.txt")]))]);
+        let screen = render_text(&mut a, 110, 20);
+        assert!(screen.contains("the picked commit deletes it"), "{screen}");
+        assert!(screen.contains("keep the tree's file"), "{screen}");
+        assert!(screen.contains("delete the file"), "{screen}");
+    }
+
+    #[test]
+    fn confirmation_bar_names_the_count_and_the_change_summary() {
+        let (mut a, _) = submit_with(vec![Ok(Flow::Ready(
+            " b.txt | 1 +\n 1 file changed".into(),
+        ))]);
+        let screen = render_text(&mut a, 120, 12);
+        assert!(
+            screen.contains("Apply 1 commit(s) as a patch? 1 file changed [y/n]"),
+            "{screen}"
+        );
+    }
+
+    #[test]
+    fn tiny_terminals_do_not_panic() {
+        let (mut a, mut f) = app();
+        for (w, h) in [(1, 1), (10, 3), (30, 5)] {
+            render_text(&mut a, w, h);
+        }
+        press(&mut a, &mut f, KeyCode::Tab);
+        render_text(&mut a, 12, 4);
+        let (mut a, _) = submit_with(vec![Ok(Flow::Conflicts(vec![text_conflict(
+            "f.txt", TWO_HUNKS,
+        )]))]);
+        render_text(&mut a, 12, 4);
+    }
+}

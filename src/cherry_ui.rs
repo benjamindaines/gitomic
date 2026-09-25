@@ -538,10 +538,9 @@ pub struct App {
     last_h: Option<Instant>,
     // When the selection last moved to its current commit; the diff waits for `DWELL` after it.
     moved: Option<Instant>,
-    // Set by `set_source` until the first movement key. While parked the selection marker lies
-    // outside the list: no commit is highlighted, no diff is loaded, and only the classification
-    // of the two ends of the list proceeds. j enters at the top, k at the bottom.
-    parked: bool,
+    // Set by `set_source` until the selection has been moved off a leading commit that changes
+    // nothing.
+    unsettled: bool,
     status: String,
     status_is_error: bool,
     list_state: ListState,
@@ -569,7 +568,7 @@ impl App {
             view_w: 80,
             last_h: None,
             moved: None,
-            parked: false,
+            unsettled: false,
             status: String::new(),
             status_is_error: false,
             list_state: ListState::default(),
@@ -601,8 +600,7 @@ impl App {
         self.hscroll = 0;
         self.focus = Focus::List;
         self.moved = None;
-        self.parked = true;
-        self.list_state = ListState::default();
+        self.unsettled = true;
     }
 
     // Open the branch overlay on `names`.
@@ -656,54 +654,33 @@ impl App {
             .is_some_and(|e| e.applies == Some(false))
     }
 
-    // The first commit at or beyond `from` in direction `dir` that changes something.
-    fn first_applicable(&mut self, from: usize, dir: isize, src: &mut dyn Source) -> Option<usize> {
+    // Move the selection off a leading commit that changes nothing, once, after a source is chosen.
+    fn settle(&mut self, src: &mut dyn Source) {
+        if !self.unsettled {
+            return;
+        }
+        self.unsettled = false;
+        self.land(self.cursor, 1, Instant::now(), src);
+    }
+
+    // Select the first commit at or beyond `from` in direction `dir` that changes something. When
+    // there is none the selection stays where it is.
+    fn land(&mut self, from: usize, dir: isize, now: Instant, src: &mut dyn Source) -> bool {
         let mut i = from as isize;
         while i >= 0 && (i as usize) < self.entries.len() {
             self.classify(i as usize, src);
             if !self.inert(i as usize) {
-                return Some(i as usize);
+                self.jump(i as usize, now);
+                return true;
             }
             i += dir;
         }
-        None
-    }
-
-    // Select the first commit at or beyond `from` in direction `dir` that changes something, and
-    // leave the parked state. When there is none the selection stays where it is.
-    fn land(&mut self, from: usize, dir: isize, now: Instant, src: &mut dyn Source) -> bool {
-        let Some(i) = self.first_applicable(from, dir, src) else {
-            if !self.entries.is_empty() {
-                self.say("no commit changes anything on HEAD", false);
-            }
-            return false;
-        };
-        if self.parked || i != self.cursor {
-            self.cursor = i;
-            self.vscroll = 0;
-            self.hscroll = 0;
-            self.moved = Some(now);
-        }
-        self.parked = false;
-        true
-    }
-
-    // Bring the parked selection into the list from the top (`dir` > 0) or from the bottom.
-    fn enter(&mut self, dir: isize, now: Instant, src: &mut dyn Source) {
-        let from = if dir > 0 {
-            0
-        } else {
-            self.entries.len().saturating_sub(1)
-        };
-        self.land(from, dir, now, src);
+        false
     }
 
     // How long the event loop may sleep before it has something to do: the rest of the dwell before
     // a diff is loaded, or nothing at all while commits near the selection await classification.
     pub fn wakeup(&self, now: Instant) -> Option<Duration> {
-        if self.parked {
-            return self.next_unclassified().map(|_| Duration::ZERO);
-        }
         if let (Some(entry), Some(t)) = (self.entries.get(self.cursor), self.moved) {
             let waited = now.saturating_duration_since(t);
             if !self.views.contains_key(&Self::view_key(entry)) && waited < DWELL {
@@ -713,19 +690,8 @@ impl App {
         self.next_unclassified().map(|_| Duration::ZERO)
     }
 
-    // The nearest unclassified commit within `IDLE_REACH` of the selection, below it first. While
-    // the selection is parked the two ends of the list are worked through instead, the top first,
-    // since those are where j and k will enter.
+    // The nearest unclassified commit within `IDLE_REACH` of the selection, below it first.
     fn next_unclassified(&self) -> Option<usize> {
-        if self.parked {
-            let len = self.entries.len();
-            let top = (0..len.min(IDLE_REACH)).find(|&i| self.entries[i].applies.is_none());
-            return top.or_else(|| {
-                (len.saturating_sub(IDLE_REACH)..len)
-                    .rev()
-                    .find(|&i| self.entries[i].applies.is_none())
-            });
-        }
         let end = (self.cursor + IDLE_REACH).min(self.entries.len());
         let below = (self.cursor..end).find(|&i| self.entries[i].applies.is_none());
         below.or_else(|| {
@@ -749,9 +715,7 @@ impl App {
     // Load the highlighted commit's diff once the selection has rested on it for `DWELL`; a diff
     // already loaded is shown at once.
     pub fn ensure_diff(&mut self, src: &mut dyn Source, now: Instant) {
-        if self.parked {
-            return;
-        }
+        self.settle(src);
         let Some(entry) = self.entries.get(self.cursor) else {
             return;
         };
@@ -774,9 +738,6 @@ impl App {
     }
 
     fn view(&self) -> Option<&DiffView> {
-        if self.parked {
-            return None;
-        }
         self.entries
             .get(self.cursor)
             .and_then(|e| self.views.get(&Self::view_key(e)))
@@ -802,10 +763,6 @@ impl App {
     fn step(&mut self, delta: isize, now: Instant, src: &mut dyn Source) {
         let dir = delta.signum();
         if self.entries.is_empty() || dir == 0 {
-            return;
-        }
-        if self.parked {
-            self.enter(dir, now, src);
             return;
         }
         let mut skipped = false;
@@ -838,10 +795,6 @@ impl App {
 
     // Space: mark the highlighted commit whole, or clear its mark (whatever kind it was).
     fn toggle(&mut self) {
-        if self.parked {
-            self.say("no commit is selected; press j or k first", false);
-            return;
-        }
         if let Some(e) = self.entries.get_mut(self.cursor) {
             e.marked = !e.marked;
             e.only = None;
@@ -851,10 +804,6 @@ impl App {
     // R: follow one file's history. The file is the one the highlighted commit changes; when it
     // changes several, an overlay asks which. See `mark_chain`.
     fn mark_file_chain(&mut self, src: &mut dyn Source) {
-        if self.parked {
-            self.say("no commit is selected; press j or k first", false);
-            return;
-        }
         let Some(entry) = self.entries.get(self.cursor) else {
             return;
         };
@@ -972,7 +921,7 @@ impl App {
             }
             KeyCode::Char(' ') => self.toggle(),
             KeyCode::Char('R') => self.mark_file_chain(src),
-            KeyCode::Char('l') | KeyCode::Right if !self.parked => self.focus = Focus::Diff,
+            KeyCode::Char('l') | KeyCode::Right => self.focus = Focus::Diff,
             KeyCode::Tab => self.open_branches(src),
             KeyCode::Enter => self.submit(src),
             KeyCode::Char('q') | KeyCode::Esc => return self.request_quit(),
@@ -1286,8 +1235,7 @@ impl App {
                     .border_style(focus_style(Focus::List)),
             )
             .highlight_style(cursor_style);
-        self.list_state
-            .select(if self.parked { None } else { Some(self.cursor) });
+        self.list_state.select(Some(self.cursor));
         frame.render_stateful_widget(list, left, &mut self.list_state);
 
         let inner_h = right.height.saturating_sub(2) as usize;
@@ -1305,12 +1253,6 @@ impl App {
                     .collect(),
                 v.lines.len(),
             ),
-            None if self.parked => (
-                vec![Line::from(
-                    "Press j to start at the newest commit, or k at the oldest.",
-                )],
-                0,
-            ),
             None if !self.entries.is_empty() => (vec![Line::from("(loading the diff...)")], 0),
             None => (
                 vec![Line::from(
@@ -1319,7 +1261,7 @@ impl App {
                 0,
             ),
         };
-        let heading = match self.entries.get(self.cursor).filter(|_| !self.parked) {
+        let heading = match self.entries.get(self.cursor) {
             Some(e) => format!(
                 " {}{}  line {}/{}  col {} ",
                 &e.full[..e.full.len().min(8)],
@@ -1330,7 +1272,6 @@ impl App {
                 total,
                 self.hscroll + 1
             ),
-            None if self.parked => " no commit selected ".to_string(),
             None => " no commit ".to_string(),
         };
         let diff = Paragraph::new(visible)
@@ -1692,25 +1633,15 @@ mod tests {
         out
     }
 
-    // An app showing the fake's commits with the selection still parked off the list.
-    fn parked_app(fake: Fake) -> (App, Fake) {
+    // An app already showing the fake's commits.
+    fn app() -> (App, Fake) {
+        let mut fake = Fake::new();
         let mut app = App::new();
         app.set_source("feat", fake.commits.clone());
         app.view_h = 10;
         app.view_w = 40;
+        app.ensure_diff(&mut fake, Instant::now());
         (app, fake)
-    }
-
-    // An app whose selection has entered the list from the top with j, diff loaded.
-    fn entered(fake: Fake) -> (App, Fake) {
-        let (mut app, mut fake) = parked_app(fake);
-        press(&mut app, &mut fake, ch('j'));
-        (app, fake)
-    }
-
-    // An app already showing the fake's commits, on the first commit that applies.
-    fn app() -> (App, Fake) {
-        entered(Fake::new())
     }
 
     fn text_conflict(path: &str, src: &str) -> FileConflict {
@@ -2141,7 +2072,12 @@ mod tests {
     fn app_with_inert_middle() -> (App, Fake) {
         let mut fake = Fake::new();
         fake.inert = vec![id('b')];
-        entered(fake)
+        let mut app = App::new();
+        app.set_source("feat", fake.commits.clone());
+        app.view_h = 10;
+        app.view_w = 40;
+        app.ensure_diff(&mut fake, Instant::now());
+        (app, fake)
     }
 
     #[test]
@@ -2177,12 +2113,15 @@ mod tests {
     fn g_and_capital_g_land_on_the_nearest_commit_that_applies() {
         let mut fake = Fake::new();
         fake.inert = vec![id('a'), id('c')];
-        let (mut a, mut fake) = parked_app(fake);
+        let mut a = App::new();
+        a.set_source("feat", fake.commits.clone());
+        // The first commit is inert, so the screen opens on the next one.
+        a.ensure_diff(&mut fake, Instant::now());
+        assert_eq!(a.cursor, 1);
         press(&mut a, &mut fake, ch('g'));
-        assert_eq!(a.cursor, 1, "the inert first commit is passed over");
+        assert_eq!(a.cursor, 1);
         press(&mut a, &mut fake, ch('G'));
-        assert_eq!(a.cursor, 1, "and the inert last one");
-        assert!(!a.parked);
+        assert_eq!(a.cursor, 1);
     }
 
     #[test]
@@ -2211,12 +2150,10 @@ mod tests {
 
     #[test]
     fn classification_is_lazy_and_done_once_per_commit() {
-        let mut fake = Fake::new();
-        fake.inert = vec![id('b')];
-        let (mut a, mut f) = parked_app(fake);
+        let (mut a, mut f) = app_with_inert_middle();
         assert!(
-            f.asked.is_empty(),
-            "nothing is asked while the selection is parked"
+            f.asked.len() <= 1,
+            "only the leading commit was needed to open"
         );
         press(&mut a, &mut f, ch('j'));
         press(&mut a, &mut f, ch('k'));
@@ -2242,18 +2179,20 @@ mod tests {
 
     #[test]
     fn the_diff_waits_for_the_selection_to_rest_and_is_then_loaded_once() {
-        let (mut a, mut fake) = parked_app(Fake::new());
+        let mut fake = Fake::new();
+        let mut a = App::new();
+        a.set_source("feat", fake.commits.clone());
+        a.view_h = 10;
+        a.view_w = 40;
         let t0 = Instant::now();
         a.ensure_diff(&mut fake, t0);
-        assert!(
-            fake.diffs.is_empty(),
-            "nothing loads while the selection is parked"
-        );
+        assert_eq!(fake.diffs.len(), 1, "the first commit shows at once");
 
         a.handle_key(key(ch('j')), t0, &mut fake);
         a.ensure_diff(&mut fake, t0 + DWELL / 2);
-        assert!(
-            fake.diffs.is_empty(),
+        assert_eq!(
+            fake.diffs.len(),
+            1,
             "not loaded while the selection is still fresh"
         );
         assert!(a
@@ -2261,147 +2200,43 @@ mod tests {
             .is_some_and(|d| d <= DWELL / 2 + Duration::from_millis(1)));
         let screen = render_text(&mut a, 100, 12);
         assert!(screen.contains("loading the diff"), "{screen}");
-        a.ensure_diff(&mut fake, t0 + DWELL);
-        assert_eq!(fake.diffs.len(), 1);
-        assert_eq!(fake.diffs[0].0, id('a'));
 
         // Passing over further commits within the dwell never loads them.
-        a.handle_key(key(ch('j')), t0 + DWELL, &mut fake);
-        a.ensure_diff(&mut fake, t0 + DWELL + DWELL / 2);
-        assert_eq!(fake.diffs.len(), 1, "the dwell restarted with the move");
-        a.handle_key(key(ch('j')), t0 + DWELL + DWELL / 2, &mut fake);
-        a.ensure_diff(&mut fake, t0 + DWELL * 2);
-        assert_eq!(fake.diffs.len(), 1, "and again with the next move");
+        a.handle_key(key(ch('j')), t0 + DWELL / 2, &mut fake);
+        a.ensure_diff(&mut fake, t0 + DWELL);
+        assert_eq!(
+            fake.diffs.len(),
+            1,
+            "the dwell restarted with the second move"
+        );
 
-        a.ensure_diff(&mut fake, t0 + DWELL * 3);
+        a.ensure_diff(&mut fake, t0 + DWELL / 2 + DWELL);
         assert_eq!(fake.diffs.len(), 2);
         assert_eq!(
             fake.diffs[1].0,
             id('c'),
             "only the commit rested on was loaded"
         );
-        a.ensure_diff(&mut fake, t0 + DWELL * 4);
+        a.ensure_diff(&mut fake, t0 + DWELL * 3);
         assert_eq!(fake.diffs.len(), 2, "loaded once");
     }
 
     #[test]
     fn a_commit_visited_before_shows_its_cached_diff_without_waiting() {
-        let (mut a, mut fake) = parked_app(Fake::new());
+        let mut fake = Fake::new();
+        let mut a = App::new();
+        a.set_source("feat", fake.commits.clone());
+        a.view_h = 10;
+        a.view_w = 40;
         let t0 = Instant::now();
+        a.ensure_diff(&mut fake, t0);
         a.handle_key(key(ch('j')), t0, &mut fake);
         a.ensure_diff(&mut fake, t0 + DWELL);
-        a.handle_key(key(ch('j')), t0 + DWELL, &mut fake);
-        a.ensure_diff(&mut fake, t0 + DWELL * 2);
-        a.handle_key(key(ch('k')), t0 + DWELL * 2, &mut fake);
+        a.handle_key(key(ch('k')), t0 + DWELL, &mut fake);
         let before = fake.diffs.len();
-        a.ensure_diff(&mut fake, t0 + DWELL * 2);
+        a.ensure_diff(&mut fake, t0 + DWELL);
         assert_eq!(fake.diffs.len(), before);
         assert!(a.view().is_some());
-    }
-
-    #[test]
-    fn the_selection_starts_parked_and_nothing_is_loaded_or_highlighted() {
-        let (mut a, f) = parked_app(Fake::new());
-        assert!(a.parked);
-        let mut f = f;
-        a.ensure_diff(&mut f, Instant::now() + DWELL);
-        assert!(f.diffs.is_empty());
-        let screen = render_text(&mut a, 100, 12);
-        assert!(screen.contains("no commit selected"), "{screen}");
-        assert!(screen.contains("Press j to start"), "{screen}");
-        assert_eq!(a.list_state.selected(), None);
-    }
-
-    #[test]
-    fn j_enters_from_the_top_and_k_from_the_bottom_skipping_gray_ends() {
-        let mut fake = Fake::new();
-        fake.inert = vec![id('a'), id('c')];
-        let (mut a, mut f) = parked_app(fake);
-        // Ends are worked out while idle, before any key.
-        let now = Instant::now();
-        while a.wakeup(now).is_some() {
-            a.tick(&mut f, now);
-        }
-        assert!(a.parked);
-        assert!(f.diffs.is_empty(), "classifying loads no diff");
-        press(&mut a, &mut f, ch('j'));
-        assert_eq!((a.parked, a.cursor), (false, 1));
-
-        let mut fake = Fake::new();
-        fake.inert = vec![id('c')];
-        let (mut a, mut f) = parked_app(fake);
-        press(&mut a, &mut f, ch('k'));
-        assert_eq!(
-            (a.parked, a.cursor),
-            (false, 1),
-            "enters at the bottom, past the gray last"
-        );
-
-        let (mut a, mut f) = parked_app(Fake::new());
-        press(&mut a, &mut f, KeyCode::Up);
-        assert_eq!(a.cursor, 2);
-        let (mut a, mut f) = parked_app(Fake::new());
-        press(&mut a, &mut f, KeyCode::Down);
-        assert_eq!(a.cursor, 0);
-    }
-
-    #[test]
-    fn only_the_gray_ends_are_stat_ed_before_the_first_key() {
-        let mut fake = Fake::new();
-        fake.inert = vec![id('a')];
-        let (mut a, mut f) = parked_app(fake);
-        let now = Instant::now();
-        while a.wakeup(now).is_some() {
-            a.tick(&mut f, now);
-        }
-        assert!(a.entries.iter().all(|e| e.applies.is_some()));
-        assert_eq!(a.entries[0].applies, Some(false));
-        press(&mut a, &mut f, ch('j'));
-        let first_diff = f.diffs.first().map(|d| d.0.clone());
-        assert_eq!(
-            first_diff,
-            Some(id('b')),
-            "the first diff is that of the entered commit"
-        );
-    }
-
-    #[test]
-    fn marking_and_the_diff_pane_do_nothing_while_parked() {
-        let (mut a, mut f) = parked_app(Fake::new());
-        press(&mut a, &mut f, ch(' '));
-        press(&mut a, &mut f, ch('R'));
-        press(&mut a, &mut f, ch('l'));
-        assert_eq!(a.marked_count(), 0);
-        assert_eq!(a.focus, Focus::List);
-        assert!(a.parked);
-        assert_eq!(a.mode, Mode::Browse);
-    }
-
-    #[test]
-    fn a_list_of_only_gray_commits_stays_parked_and_says_so() {
-        let mut fake = Fake::new();
-        fake.inert = vec![id('a'), id('b'), id('c')];
-        let (mut a, mut f) = parked_app(fake);
-        press(&mut a, &mut f, ch('j'));
-        assert!(a.parked);
-        assert!(
-            a.status.contains("no commit changes anything"),
-            "{}",
-            a.status
-        );
-        press(&mut a, &mut f, ch('k'));
-        assert!(a.parked);
-    }
-
-    #[test]
-    fn choosing_another_branch_parks_the_selection_again() {
-        let (mut a, mut f) = app();
-        assert!(!a.parked);
-        press(&mut a, &mut f, KeyCode::Tab);
-        press(&mut a, &mut f, KeyCode::Enter);
-        assert_eq!(a.source_label.as_deref(), Some("feat"));
-        assert!(a.parked);
-        assert_eq!(a.list_state.selected(), None);
     }
 
     fn render_text(a: &mut App, w: u16, h: u16) -> String {

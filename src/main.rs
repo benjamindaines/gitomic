@@ -82,6 +82,10 @@ fn dispatch(args: &[String]) -> Res<()> {
             };
             commands::exec(&cwd, &argv, shell)
         }
+        "drop" | "rm" => {
+            let opts = DropOpts::parse(&args[1..])?;
+            commands::drop_commits(&cwd, &opts.hashes, opts.dry_run)
+        }
         "stop" => commands::stop(&cwd),
         "abort" => commands::abort(&cwd, args[1..].iter().any(|a| a == "--force" || a == "-f")),
         "-h" | "--help" | "help" | "" => {
@@ -123,6 +127,35 @@ impl FinishOpts {
             }
         }
         Ok(FinishOpts { message, numbering })
+    }
+}
+
+// Parsed options for the drop command.
+struct DropOpts {
+    hashes: Vec<String>,
+    dry_run: bool,
+}
+
+impl DropOpts {
+    // Parse drop arguments. Every positional word is a commit hash (abbreviated or full);
+    // `-n/--dry-run` reports what would be dropped, and whether every later commit still applies,
+    // without changing anything.
+    fn parse(rest: &[String]) -> Res<DropOpts> {
+        let mut hashes = Vec::new();
+        let mut dry_run = false;
+        for arg in rest {
+            match arg.as_str() {
+                "-n" | "--dry-run" => dry_run = true,
+                flag if flag.starts_with('-') => {
+                    return Err(format!("unexpected option '{flag}' for drop").into())
+                }
+                hash => hashes.push(hash.to_string()),
+            }
+        }
+        if hashes.is_empty() {
+            return Err("drop: expected at least one commit hash".into());
+        }
+        Ok(DropOpts { hashes, dry_run })
     }
 }
 
@@ -193,6 +226,14 @@ COMMANDS:
                        active session. Mainly for `stage = tracked`; under `stage = observed` a live watcher
                        captures created files directly. `-c` runs a shell string (su-style); otherwise <cmd>
                        is an argv run without a shell. Aliases: run.
+  drop [-n] <hash>...  Delete individual unpublished commits from the checked-out branch: those in
+                       the open session's pending batch or, with no session, any commit not
+                       contained in a remote-tracking branch. Later commits are re-applied without
+                       them, and the files the dropped commits changed are removed or restored on
+                       disk; uncommitted edits to other files are kept. Refuses, changing nothing,
+                       when a later commit depends on a dropped change or an uncommitted edit
+                       blocks the update. -n/--dry-run only reports. Recover a drop with
+                       'git cherry-pick <full id>' (printed). Aliases: rm.
   stop                 Stop the watcher but keep the base and recorded commits for later finish/resume.
   abort [--force]      Discard the session: reset the branch to the base and drop the atomic commits.
   help, --version

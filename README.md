@@ -37,6 +37,7 @@ gitomic finish -m "message"  # stop watching and stamp the message across the ba
 gitomic finish               # same, but open $GIT_EDITOR for the message
 gitomic stop                 # stop watching, keep the base and commits for later finish/resume
 gitomic abort --force        # discard the session: reset the branch to the base
+gitomic drop <hash>...       # delete individual unpublished commits (alias: rm)
 ```
 
 Running `init` again when a base already exists but no watcher is live **resumes** that session rather than
@@ -47,6 +48,32 @@ starting a new one, so an accidental `stop` — or a reboot — is recoverable w
 - `-m, --message <text>` — use `<text>` and skip the editor.
 - `-n, --numbering` — append ` [i/N]` to each commit message this run.
 - `--no-numbering` — do not append ordinals this run (overrides the config default).
+
+### drop
+
+`gitomic drop <hash>...` deletes individual commits that have not been pushed, using the short hashes printed
+by the `finish` editor template, `gitomic diff`, or `git log`.
+
+- **Eligible commits** are the open session's pending batch (`base..HEAD`) or, when no session is open, any
+  commit on the checked-out branch that no remote-tracking branch contains. A commit that is already in a
+  remote-tracking branch, a root commit, and a merge commit are refused.
+- **History** is rewritten by re-applying the later commits onto the surviving parent, keeping each one's
+  message and authorship. The work happens in the object database, so nothing on disk changes until every
+  replay has succeeded.
+- **Dependencies** are detected, not guessed at: a later commit that does not apply without a dropped change
+  (for instance, one that edits a file the dropped commit created) aborts the whole operation and is named in
+  the error. Pass its hash as well to drop it together with the commit it depends on.
+- **Work tree**: files the dropped commits added are removed and files they changed are restored, as
+  `git reset --keep` does. Uncommitted edits to any other file are kept; an uncommitted edit to a file that
+  must be rewritten aborts the operation with nothing changed.
+- **Session**: a live watcher is stopped, its final capture flushed, and the watcher restarted afterwards, so
+  the session carries on. The base marker is untouched.
+- **Recovery**: the full id of every dropped commit is printed. The objects remain until garbage collection,
+  so `git cherry-pick <full id>` restores one.
+- `-n, --dry-run` reports what would be dropped and whether every later commit still applies, and modifies
+  nothing.
+
+Requires git 2.38 or newer (`git merge-tree --write-tree`).
 
 ## Configuration
 

@@ -401,6 +401,206 @@ pub fn abort(cwd: &Path, force: bool) -> Res<()> {
     Ok(())
 }
 
+// Remove individual unpublished commits from the checked-out branch (issue #12). Each selector is a
+// commit hash, abbreviated or full, as printed by the finish template or `git log`. The candidates
+// are the commits that no remote-tracking ref contains or, while a session is open, the session's
+// pending batch (base..HEAD). A published commit is refused: rewriting it would diverge from what a
+// remote already holds.
+//
+// The rewrite is computed entirely in the object database. The commits following the first dropped
+// one are re-applied, oldest first, onto the surviving parent with their messages and authorship
+// intact. A later commit that does not apply cleanly without a dropped change (for example, one
+// that edits a file the dropped commit created) aborts the whole operation before anything is
+// modified; the error names that commit so it can be dropped as well. Only when every replay
+// succeeds is the branch moved, with `reset --keep`: files the dropped commits introduced or
+// altered are removed or restored on disk, uncommitted edits elsewhere are retained, and an
+// uncommitted edit to a file that must be rewritten aborts the move with nothing changed. The
+// dropped commit objects stay in the object database until garbage collection, and their full ids
+// are printed so a mistaken drop is recoverable with `git cherry-pick`.
+//
+// An open session's watcher is stopped and its final capture flushed first, so the tip being
+// rewritten is stable, then restarted afterwards, so the session continues. `dry_run` reports the
+// outcome, including any conflict, without modifying the branch or the watcher.
+pub fn drop_commits(cwd: &Path, selectors: &[String], dry_run: bool) -> Res<()> {
+    let root = git::work_tree(cwd)?;
+    let git_dir = git::git_dir(cwd)?;
+    let branch = git::current_branch(&root)?;
+
+    if selectors.is_empty() {
+        return Err("drop: expected at least one commit hash".into());
+    }
+    if git::operation_in_progress(&git_dir) {
+        return Err("drop: a merge, rebase, cherry-pick, revert, or bisect is in progress".into());
+    }
+
+    // Rejecting a bad selector before the watcher is disturbed keeps a typo from interrupting a
+    // session.
+    resolve_drop_targets(&root, &branch, selectors)?;
+
+    let was_live = !dry_run && live_watcher(&git_dir, &branch).is_some();
+    if was_live {
+        let cfg = Config::load()?;
+        terminate_watcher(&git_dir, &branch)?;
+        report_flush(&root, &git_dir, &branch, &cfg);
+    }
+
+    let result = drop_locked(&root, &branch, selectors, dry_run);
+
+    if was_live {
+        if let Err(e) = init(cwd, false, false) {
+            eprintln!("gitomic: drop: watcher could not be restarted: {e}");
+        }
+    }
+    result
+}
+
+// Candidate commits for a drop, oldest-first with their parents, and the wording that describes the
+// candidate set in diagnostics. An open session confines candidates to its pending batch, since the
+// base marker must stay an ancestor of the branch tip; otherwise every commit not yet contained in
+// a remote-tracking ref qualifies.
+type Chain = Vec<(String, Vec<String>)>;
+type Candidates = (Chain, &'static str);
+
+fn drop_candidates(root: &Path, branch: &str) -> Res<Candidates> {
+    let base_ref = git::base_ref(branch);
+    if git::rev_exists(root, &base_ref)? {
+        let range = format!("{base_ref}..HEAD");
+        Ok((
+            git::commits_with_parents(root, Some(&range))?,
+            "in this session's pending batch",
+        ))
+    } else {
+        Ok((
+            git::commits_with_parents(root, None)?,
+            "unpublished (not contained in any remote-tracking branch)",
+        ))
+    }
+}
+
+// Resolve each selector to a full commit id and confirm it is a candidate. Returns the candidate
+// list and the distinct selected ids in history order, so the caller reports and replays them
+// consistently regardless of the order or repetition on the command line.
+fn resolve_drop_targets(
+    root: &Path,
+    branch: &str,
+    selectors: &[String],
+) -> Res<(Chain, Vec<String>)> {
+    let (candidates, scope) = drop_candidates(root, branch)?;
+    let mut chosen: Vec<String> = Vec::new();
+    for sel in selectors {
+        let full = git::rev_parse(root, &format!("{sel}^{{commit}}"))
+            .map_err(|_| format!("drop: '{sel}' does not name a single commit"))?;
+        if !candidates.iter().any(|(c, _)| *c == full) {
+            return Err(format!(
+                "drop: {} is not {scope} on '{branch}'; only such commits may be dropped",
+                short(&full)
+            )
+            .into());
+        }
+        if !chosen.contains(&full) {
+            chosen.push(full);
+        }
+    }
+    let ordered = candidates
+        .iter()
+        .map(|(c, _)| c.clone())
+        .filter(|c| chosen.contains(c))
+        .collect();
+    Ok((candidates, ordered))
+}
+
+// The rewrite proper, run with the watcher already stopped. Selectors are resolved again here
+// because the final capture may have amended the newest atomic commit, changing its id.
+fn drop_locked(root: &Path, branch: &str, selectors: &[String], dry_run: bool) -> Res<()> {
+    let (candidates, targets) = resolve_drop_targets(root, branch, selectors).map_err(|e| {
+        format!("{e} (a capture of pending edits may have amended the newest commit; re-check it)")
+    })?;
+    let first = candidates
+        .iter()
+        .position(|(c, _)| targets.contains(c))
+        .ok_or("drop: no matching commit")?;
+
+    // Replay is defined for a single chain of single-parent commits. A merge or root commit at or
+    // after the first dropped commit has no unique parent to re-apply onto.
+    for (c, parents) in &candidates[first..] {
+        if parents.len() != 1 {
+            let kind = if parents.is_empty() { "root" } else { "merge" };
+            return Err(format!(
+                "drop: {} is a {kind} commit; only linear history can be rewritten",
+                short(c)
+            )
+            .into());
+        }
+    }
+
+    let old_head = git::rev_parse(root, "HEAD")?;
+    let mut parent = candidates[first].1[0].clone();
+    let mut replayed = 0usize;
+    for (commit, _) in &candidates[first + 1..] {
+        if targets.contains(commit) {
+            continue;
+        }
+        match git::cherry_pick_tree(root, &parent, commit)? {
+            git::Pick::Tree(tree) => {
+                let message = git::commit_message(root, commit)?;
+                let (name, email, date) = git::author_of(root, commit)?;
+                parent = git::commit_tree(root, &tree, &parent, &message, &name, &email, &date)?;
+                replayed += 1;
+            }
+            git::Pick::Conflict => {
+                return Err(format!(
+                    "drop: {} does not apply without the change being dropped; nothing was \
+                     modified. Add its hash to the command to drop it as well.",
+                    short(commit)
+                )
+                .into());
+            }
+        }
+    }
+
+    if dry_run {
+        println!("gitomic: dry run; nothing was modified");
+    } else {
+        // The watcher is stopped, so HEAD can only differ if something outside gitomic moved it
+        // meanwhile.
+        if git::rev_parse(root, "HEAD")? != old_head {
+            return Err(
+                "drop: HEAD moved while the rewrite was prepared; nothing was modified".into(),
+            );
+        }
+        git::reset_keep(root, &parent, "gitomic drop").map_err(|e| {
+            format!(
+                "drop: cannot update the work tree ({e}); commit or stash uncommitted edits to the \
+                 files involved and retry. Nothing was modified."
+            )
+        })?;
+    }
+
+    let verb = if dry_run { "would drop" } else { "dropped" };
+    for commit in &targets {
+        let message = git::commit_message(root, commit)?;
+        let subject = message.lines().next().unwrap_or("").trim();
+        let subject = if subject.is_empty() {
+            "(no message)"
+        } else {
+            subject
+        };
+        println!("gitomic: {verb} {} {subject}", short(commit));
+    }
+    println!(
+        "  {replayed} later commit(s) re-applied; {} -> {}",
+        short(&old_head),
+        short(&parent)
+    );
+    if !dry_run {
+        println!("  recover a dropped commit with: git cherry-pick <full id>");
+        for commit in &targets {
+            println!("    {commit}");
+        }
+    }
+    Ok(())
+}
+
 // End the session: stop the watcher, then stamp one message across every atomic commit recorded since the
 // base. `message` short-circuits the editor; otherwise the configured editor is launched with a template.
 pub fn finish(cwd: &Path, message: Option<String>, numbering_override: Option<bool>) -> Res<()> {
@@ -527,6 +727,9 @@ fn template(commits: &[String]) -> String {
     for c in commits {
         t.push_str(&format!("#   {}\n", short(c)));
     }
+    t.push_str("#\n");
+    t.push_str("# To remove a commit from this list, leave the message empty, run\n");
+    t.push_str("# 'gitomic drop <hash>', then run finish again.\n");
     t
 }
 
@@ -674,5 +877,232 @@ mod tests {
     fn short_truncates() {
         assert_eq!(short("0123456789abcdef0123"), "0123456789ab");
         assert_eq!(short("abc"), "abc");
+    }
+}
+
+// Tests for `drop` run against throwaway repositories in the system temporary directory, one per
+// test, so no test depends on another's state or on the developer's own git configuration.
+#[cfg(test)]
+mod drop_tests {
+    use super::*;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+
+    // A fresh repository on branch `main` with a local identity, removed on drop.
+    struct Repo(PathBuf);
+
+    impl Repo {
+        fn new() -> Repo {
+            let n = NEXT.fetch_add(1, Ordering::SeqCst);
+            let dir = std::env::temp_dir().join(format!("gitomic-drop-{}-{n}", std::process::id()));
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(&dir).unwrap();
+            let repo = Repo(dir);
+            repo.git(&["init", "-q", "-b", "main"]);
+            repo.git(&["config", "user.name", "Test"]);
+            repo.git(&["config", "user.email", "test@example.invalid"]);
+            repo
+        }
+
+        fn git(&self, args: &[&str]) -> String {
+            git::run(&self.0, args).unwrap()
+        }
+
+        // Write `content` to `name` and record it as one commit with `msg`.
+        fn commit_file(&self, name: &str, content: &str, msg: &str) -> String {
+            fs::write(self.0.join(name), content).unwrap();
+            self.git(&["add", name]);
+            self.git(&["commit", "-q", "-m", msg]);
+            self.git(&["rev-parse", "HEAD"])
+        }
+
+        fn subjects(&self) -> Vec<String> {
+            self.git(&["log", "--format=%s", "--reverse"])
+                .lines()
+                .map(str::to_string)
+                .collect()
+        }
+
+        fn drop(&self, hashes: &[&str], dry_run: bool) -> Res<()> {
+            let sel: Vec<String> = hashes.iter().map(|h| h.to_string()).collect();
+            drop_commits(&self.0, &sel, dry_run)
+        }
+    }
+
+    impl Drop for Repo {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn drops_a_middle_commit_and_its_files() {
+        let r = Repo::new();
+        r.commit_file("a.txt", "a\n", "one");
+        let two = r.commit_file("b.txt", "b\n", "two");
+        r.commit_file("c.txt", "c\n", "three");
+
+        r.drop(&[&two[..8]], false).unwrap();
+
+        assert_eq!(r.subjects(), ["one", "three"]);
+        assert!(r.0.join("a.txt").exists());
+        assert!(!r.0.join("b.txt").exists());
+        assert!(r.0.join("c.txt").exists());
+        assert!(!r.git(&["rev-list", "HEAD"]).contains(&two));
+    }
+
+    #[test]
+    fn preserves_authorship_and_empty_messages_of_replayed_commits() {
+        let r = Repo::new();
+        r.commit_file("a.txt", "a\n", "one");
+        let two = r.commit_file("b.txt", "b\n", "two");
+        fs::write(r.0.join("c.txt"), "c\n").unwrap();
+        r.git(&["add", "c.txt"]);
+        r.git(&[
+            "commit",
+            "-q",
+            "--allow-empty-message",
+            "-m",
+            "",
+            "--author",
+            "Other <other@example.invalid>",
+        ]);
+
+        r.drop(&[&two], false).unwrap();
+
+        assert_eq!(
+            r.git(&["log", "-1", "--format=%an <%ae>"]),
+            "Other <other@example.invalid>"
+        );
+        assert_eq!(r.git(&["log", "-1", "--format=%s"]), "");
+    }
+
+    #[test]
+    fn refuses_when_a_later_commit_depends_on_the_dropped_one() {
+        let r = Repo::new();
+        r.commit_file("a.txt", "a\n", "one");
+        let two = r.commit_file("b.txt", "b1\n", "two");
+        r.commit_file("b.txt", "b2\n", "three");
+        let head = r.git(&["rev-parse", "HEAD"]);
+
+        let err = r.drop(&[&two], false).unwrap_err().to_string();
+
+        assert!(err.contains("does not apply"), "{err}");
+        assert_eq!(r.git(&["rev-parse", "HEAD"]), head);
+        assert_eq!(fs::read_to_string(r.0.join("b.txt")).unwrap(), "b2\n");
+    }
+
+    #[test]
+    fn dropping_the_dependent_commits_together_succeeds() {
+        let r = Repo::new();
+        r.commit_file("a.txt", "a\n", "one");
+        let two = r.commit_file("b.txt", "b1\n", "two");
+        let three = r.commit_file("b.txt", "b2\n", "three");
+
+        r.drop(&[&three, &two], false).unwrap();
+
+        assert_eq!(r.subjects(), ["one"]);
+        assert!(!r.0.join("b.txt").exists());
+    }
+
+    #[test]
+    fn refuses_a_commit_already_in_a_remote_tracking_branch() {
+        let r = Repo::new();
+        let one = r.commit_file("a.txt", "a\n", "one");
+        r.commit_file("b.txt", "b\n", "two");
+        r.git(&["update-ref", "refs/remotes/origin/main", &one]);
+
+        let err = r.drop(&[&one], false).unwrap_err().to_string();
+
+        assert!(err.contains("not unpublished"), "{err}");
+        assert_eq!(r.subjects(), ["one", "two"]);
+    }
+
+    #[test]
+    fn refuses_a_root_commit() {
+        let r = Repo::new();
+        let one = r.commit_file("a.txt", "a\n", "one");
+        r.commit_file("b.txt", "b\n", "two");
+
+        let err = r.drop(&[&one], false).unwrap_err().to_string();
+
+        assert!(err.contains("root commit"), "{err}");
+        assert_eq!(r.subjects(), ["one", "two"]);
+    }
+
+    #[test]
+    fn keeps_uncommitted_edits_to_unrelated_files() {
+        let r = Repo::new();
+        r.commit_file("a.txt", "a\n", "one");
+        let two = r.commit_file("b.txt", "b\n", "two");
+        r.commit_file("c.txt", "c\n", "three");
+        fs::write(r.0.join("a.txt"), "edited\n").unwrap();
+
+        r.drop(&[&two], false).unwrap();
+
+        assert_eq!(fs::read_to_string(r.0.join("a.txt")).unwrap(), "edited\n");
+        assert_eq!(r.subjects(), ["one", "three"]);
+    }
+
+    #[test]
+    fn refuses_when_an_uncommitted_edit_blocks_the_work_tree_update() {
+        let r = Repo::new();
+        r.commit_file("a.txt", "a\n", "one");
+        let two = r.commit_file("b.txt", "b\n", "two");
+        fs::write(r.0.join("b.txt"), "local edit\n").unwrap();
+        let head = r.git(&["rev-parse", "HEAD"]);
+
+        let err = r.drop(&[&two], false).unwrap_err().to_string();
+
+        assert!(err.contains("Nothing was modified"), "{err}");
+        assert_eq!(r.git(&["rev-parse", "HEAD"]), head);
+        assert_eq!(
+            fs::read_to_string(r.0.join("b.txt")).unwrap(),
+            "local edit\n"
+        );
+    }
+
+    #[test]
+    fn dry_run_modifies_nothing() {
+        let r = Repo::new();
+        r.commit_file("a.txt", "a\n", "one");
+        let two = r.commit_file("b.txt", "b\n", "two");
+        r.commit_file("c.txt", "c\n", "three");
+        let head = r.git(&["rev-parse", "HEAD"]);
+
+        r.drop(&[&two], true).unwrap();
+
+        assert_eq!(r.git(&["rev-parse", "HEAD"]), head);
+        assert!(r.0.join("b.txt").exists());
+    }
+
+    #[test]
+    fn rejects_an_unknown_hash() {
+        let r = Repo::new();
+        r.commit_file("a.txt", "a\n", "one");
+        r.commit_file("b.txt", "b\n", "two");
+
+        let err = r.drop(&["deadbeef"], false).unwrap_err().to_string();
+
+        assert!(err.contains("does not name a single commit"), "{err}");
+    }
+
+    #[test]
+    fn session_scope_excludes_commits_before_the_base() {
+        let r = Repo::new();
+        let one = r.commit_file("a.txt", "a\n", "one");
+        r.commit_file("b.txt", "b\n", "two");
+        let head = r.git(&["rev-parse", "HEAD"]);
+        r.git(&["update-ref", &git::base_ref("main"), &head]);
+        let three = r.commit_file("c.txt", "c\n", "three");
+
+        let err = r.drop(&[&one], false).unwrap_err().to_string();
+        assert!(err.contains("pending batch"), "{err}");
+
+        r.drop(&[&three], false).unwrap();
+        assert_eq!(r.subjects(), ["one", "two"]);
+        assert_eq!(r.git(&["rev-parse", &git::base_ref("main")]), head);
     }
 }

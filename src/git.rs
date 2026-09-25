@@ -133,6 +133,96 @@ pub fn rev_list_reverse(dir: &Path, range: &str) -> Res<Vec<String>> {
     Ok(out.lines().map(|l| l.to_string()).collect())
 }
 
+// Commits reachable from HEAD but from no remote-tracking ref, oldest-first, each paired with its
+// parent ids. This is the set of commits that have not been published to any known remote, and
+// therefore the set whose history may be rewritten without invalidating anything a collaborator
+// holds. Without any remote-tracking ref every commit on the branch qualifies. `range` selects the
+// walk: `None` uses the unpublished set above, `Some("base..HEAD")` restricts it to an explicit
+// revision range (an active session's pending batch).
+pub fn commits_with_parents(dir: &Path, range: Option<&str>) -> Res<Vec<(String, Vec<String>)>> {
+    let mut args = vec!["rev-list", "--reverse", "--parents"];
+    match range {
+        Some(r) => args.push(r),
+        None => args.extend(["HEAD", "--not", "--remotes"]),
+    }
+    let out = run(dir, &args)?;
+    Ok(out
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| {
+            let mut ids = l.split(' ').map(str::to_string);
+            let commit = ids.next().unwrap_or_default();
+            (commit, ids.collect())
+        })
+        .collect())
+}
+
+// Full commit message (subject and body) of a commit, with trailing whitespace removed. An empty
+// result is a valid answer: atomic commits recorded by the watcher carry an empty placeholder
+// message.
+pub fn commit_message(dir: &Path, commit: &str) -> Res<String> {
+    run(dir, &["show", "-s", "--format=%B", commit])
+}
+
+// Outcome of applying one commit's change onto a different parent without touching the work tree.
+pub enum Pick {
+    // The change applied cleanly; carries the id of the resulting tree.
+    Tree(String),
+    // The change overlaps another change in a way that needs a human decision.
+    Conflict,
+}
+
+// Compute the tree that results from applying `commit`'s own change (its diff against its first
+// parent) onto `onto`, as `git cherry-pick` would, but entirely inside the object database: neither
+// the index nor the work tree is read or written, so a session's uncommitted files are never at
+// risk. Uses `git merge-tree --write-tree` (git 2.38 or newer), whose exit status is 0 for a clean
+// merge and 1 for a conflicted one; any other status is a genuine failure and is returned as an
+// error carrying git's stderr.
+pub fn cherry_pick_tree(dir: &Path, onto: &str, commit: &str) -> Res<Pick> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["merge-tree", "--write-tree"])
+        .arg(format!("--merge-base={commit}^"))
+        .arg(onto)
+        .arg(commit)
+        .output()?;
+    match out.status.code() {
+        Some(0) => {
+            let stdout = String::from_utf8(out.stdout)?;
+            let tree = stdout.lines().next().unwrap_or_default().trim().to_string();
+            if tree.is_empty() {
+                return Err("git merge-tree: no tree id in output".into());
+            }
+            Ok(Pick::Tree(tree))
+        }
+        Some(1) => Ok(Pick::Conflict),
+        _ => {
+            let msg = String::from_utf8_lossy(&out.stderr);
+            Err(format!("git merge-tree: {}", msg.trim()).into())
+        }
+    }
+}
+
+// Move the checked-out branch, the index, and the files that differ between the old and new tips to
+// `target`, while retaining uncommitted modifications to every other file (`git reset --keep`). The
+// command refuses, leaving branch, index, and work tree untouched, when an uncommitted modification
+// falls on a file that the move would have to rewrite. `action` labels the reflog entries so the
+// move is attributable afterwards.
+pub fn reset_keep(dir: &Path, target: &str, action: &str) -> Res<()> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["reset", "--keep", "--quiet", target])
+        .env("GIT_REFLOG_ACTION", action)
+        .output()?;
+    if !out.status.success() {
+        let msg = String::from_utf8_lossy(&out.stderr);
+        return Err(msg.trim().to_string().into());
+    }
+    Ok(())
+}
+
 // Author name, email, and strict-ISO author date of a commit, preserved verbatim so that a replayed commit
 // keeps its original authorship while receiving a fresh committer identity from ambient configuration.
 pub fn author_of(dir: &Path, commit: &str) -> Res<(String, String, String)> {

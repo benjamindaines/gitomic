@@ -186,3 +186,63 @@ the files reach the state they have on the source branch at the selected commit.
 - Real terminal against a live session: `R` on the middle of three commits marked two ("2 of 3 marked" and the
   count message); a second `R` unmarked; `R` on the newest marked all three; confirming produced one atomic
   commit and `f.txt` and `b.txt` were byte-identical to the branch tip's.
+
+## Addendum (comment 280): `R` follows one file's history (supersedes the comment 278 addendum)
+
+### Context
+
+The comment 278 reading of `R` (mark every older commit regardless of file) was not what was meant. The intent
+is the per-file history view: bring one file to its state on the source branch at the selected commit, using
+only the commits that changed that file. gitomic commits normally change one file; a commit made with
+`git add` may change several.
+
+### Design decisions (three were confirmed with the requester)
+
+- **Scope.** `R` marks the highlighted commit and every older commit of the source branch that changes the same
+  file (`git rev-list --cherry-pick --right-only --no-merges --full-history HEAD...<branch> -- :(literal)<path>`,
+  the same range as the list). Commits above the cursor keep their marks; a second `R` on a fully scoped chain
+  clears it.
+- **Multi-file commit in the chain (confirmed: apply only that file's part).** Each scoped commit is replayed
+  as a scratch commit whose tree is its parent's with only that path taken from the commit
+  (`patch::scoped_commit`), so the other files of the commit are left out. The status line counts such commits.
+- **Highlighted commit changes several files (confirmed: ask with a small overlay).** An overlay lists the
+  files; Enter follows the chosen one, Esc marks nothing.
+- **Fallback (confirmed: `X` restores the file whole).** On the decision screen `X` drops the scoped picks of
+  the current file and instead sets the file to its exact content in the newest commit marked for it (or
+  removes it when that commit lacks it), applied after the picks. `X` is refused with a message when the
+  selection was not made with `R`. The confirmation prompt names restored files.
+- **Recording.** The patch header gains `# only <id> <path>` and `# restore <id> <path>` lines, parsed back by
+  `Spec::parse` and preserved by `rebuild`, so a patch recomputed against a moved HEAD keeps its scoping.
+- **Command line.** `--only <path>` applies every named commit for that file only; a commit that does not
+  change the file is refused.
+- **Display.** Scoped marks show `[f]` (cyan); space marks stay `[x]`. The diff title shows `only: <path>` and
+  the preview is the restricted form. The decision screen now names the commit actually being replayed (it
+  previously named the first marked commit).
+
+### Changes
+
+- `src/cherry_ui.rs`: `Sel`, `OverlayKind`, `Entry.only`; `mark_through` replaced by `mark_file_chain` and
+  `mark_chain`; `key_overlay` handles the file overlay; `X` in `key_resolve`; `GitSource` carries picks with
+  scopes and restores; `[f]` rendering, prompt and hints; `Source::replaying`. The old three `R` tests were
+  rewritten; 8 tests added or replaced.
+- `src/patch.rs`: `scoped_commit`, `restored_tree`, `TempIndex::set_from`, `Job::with_scopes`/`current`,
+  `Spec.only`/`restore` with header and parse support; 5 tests.
+- `src/cherry.rs`: `changed_paths`, `touching`, `preview(.., only)`, `spec_from_hashes(.., only)`; 4 tests.
+- `src/main.rs`: `--only` option and usage text. `README.md`: `R`, `X`, `--only`.
+
+### Known limits
+
+- Renames are not followed; a file is tracked under the name it has in each commit.
+- Merge commits are not in the list, so a chain does not include changes that arrived only through a merge.
+- Paths containing a newline are refused for scoping.
+- A conflict with no A/B meaning (rename/rename, file/directory) refuses the selection with the reason;
+  the marks are kept so they can be adjusted.
+
+### Verification
+
+- `cargo test`: 137 passed (123 before). `cargo fmt --check` clean; added lines at most 100 columns.
+- Real terminal against a live session: history with a two-file commit, an unrelated commit and a later edit
+  of the same file, and a conflicting edit on the current branch. `R` on the newest commit marked the two
+  commits touching `f.txt` as `[f]`, reported the multi-file one, Enter opened the decision screen, `X` reached
+  the confirmation naming `f.txt`, `y` applied it: `f.txt` matched the branch tip, the second file of the
+  multi-file commit and the unrelated commit's file were absent, and the watcher was left running.

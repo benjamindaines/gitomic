@@ -144,11 +144,18 @@ vim-style keys, `space` to mark and the same rule that only `y`/`n` answer a pro
   the first thing shown.
 - The right pane shows what each commit would change relative to the `HEAD` that was current when the screen
   opened, not the commit's own diff. A commit that would conflict is announced above its diff.
-- `R` marks the highlighted commit and every older one below it, which are the commits the branch holds that
-  `HEAD` lacks, so that replaying them brings the touched files to the state they have on the source branch
-  at the highlighted commit. Commits above the cursor keep their marks; pressing `R` again on a fully marked
-  range unmarks it. Merge commits are not in the list, so changes that reached the branch only through a
-  merge are not part of such a range.
+- `R` follows one file. It marks the highlighted commit and every older commit of the source branch that
+  changes the same file (the commits `HEAD` lacks), each restricted to that file, so that replaying them
+  brings the file to its state on the source branch at the highlighted commit. When the highlighted commit
+  changes several files, a small overlay asks which one to follow. A commit in the chain that also changes
+  other files (one made with `git add` rather than by gitomic) is applied for the followed file only; its
+  other files are left out, and the status line counts such commits. Restricted marks show as `[f]` (plain
+  space marks stay `[x]`) and the diff title names the file; the preview shows the restricted form.
+  Commits above the cursor keep their marks, and pressing `R` again on a fully marked chain clears it. Renames
+  are not followed (a file is tracked under the name it has in each commit), and merge commits are not in the
+  list, so changes that reached the branch only through a merge are not part of a chain.
+- On the command line the same restriction is `--only <path>`: every named commit is applied for that file
+  only, and a commit that does not change it is refused.
 - `Enter` on the list replays the marked commits, oldest first. A clean result goes straight to the `y`/`n`
   prompt, which names the number of commits and the size of the change.
 - **Conflicts** open a decision screen: the conflicted files on the left, one entry per conflict hunk, and the
@@ -156,7 +163,9 @@ vim-style keys, `space` to mark and the same rule that only `y`/`n` answer a pro
   `b` takes the picked commit's version, `c` keeps both (tree copy first), `u` undoes, `j`/`k` move between
   conflicts and `Enter` continues once every one is decided. A file that cannot be split into hunks (binary
   content, or one side deleted the file) is decided as a whole with `a`/`b`. A later commit in the selection
-  that conflicts opens the screen again.
+  that conflicts opens the screen again. When the selection was made with `R`, `X` abandons the replay of
+  that file's history and restores the file whole from the newest commit marked for it (its content on the
+  source branch, or absent if the commit lacks it); the confirmation prompt names the restored files.
 - Conflicts with no A/B meaning (a file renamed differently on both sides, a file/directory clash) are
   reported and the selection is refused; `git cherry-pick` handles those.
 

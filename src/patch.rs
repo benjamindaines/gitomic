@@ -304,72 +304,150 @@ fn parse_conflicts(root: &Path, stdout: &[u8]) -> Res<Merged> {
 
 static NEXT_INDEX: AtomicUsize = AtomicUsize::new(0);
 
-// Turn a conflicted tree and a full set of decisions into a clean tree. A throwaway index file is
-// seeded from the conflicted tree, the decided files are written into it, and `write-tree` reads it
-// back, so the repository's own index and work tree are never involved.
-fn resolved_tree(root: &Path, tree: &str, files: &[FileConflict]) -> Res<String> {
-    let git_dir = git::git_dir(root)?;
-    let n = NEXT_INDEX.fetch_add(1, Ordering::SeqCst);
-    let index = git_dir.join(format!("gitomic-pick-{}-{n}.idx", std::process::id()));
-    let _ = std::fs::remove_file(&index);
-    let result = (|| -> Res<String> {
-        let run = |args: &[&str]| -> Res<String> {
-            let out = Command::new("git")
-                .arg("-C")
-                .arg(root)
-                .args(args)
-                .env("GIT_INDEX_FILE", &index)
-                .output()?;
-            if !out.status.success() {
-                let msg = String::from_utf8_lossy(&out.stderr);
-                return Err(format!("git {}: {}", args.join(" "), msg.trim()).into());
+// A throwaway index file, removed when dropped. Trees are assembled in it with plumbing commands
+// (`GIT_INDEX_FILE` points git at it), so the repository's own index and work tree are never
+// involved.
+struct TempIndex<'a> {
+    root: &'a Path,
+    path: PathBuf,
+}
+
+impl<'a> TempIndex<'a> {
+    fn new(root: &'a Path) -> Res<TempIndex<'a>> {
+        let git_dir = git::git_dir(root)?;
+        let n = NEXT_INDEX.fetch_add(1, Ordering::SeqCst);
+        let path = git_dir.join(format!("gitomic-pick-{}-{n}.idx", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        Ok(TempIndex { root, path })
+    }
+
+    fn run(&self, args: &[&str]) -> Res<String> {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(self.root)
+            .args(args)
+            .env("GIT_INDEX_FILE", &self.path)
+            .output()?;
+        if !out.status.success() {
+            let msg = String::from_utf8_lossy(&out.stderr);
+            return Err(format!("git {}: {}", args.join(" "), msg.trim()).into());
+        }
+        Ok(String::from_utf8(out.stdout)?.trim().to_string())
+    }
+
+    // Make `path` in the index match `path` in the commit `source`: the same mode and blob, or
+    // absent when `source` has no such file.
+    fn set_from(&self, source: &str, path: &str) -> Res<()> {
+        let listing = git::run(
+            self.root,
+            &["ls-tree", "-z", "--full-tree", source, "--", path],
+        )?;
+        match listing.split('\t').next().filter(|m| !m.is_empty()) {
+            Some(meta) => {
+                let mut parts = meta.split(' ');
+                let (Some(mode), Some(_), Some(oid)) = (parts.next(), parts.next(), parts.next())
+                else {
+                    return Err(format!("git ls-tree: unexpected output for {path}").into());
+                };
+                self.run(&["update-index", "--add", "--cacheinfo", mode, oid, path])?;
             }
-            Ok(String::from_utf8(out.stdout)?.trim().to_string())
-        };
-        run(&["read-tree", tree])?;
-        for file in files {
-            match &file.body {
-                Body::Hunks(segs) => {
-                    let bytes = conflict::render(segs)
-                        .ok_or_else(|| format!("{}: a hunk is still undecided", file.path))?;
-                    let oid = git::hash_object_write(root, &bytes)?;
-                    run(&[
-                        "update-index",
-                        "--add",
-                        "--cacheinfo",
-                        &file.mode,
-                        &oid,
-                        &file.path,
-                    ])?;
-                }
-                Body::Whole {
-                    ours,
-                    theirs,
-                    choice,
-                } => {
-                    let picked = match choice {
-                        Some(Side::A) => ours,
-                        Some(Side::B) => theirs,
-                        _ => return Err(format!("{}: not decided", file.path).into()),
-                    };
-                    match picked {
-                        Some(b) => run(&[
+            None => {
+                self.run(&["update-index", "--force-remove", "--", path])?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for TempIndex<'_> {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+// Turn a conflicted tree and a full set of decisions into a clean tree.
+fn resolved_tree(root: &Path, tree: &str, files: &[FileConflict]) -> Res<String> {
+    let idx = TempIndex::new(root)?;
+    idx.run(&["read-tree", tree])?;
+    for file in files {
+        match &file.body {
+            Body::Hunks(segs) => {
+                let bytes = conflict::render(segs)
+                    .ok_or_else(|| format!("{}: a hunk is still undecided", file.path))?;
+                let oid = git::hash_object_write(root, &bytes)?;
+                let args = [
+                    "update-index",
+                    "--add",
+                    "--cacheinfo",
+                    &file.mode,
+                    &oid,
+                    &file.path,
+                ];
+                idx.run(&args)?;
+            }
+            Body::Whole {
+                ours,
+                theirs,
+                choice,
+            } => {
+                let picked = match choice {
+                    Some(Side::A) => ours,
+                    Some(Side::B) => theirs,
+                    _ => return Err(format!("{}: not decided", file.path).into()),
+                };
+                match picked {
+                    Some(b) => {
+                        let args = [
                             "update-index",
                             "--add",
                             "--cacheinfo",
                             &b.mode,
                             &b.oid,
                             &file.path,
-                        ])?,
-                        None => run(&["update-index", "--force-remove", "--", &file.path])?,
-                    };
+                        ];
+                        idx.run(&args)?;
+                    }
+                    None => {
+                        idx.run(&["update-index", "--force-remove", "--", &file.path])?;
+                    }
                 }
             }
         }
-        run(&["write-tree"])
-    })();
-    let _ = std::fs::remove_file(&index);
-    result
+    }
+    idx.run(&["write-tree"])
+}
+
+// A commit carrying only `path`'s part of `pick`'s change: its parent is `pick`'s parent, and its
+// tree is that parent's tree with `path` set to what it is in `pick` (or removed, if `pick` deleted
+// it). Replaying it applies the one file's change and leaves every other file of a multi-file
+// commit out. Merge and root commits have no single parent to diff against and are refused.
+pub fn scoped_commit(root: &Path, pick: &str, path: &str) -> Res<String> {
+    if path.contains('\n') {
+        return Err(
+            format!("cannot restrict a pick to a path containing a newline: {path:?}").into(),
+        );
+    }
+    let parents = git::run(root, &["show", "-s", "--format=%P", pick])?;
+    let parent = match parents.split_whitespace().collect::<Vec<_>>()[..] {
+        [p] => p.to_string(),
+        [] => return Err(format!("{pick} is a root commit").into()),
+        _ => return Err(format!("{pick} is a merge commit").into()),
+    };
+    let idx = TempIndex::new(root)?;
+    idx.run(&["read-tree", &parent])?;
+    idx.set_from(pick, path)?;
+    let tree = idx.run(&["write-tree"])?;
+    let message = git::commit_message(root, pick)?;
+    let (name, email, date) = git::author_of(root, pick)?;
+    git::commit_tree(root, &tree, &parent, &message, &name, &email, &date)
+}
+
+// The tree of the commit `onto` with `path` replaced by its content in the commit `source`.
+fn restored_tree(root: &Path, onto: &str, source: &str, path: &str) -> Res<String> {
+    let idx = TempIndex::new(root)?;
+    idx.run(&["read-tree", onto])?;
+    idx.set_from(source, path)?;
+    idx.run(&["write-tree"])
 }
 
 // Progress of a replay: what remains to be merged and the running result.
@@ -383,6 +461,11 @@ pub struct Job {
     done: usize,
     pending_tree: Option<String>,
     decided: Vec<(String, Side)>,
+    // (pick id, path): the pick is replayed restricted to that path.
+    only: Vec<(String, String)>,
+    // (commit, path): after the picks, `path` is set to its content in `commit`.
+    restores: Vec<(String, String)>,
+    restored: usize,
 }
 
 // Where a replay stopped.
@@ -405,33 +488,62 @@ impl Job {
             done: 0,
             pending_tree: None,
             decided: decided.to_vec(),
+            only: Vec::new(),
+            restores: Vec::new(),
+            restored: 0,
         }
+    }
+
+    // Restrict the listed picks to one path each, and add whole-file restores that run after the
+    // picks. See `Spec::only` and `Spec::restore`.
+    pub fn with_scopes(mut self, only: &[(String, String)], restores: &[(String, String)]) -> Job {
+        self.only = only.to_vec();
+        self.restores = restores.to_vec();
+        self
     }
 
     // Merge picks until one needs a decision or all are merged. A conflict whose every unit already
     // has a remembered decision is resolved without stopping.
     pub fn advance(&mut self) -> Res<Step> {
         loop {
-            if self.done == self.picks.len() {
-                return Ok(Step::Done);
-            }
-            let pick = self.picks[self.done].clone();
-            match merge(&self.root, &self.tip, &pick)? {
-                Merged::Clean(tree) => self.take(&tree)?,
-                Merged::Unsupported(list) => return Ok(Step::Unsupported(list)),
-                Merged::Conflicted { tree, mut files } => {
-                    for f in &mut files {
-                        f.apply_saved(&self.decided);
+            if self.done < self.picks.len() {
+                let pick = self.effective(&self.picks[self.done])?;
+                match merge(&self.root, &self.tip, &pick)? {
+                    Merged::Clean(tree) => {
+                        self.take(&tree)?;
+                        self.done += 1;
                     }
-                    if files.iter().all(|f| f.unresolved() == 0) {
-                        let clean = resolved_tree(&self.root, &tree, &files)?;
-                        self.take(&clean)?;
-                    } else {
-                        self.pending_tree = Some(tree);
-                        return Ok(Step::Conflicts(files));
+                    Merged::Unsupported(list) => return Ok(Step::Unsupported(list)),
+                    Merged::Conflicted { tree, mut files } => {
+                        for f in &mut files {
+                            f.apply_saved(&self.decided);
+                        }
+                        if files.iter().all(|f| f.unresolved() == 0) {
+                            let clean = resolved_tree(&self.root, &tree, &files)?;
+                            self.take(&clean)?;
+                            self.done += 1;
+                        } else {
+                            self.pending_tree = Some(tree);
+                            return Ok(Step::Conflicts(files));
+                        }
                     }
                 }
+            } else if self.restored < self.restores.len() {
+                let (source, path) = self.restores[self.restored].clone();
+                let tree = restored_tree(&self.root, &self.tip, &source, &path)?;
+                self.take(&tree)?;
+                self.restored += 1;
+            } else {
+                return Ok(Step::Done);
             }
+        }
+    }
+
+    // The commit to merge for a pick: the pick itself, or its restricted form when scoped.
+    fn effective(&self, id: &str) -> Res<String> {
+        match self.only.iter().find(|(k, _)| k == id) {
+            Some((_, path)) => scoped_commit(&self.root, id, path),
+            None => Ok(id.to_string()),
         }
     }
 
@@ -455,10 +567,12 @@ impl Job {
                 }
             }
         }
-        self.take(&clean)
+        self.take(&clean)?;
+        self.done += 1;
+        Ok(())
     }
 
-    // Adopt `tree` as the result of the pick being merged.
+    // Adopt `tree` as the running result.
     fn take(&mut self, tree: &str) -> Res<()> {
         self.tip = git::commit_tree(
             &self.root,
@@ -469,11 +583,15 @@ impl Job {
             "gitomic@localhost",
             "1970-01-01T00:00:00+00:00",
         )?;
-        self.done += 1;
         Ok(())
     }
 
     // Every decision known to this job, taken now or seeded, for recording in a patch header.
+    // The pick whose merge the replay stopped at, while there is one.
+    pub fn current(&self) -> Option<&str> {
+        self.picks.get(self.done).map(String::as_str)
+    }
+
     pub fn decisions(&self) -> &[(String, Side)] {
         &self.decided
     }
@@ -513,6 +631,8 @@ impl Job {
                 base: self.base.clone(),
                 picks: subjects.to_vec(),
                 decisions: self.decided.clone(),
+                only: self.only.clone(),
+                restore: self.restores.clone(),
             },
             body,
             paths,
@@ -535,7 +655,7 @@ fn diff_bytes(root: &Path, args: &[&str]) -> Res<Vec<u8>> {
 }
 
 // What a patch was built from; enough to build it again.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Spec {
     // The commit the patch applies to.
     pub base: String,
@@ -543,6 +663,12 @@ pub struct Spec {
     pub picks: Vec<(String, String)>,
     // (fingerprint, side) of every conflict decision.
     pub decisions: Vec<(String, Side)>,
+    // (pick id, path): that pick contributes only its change to that path. This is how a multi-file
+    // commit is applied for one file.
+    pub only: Vec<(String, String)>,
+    // (commit, path): after the picks, the file is set to its exact content in that commit, or
+    // removed if the commit lacks it. A whole-file alternative to replaying a conflicting history.
+    pub restore: Vec<(String, String)>,
 }
 
 const HEADER_TAG: &str = "# gitomic-patch 1";
@@ -559,6 +685,12 @@ impl Spec {
         for (id, subject) in &self.picks {
             let subject = subject.replace(['\n', '\r'], " ");
             out.push_str(&format!("# pick {id} {subject}\n"));
+        }
+        for (id, path) in &self.only {
+            out.push_str(&format!("# only {id} {path}\n"));
+        }
+        for (id, path) in &self.restore {
+            out.push_str(&format!("# restore {id} {path}\n"));
         }
         for (fp, side) in &self.decisions {
             out.push_str(&format!("# decision {fp} {}\n", side.letter()));
@@ -580,6 +712,8 @@ impl Spec {
         let mut base = None;
         let mut picks = Vec::new();
         let mut decisions = Vec::new();
+        let mut only = Vec::new();
+        let mut restore = Vec::new();
         for line in lines {
             let Some(rest) = line.strip_prefix("# ") else {
                 break;
@@ -589,6 +723,12 @@ impl Spec {
             } else if let Some(p) = rest.strip_prefix("pick ") {
                 let (id, subject) = p.split_once(' ').unwrap_or((p, ""));
                 picks.push((id.to_string(), subject.to_string()));
+            } else if let Some(o) = rest.strip_prefix("only ") {
+                let (id, path) = o.split_once(' ')?;
+                only.push((id.to_string(), path.to_string()));
+            } else if let Some(r) = rest.strip_prefix("restore ") {
+                let (id, path) = r.split_once(' ')?;
+                restore.push((id.to_string(), path.to_string()));
             } else if let Some(d) = rest.strip_prefix("decision ") {
                 let (fp, side) = d.split_once(' ')?;
                 let side = Side::from_letter(side.trim().chars().next()?)?;
@@ -599,6 +739,8 @@ impl Spec {
             base: base?,
             picks,
             decisions,
+            only,
+            restore,
         })
     }
 }
@@ -637,7 +779,8 @@ pub enum Built {
 
 // Replay `spec` against its own base. Decisions in the spec are reused where their conflicts recur.
 pub fn build(root: &Path, spec: &Spec) -> Res<Built> {
-    let mut job = Job::new(root, &spec.base, &spec.ids(), &spec.decisions);
+    let mut job = Job::new(root, &spec.base, &spec.ids(), &spec.decisions)
+        .with_scopes(&spec.only, &spec.restore);
     match job.advance()? {
         Step::Done => Ok(Built::Ready(Box::new(job.patch(&spec.picks)?))),
         Step::Conflicts(files) => Ok(Built::Conflicts(files)),
@@ -995,5 +1138,113 @@ mod tests {
             .filter(|e| e.file_name().to_string_lossy().starts_with("gitomic-pick-"))
             .count();
         assert_eq!(leftovers, 0);
+    }
+
+    // main: f.txt untouched. feat: one commit changes f.txt, o.txt (edited) and d.txt (deleted).
+    fn multi(r: &Repo) -> String {
+        r.write("f.txt", &Repo::lines());
+        r.write("o.txt", "o\n");
+        r.write("d.txt", "d\n");
+        r.git(&["add", "."]);
+        r.git(&["commit", "-q", "-m", "base"]);
+        r.git(&["checkout", "-q", "-b", "feat"]);
+        r.write("f.txt", &Repo::lines_with(&[(2, "F2")]));
+        r.write("o.txt", "o2\n");
+        r.git(&["rm", "-q", "d.txt"]);
+        r.git(&["add", "."]);
+        r.git(&["commit", "-q", "-m", "three files"]);
+        let id = r.head();
+        r.git(&["checkout", "-q", "main"]);
+        id
+    }
+
+    #[test]
+    fn a_scoped_commit_carries_one_files_part_of_a_multi_file_commit() {
+        let r = Repo::new();
+        let pick = multi(&r);
+        let parent = r.git(&["rev-parse", &format!("{pick}^")]);
+
+        let only_f = scoped_commit(&r.0, &pick, "f.txt").unwrap();
+        assert_eq!(r.git(&["rev-parse", &format!("{only_f}^")]), parent);
+        let names = r.git(&["diff", "--name-only", &parent, &only_f]);
+        assert_eq!(names, "f.txt");
+        assert_eq!(r.git(&["log", "-1", "--format=%s", &only_f]), "three files");
+
+        // A deletion is carried as a deletion.
+        let only_d = scoped_commit(&r.0, &pick, "d.txt").unwrap();
+        assert_eq!(
+            r.git(&["diff", "--name-status", &parent, &only_d]),
+            "D\td.txt"
+        );
+    }
+
+    #[test]
+    fn scoped_commits_refuse_root_merge_and_newline_paths() {
+        let r = Repo::new();
+        let root = r.commit_file("a.txt", "a\n", "root");
+        assert!(scoped_commit(&r.0, &root, "a.txt").is_err());
+        assert!(scoped_commit(&r.0, &root, "a\nb").is_err());
+    }
+
+    #[test]
+    fn a_replay_restricted_to_one_file_leaves_the_others_out() {
+        let r = Repo::new();
+        let pick = multi(&r);
+        let mut job = Job::new(&r.0, &r.head(), std::slice::from_ref(&pick), &[])
+            .with_scopes(&[(pick.clone(), "o.txt".to_string())], &[]);
+        assert!(matches!(job.advance().unwrap(), Step::Done));
+        let patch = job.patch(&[]).unwrap();
+        assert_eq!(patch.paths, vec!["o.txt".to_string()]);
+    }
+
+    #[test]
+    fn a_restore_sets_the_file_to_its_content_at_the_source_or_removes_it() {
+        let r = Repo::new();
+        let pick = multi(&r);
+        // Restore f.txt to the branch's copy; d.txt does not exist in the source, so it is removed.
+        let mut job = Job::new(&r.0, &r.head(), &[], &[]).with_scopes(
+            &[],
+            &[
+                (pick.clone(), "f.txt".to_string()),
+                (pick.clone(), "d.txt".to_string()),
+            ],
+        );
+        assert!(matches!(job.advance().unwrap(), Step::Done));
+        let patch = job.patch(&[]).unwrap();
+        let mut paths = patch.paths.clone();
+        paths.sort();
+        assert_eq!(paths, vec!["d.txt".to_string(), "f.txt".to_string()]);
+        assert_eq!(applied(&r, &job, "f.txt"), Repo::lines_with(&[(2, "F2")]));
+        assert!(!r.exists("d.txt"));
+    }
+
+    #[test]
+    fn only_and_restore_survive_the_header_round_trip_and_a_rebuild() {
+        let r = Repo::new();
+        let pick = multi(&r);
+        let spec = Spec {
+            base: r.head(),
+            picks: vec![(pick.clone(), "three files".to_string())],
+            only: vec![(pick.clone(), "o.txt".to_string())],
+            restore: vec![(pick.clone(), "f.txt".to_string())],
+            ..Spec::default()
+        };
+        let Built::Ready(patch) = build(&r.0, &spec).unwrap() else {
+            panic!("expected a clean build");
+        };
+        let parsed = Spec::parse(&patch.bytes()).unwrap();
+        assert_eq!(parsed.only, spec.only);
+        assert_eq!(parsed.restore, spec.restore);
+
+        // HEAD moves; the rebuilt patch keeps the scoping.
+        r.commit_file("c.txt", "c\n", "add c");
+        let Built::Ready(again) = rebuild(&r.0, &parsed, &r.head()).unwrap() else {
+            panic!("expected a clean rebuild");
+        };
+        assert_eq!(again.spec.only, spec.only);
+        assert_eq!(again.spec.restore, spec.restore);
+        let mut paths = again.paths.clone();
+        paths.sort();
+        assert_eq!(paths, vec!["f.txt".to_string(), "o.txt".to_string()]);
     }
 }

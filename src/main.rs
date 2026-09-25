@@ -181,6 +181,7 @@ impl DropOpts {
 // `-p/--patch-only` writes the patch file and stops.
 fn parse_cherry(rest: &[String]) -> Res<cherry::Opts> {
     let mut opts = cherry::Opts {
+        only: None,
         from: None,
         hashes: Vec::new(),
         dry_run: false,
@@ -191,6 +192,10 @@ fn parse_cherry(rest: &[String]) -> Res<cherry::Opts> {
         match arg.as_str() {
             "-n" | "--dry-run" => opts.dry_run = true,
             "-p" | "--patch-only" => opts.patch_only = true,
+            "--only" => {
+                let value = it.next().ok_or("expected a path after --only")?;
+                opts.only = Some(value.clone());
+            }
             "--from" => {
                 let value = it.next().ok_or("expected a branch after --from")?;
                 opts.from = Some(value.clone());
@@ -310,11 +315,14 @@ COMMANDS:
                        open it is recorded as one atomic commit (a live watcher is paused
                        meanwhile), otherwise it is left uncommitted. With no hash, opens an
                        interactive screen: commits on the left, what each would change on the
-                       right, space to mark, R to mark a commit and every older one, Tab to choose
-                       the branch, Enter to prepare. A conflict opens a decision screen: a keeps
-                       the tree copy, b takes the picked commit's, c keeps both, per conflict
-                       hunk. Options: --from <branch>, -n/--dry-run (report only), -p/--patch-only
-                       (write the patch file, apply nothing). With hashes, conflicts are refused.
+                       right, space to mark, R to follow one file (marks the commit and every older
+                       commit that changes the same file, each applied for that file only), Tab to
+                       choose the branch, Enter to prepare. A conflict opens a decision screen: a
+                       keeps the tree copy, b takes the picked commit's, c keeps both, per conflict
+                       hunk; X restores the whole file from the newest R-marked commit instead.
+                       Options: --from <branch>, --only <path> (apply each named commit for that
+                       file only), -n/--dry-run (report only), -p/--patch-only (write the patch
+                       file, apply nothing). With hashes, conflicts are refused.
                        Aliases: pick.
   stop                 Stop the watcher but keep the base and recorded commits for later finish/resume.
   abort [--force]      Discard the session: reset the branch to the base and drop the atomic commits.

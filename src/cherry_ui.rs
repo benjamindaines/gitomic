@@ -14,7 +14,9 @@
 //
 // Keys, list pane:
 //   j/k, arrows  move            g/G  first/last          space  toggle the mark
-//   R            mark this commit and every older one below it (a second press unmarks them)
+//   R            follow one file: mark this commit and every older commit that changes the same
+//                file, each restricted to that file (an overlay asks which file when the commit
+//                changes several; a second press unmarks the chain)
 //   l, Right     open the diff   Tab  choose the source branch
 //   Enter        prepare the marked commits (conflicts are decided first), then confirm with y/n
 //   q, Esc       quit (confirmed first when commits are marked)
@@ -24,6 +26,7 @@
 // Keys, decision screen:
 //   j/k          previous/next conflict     a  keep the tree copy     b  take the picked commit's
 //   c            keep both (text conflicts)  u  undo the decision      Ctrl-d/u  scroll
+//   X            restore this file whole from the newest commit marked for it with R
 //   Enter        continue once every conflict is decided               Esc, q  leave
 
 use std::collections::HashMap;
@@ -56,17 +59,36 @@ pub enum Flow {
     Refused(String),
 }
 
+// One commit chosen for the patch, optionally restricted to a single file.
+#[derive(Clone, PartialEq, Debug)]
+pub struct Sel {
+    pub id: String,
+    pub subject: String,
+    pub only: Option<String>,
+}
+
 // What the screen needs from git.
 pub trait Source {
     fn branches(&mut self) -> Result<Vec<String>, String>;
     // Commits on `branch` that HEAD lacks, newest first.
     fn commits(&mut self, branch: &str) -> Result<Vec<(String, String)>, String>;
-    // The preview text for one commit.
-    fn diff(&mut self, commit: &str) -> Result<String, String>;
+    // The preview text for one commit, restricted to one file when `only` is given.
+    fn diff(&mut self, commit: &str, only: Option<&str>) -> Result<String, String>;
+    // Paths a commit changes.
+    fn paths(&mut self, commit: &str) -> Result<Vec<String>, String>;
+    // Commits of `branch` that HEAD lacks and that change `path`.
+    fn touching(&mut self, branch: &str, path: &str) -> Result<Vec<String>, String>;
     // Begin replaying `picks` (oldest first) and report where it stops.
-    fn start(&mut self, picks: &[(String, String)]) -> Result<Flow, String>;
+    fn start(&mut self, picks: &[Sel]) -> Result<Flow, String>;
+    // Replace the picks restricted to `path` by one whole-file restore of it from the newest of
+    // them, and replay again. Errors when no pick is restricted to `path`.
+    fn restore(&mut self, path: &str) -> Result<Flow, String>;
     // Supply decisions for the conflict last reported and continue.
     fn resolve(&mut self, files: Vec<FileConflict>) -> Result<Flow, String>;
+    // The commit a reported conflict belongs to.
+    fn replaying(&self) -> Option<String> {
+        None
+    }
     // The recipe for the patch once the replay is `Ready`.
     fn spec(&mut self) -> Result<Spec, String>;
 }
@@ -77,18 +99,44 @@ struct GitSource {
     // HEAD when the screen opened; every preview and the replay are relative to it.
     base: String,
     job: Option<Job>,
-    picks: Vec<(String, String)>,
+    picks: Vec<Sel>,
+    // (commit, path) whole-file restores that replaced restricted picks.
+    restores: Vec<(String, String)>,
     // Decisions carried across restarts of the replay, so a cancelled confirmation does not lose
     // them.
     decided: Vec<(String, Side)>,
 }
 
 impl GitSource {
+    // (id, subject) of every pick, oldest first, as a patch header records them.
+    fn subjects(&self) -> Vec<(String, String)> {
+        self.picks
+            .iter()
+            .map(|p| (p.id.clone(), p.subject.clone()))
+            .collect()
+    }
+
+    // Replay the current picks and restores from the start.
+    fn run_job(&mut self) -> Result<Flow, String> {
+        let ids: Vec<String> = self.picks.iter().map(|p| p.id.clone()).collect();
+        let only: Vec<(String, String)> = self
+            .picks
+            .iter()
+            .filter_map(|p| p.only.clone().map(|path| (p.id.clone(), path)))
+            .collect();
+        let mut job = Job::new(&self.root, &self.base, &ids, &self.decided)
+            .with_scopes(&only, &self.restores);
+        let step = job.advance().map_err(|e| e.to_string())?;
+        self.decided = job.decisions().to_vec();
+        self.job = Some(job);
+        self.flow(step)
+    }
+
     fn flow(&mut self, step: Step) -> Result<Flow, String> {
         match step {
             Step::Done => {
                 let job = self.job.as_ref().ok_or("no replay in progress")?;
-                let patch = job.patch(&self.picks).map_err(|e| e.to_string())?;
+                let patch = job.patch(&self.subjects()).map_err(|e| e.to_string())?;
                 if patch.is_empty() {
                     return Ok(Flow::Refused(
                         "the selection changes nothing relative to HEAD".to_string(),
@@ -114,18 +162,37 @@ impl Source for GitSource {
         cherry::candidates(&self.cwd, branch).map_err(|e| e.to_string())
     }
 
-    fn diff(&mut self, commit: &str) -> Result<String, String> {
-        cherry::preview(&self.root, &self.base, commit).map_err(|e| e.to_string())
+    fn diff(&mut self, commit: &str, only: Option<&str>) -> Result<String, String> {
+        cherry::preview(&self.root, &self.base, commit, only).map_err(|e| e.to_string())
     }
 
-    fn start(&mut self, picks: &[(String, String)]) -> Result<Flow, String> {
+    fn paths(&mut self, commit: &str) -> Result<Vec<String>, String> {
+        cherry::changed_paths(&self.root, commit).map_err(|e| e.to_string())
+    }
+
+    fn touching(&mut self, branch: &str, path: &str) -> Result<Vec<String>, String> {
+        cherry::touching(&self.cwd, branch, path).map_err(|e| e.to_string())
+    }
+
+    fn start(&mut self, picks: &[Sel]) -> Result<Flow, String> {
         self.picks = picks.to_vec();
-        let ids: Vec<String> = picks.iter().map(|(id, _)| id.clone()).collect();
-        let mut job = Job::new(&self.root, &self.base, &ids, &self.decided);
-        let step = job.advance().map_err(|e| e.to_string())?;
-        self.decided = job.decisions().to_vec();
-        self.job = Some(job);
-        self.flow(step)
+        self.restores.clear();
+        self.run_job()
+    }
+
+    fn restore(&mut self, path: &str) -> Result<Flow, String> {
+        let newest = self
+            .picks
+            .iter()
+            .rev()
+            .find(|p| p.only.as_deref() == Some(path))
+            .map(|p| p.id.clone())
+            .ok_or(
+                "whole-file restore is offered for a selection made with R (one file's history)",
+            )?;
+        self.picks.retain(|p| p.only.as_deref() != Some(path));
+        self.restores.push((newest, path.to_string()));
+        self.run_job()
     }
 
     fn resolve(&mut self, files: Vec<FileConflict>) -> Result<Flow, String> {
@@ -136,9 +203,16 @@ impl Source for GitSource {
         self.flow(step)
     }
 
+    fn replaying(&self) -> Option<String> {
+        self.job
+            .as_ref()
+            .and_then(|j| j.current())
+            .map(str::to_string)
+    }
+
     fn spec(&mut self) -> Result<Spec, String> {
         let job = self.job.as_ref().ok_or("no replay in progress")?;
-        job.patch(&self.picks)
+        job.patch(&self.subjects())
             .map(|p| p.spec)
             .map_err(|e| e.to_string())
     }
@@ -172,9 +246,20 @@ struct Entry {
     full: String,
     subject: String,
     marked: bool,
+    // Set when the mark restricts the commit to one file (made with R).
+    only: Option<String>,
+}
+
+// What the overlay is choosing.
+#[derive(Clone, PartialEq, Debug)]
+enum OverlayKind {
+    Branch,
+    // A file among those the highlighted commit changes; R then follows that file's history.
+    File,
 }
 
 struct Overlay {
+    kind: OverlayKind,
     names: Vec<String>,
     cursor: usize,
 }
@@ -435,6 +520,10 @@ pub struct App {
     list_state: ListState,
     overlay: Option<Overlay>,
     resolver: Option<Resolver>,
+    // Files restored whole after a decision-screen `X`, named in the confirmation prompt.
+    restored: Vec<String>,
+    // The commit the decision screen is about.
+    replaying: String,
 }
 
 impl App {
@@ -457,6 +546,8 @@ impl App {
             list_state: ListState::default(),
             overlay: None,
             resolver: None,
+            restored: Vec::new(),
+            replaying: String::new(),
         }
     }
 
@@ -470,6 +561,7 @@ impl App {
                 full,
                 subject,
                 marked: false,
+                only: None,
             })
             .collect();
         self.source_label = Some(branch.to_string());
@@ -482,7 +574,11 @@ impl App {
 
     // Open the branch overlay on `names`.
     pub fn open_overlay(&mut self, names: Vec<String>) {
-        self.overlay = Some(Overlay { names, cursor: 0 });
+        self.overlay = Some(Overlay {
+            kind: OverlayKind::Branch,
+            names,
+            cursor: 0,
+        });
         self.mode = Mode::Overlay;
     }
 
@@ -491,34 +587,44 @@ impl App {
     }
 
     // The marked commits, oldest first, which is the order they are replayed in.
-    fn marked_picks(&self) -> Vec<(String, String)> {
+    fn marked_picks(&self) -> Vec<Sel> {
         self.entries
             .iter()
             .rev()
             .filter(|e| e.marked)
-            .map(|e| (e.full.clone(), e.subject.clone()))
+            .map(|e| Sel {
+                id: e.full.clone(),
+                subject: e.subject.clone(),
+                only: e.only.clone(),
+            })
             .collect()
+    }
+
+    // Preview cache key: a commit previews differently when it is restricted to one file.
+    fn view_key(e: &Entry) -> String {
+        format!("{}\0{}", e.full, e.only.as_deref().unwrap_or(""))
     }
 
     pub fn ensure_diff(&mut self, src: &mut dyn Source) {
         let Some(entry) = self.entries.get(self.cursor) else {
             return;
         };
-        if self.views.contains_key(&entry.full) {
+        let key = Self::view_key(entry);
+        if self.views.contains_key(&key) {
             return;
         }
-        let full = entry.full.clone();
-        let view = match src.diff(&full) {
+        let (full, only) = (entry.full.clone(), entry.only.clone());
+        let view = match src.diff(&full, only.as_deref()) {
             Ok(text) => style_diff(&text),
             Err(e) => style_diff(&format!("could not show {full}: {e}")),
         };
-        self.views.insert(full, view);
+        self.views.insert(key, view);
     }
 
     fn view(&self) -> Option<&DiffView> {
         self.entries
             .get(self.cursor)
-            .and_then(|e| self.views.get(&e.full))
+            .and_then(|e| self.views.get(&Self::view_key(e)))
     }
 
     fn max_v(&self) -> usize {
@@ -553,30 +659,76 @@ impl App {
         }
     }
 
+    // Space: mark the highlighted commit whole, or clear its mark (whatever kind it was).
     fn toggle(&mut self) {
         if let Some(e) = self.entries.get_mut(self.cursor) {
             e.marked = !e.marked;
+            e.only = None;
         }
     }
 
-    // Mark the highlighted commit and every commit below it, that is every older commit the branch
-    // holds that HEAD lacks. Replayed in order, they bring the picked files to the state they have
-    // on the source branch at the highlighted commit. Commits above the cursor keep their marks.
-    // When the whole range is already marked, the same key unmarks it.
-    fn mark_through(&mut self) {
-        if self.entries.is_empty() {
+    // R: follow one file's history. The file is the one the highlighted commit changes; when it
+    // changes several, an overlay asks which. See `mark_chain`.
+    fn mark_file_chain(&mut self, src: &mut dyn Source) {
+        let Some(entry) = self.entries.get(self.cursor) else {
             return;
+        };
+        let commit = entry.full.clone();
+        match src.paths(&commit) {
+            Err(e) => self.say(e, true),
+            Ok(paths) if paths.is_empty() => self.say("this commit changes no file", true),
+            Ok(paths) if paths.len() == 1 => self.mark_chain(&paths[0], src),
+            Ok(paths) => {
+                self.overlay = Some(Overlay {
+                    kind: OverlayKind::File,
+                    names: paths,
+                    cursor: 0,
+                });
+                self.mode = Mode::Overlay;
+            }
         }
-        let range = self.cursor..self.entries.len();
-        let all = self.entries[range.clone()].iter().all(|e| e.marked);
-        let count = range.len();
-        for e in &mut self.entries[range] {
-            e.marked = !all;
+    }
+
+    // Mark the highlighted commit and every older commit of the branch that changes `path`, each
+    // restricted to that file. Replayed oldest first they bring the file to its state on the
+    // source branch at the highlighted commit; a commit that also changes other files contributes
+    // only its part for `path`. Commits above the cursor keep their marks. When that whole chain
+    // is already marked for `path`, the same call clears it.
+    fn mark_chain(&mut self, path: &str, src: &mut dyn Source) {
+        let Some(branch) = self.source_label.clone() else {
+            return;
+        };
+        let touching = match src.touching(&branch, path) {
+            Ok(t) => t,
+            Err(e) => {
+                self.say(e, true);
+                return;
+            }
+        };
+        let cursor = self.cursor;
+        let chain: Vec<usize> = (cursor..self.entries.len())
+            .filter(|&i| i == cursor || touching.contains(&self.entries[i].full))
+            .collect();
+        let all = chain
+            .iter()
+            .all(|&i| self.entries[i].marked && self.entries[i].only.as_deref() == Some(path));
+        for &i in &chain {
+            self.entries[i].marked = !all;
+            self.entries[i].only = if all { None } else { Some(path.to_string()) };
         }
         let text = if all {
-            format!("unmarked {count} commit(s) from here down")
+            format!("unmarked {} commit(s) for {path}", chain.len())
         } else {
-            format!("marked {count} commit(s): this one and every older one")
+            let partial = chain
+                .iter()
+                .filter(|&&i| src.paths(&self.entries[i].full).is_ok_and(|p| p.len() > 1))
+                .count();
+            let extra = if partial > 0 {
+                format!("; {partial} also change other files and are applied for it only")
+            } else {
+                String::new()
+            };
+            format!("marked {} commit(s) for {path}{extra}", chain.len())
         };
         self.say(text, false);
     }
@@ -630,7 +782,7 @@ impl App {
             KeyCode::Char('g') | KeyCode::Home => self.jump(0),
             KeyCode::Char('G') | KeyCode::End => self.jump(self.entries.len().saturating_sub(1)),
             KeyCode::Char(' ') => self.toggle(),
-            KeyCode::Char('R') => self.mark_through(),
+            KeyCode::Char('R') => self.mark_file_chain(src),
             KeyCode::Char('l') | KeyCode::Right => self.focus = Focus::Diff,
             KeyCode::Tab => self.open_branches(src),
             KeyCode::Enter => self.submit(src),
@@ -663,7 +815,7 @@ impl App {
             KeyCode::Enter | KeyCode::Char('n') => self.step(1),
             KeyCode::Char('N') => self.step(-1),
             KeyCode::Char(' ') => self.toggle(),
-            KeyCode::Char('R') => self.mark_through(),
+            KeyCode::Char('R') => self.mark_file_chain(src),
             KeyCode::Tab => self.open_branches(src),
             KeyCode::Esc => self.focus = Focus::List,
             KeyCode::Char('q') => return self.request_quit(),
@@ -697,6 +849,12 @@ impl App {
             KeyCode::Char('k') | KeyCode::Up => ov.cursor = ov.cursor.saturating_sub(1),
             KeyCode::Char('g') | KeyCode::Home => ov.cursor = 0,
             KeyCode::Char('G') | KeyCode::End => ov.cursor = last,
+            KeyCode::Enter if ov.kind == OverlayKind::File => {
+                let path = ov.names[ov.cursor].clone();
+                self.overlay = None;
+                self.mode = Mode::Browse;
+                self.mark_chain(&path, src);
+            }
             KeyCode::Enter => {
                 let name = ov.names[ov.cursor].clone();
                 match src.commits(&name) {
@@ -727,11 +885,13 @@ impl App {
             self.say("nothing is marked; press space on a commit first", true);
             return;
         }
+        self.restored.clear();
         let flow = src.start(&picks);
-        self.after_flow(flow);
+        self.after_flow(flow, &*src);
     }
 
-    fn after_flow(&mut self, flow: Result<Flow, String>) {
+    fn after_flow(&mut self, flow: Result<Flow, String>, src: &dyn Source) {
+        self.replaying = src.replaying().unwrap_or_default();
         match flow {
             Ok(Flow::Ready(summary)) => {
                 self.resolver = None;
@@ -781,6 +941,20 @@ impl App {
             KeyCode::Char('u') => {
                 res.decide(None);
             }
+            KeyCode::Char('X') => {
+                let Some(&(f, _)) = res.units.get(res.cursor) else {
+                    return;
+                };
+                let path = res.files[f].path.clone();
+                match src.restore(&path) {
+                    Ok(flow) => {
+                        self.restored.push(path);
+                        self.resolver = None;
+                        self.after_flow(Ok(flow), &*src);
+                    }
+                    Err(e) => self.say(e, true),
+                }
+            }
             KeyCode::Enter => {
                 let left = res.undecided();
                 if left > 0 {
@@ -790,7 +964,7 @@ impl App {
                 let files = std::mem::take(&mut res.files);
                 self.resolver = None;
                 let flow = src.resolve(files);
-                self.after_flow(flow);
+                self.after_flow(flow, &*src);
             }
             KeyCode::Esc | KeyCode::Char('q') => {
                 self.resolver = None;
@@ -878,9 +1052,15 @@ impl App {
                 } else {
                     &e.subject
                 };
-                let mark = if e.marked { 'x' } else { ' ' };
+                let mark = match (e.marked, &e.only) {
+                    (false, _) => ' ',
+                    (true, None) => 'x',
+                    (true, Some(_)) => 'f',
+                };
                 let text = format!("[{mark}] {} {subject}", &e.full[..e.full.len().min(8)]);
-                let style = if e.marked {
+                let style = if e.marked && e.only.is_some() {
+                    Style::new().fg(Color::Cyan)
+                } else if e.marked {
                     Style::new().fg(Color::Green)
                 } else {
                     Style::new()
@@ -940,8 +1120,11 @@ impl App {
         };
         let heading = match self.entries.get(self.cursor) {
             Some(e) => format!(
-                " {}  line {}/{}  col {} ",
+                " {}{}  line {}/{}  col {} ",
                 &e.full[..e.full.len().min(8)],
+                e.only
+                    .as_ref()
+                    .map_or(String::new(), |p| format!("  only: {p}")),
                 (self.vscroll + 1).min(total.max(1)),
                 total,
                 self.hscroll + 1
@@ -979,11 +1162,7 @@ impl App {
         state.select(Some(res.cursor));
         frame.render_stateful_widget(list, left, &mut state);
 
-        let pick = self
-            .entries
-            .iter()
-            .find(|e| e.marked)
-            .map_or(String::new(), |e| e.full[..e.full.len().min(8)].to_string());
+        let pick = self.replaying[..self.replaying.len().min(8)].to_string();
         let lines = res.detail(&pick);
         let inner_h = right.height.saturating_sub(2) as usize;
         self.view_h = inner_h.max(1);
@@ -1010,10 +1189,14 @@ impl App {
             height: h,
         };
         let items: Vec<ListItem> = ov.names.iter().map(|n| ListItem::new(n.as_str())).collect();
+        let title = match ov.kind {
+            OverlayKind::Branch => " Pick from which branch?  (Enter use, Esc close) ",
+            OverlayKind::File => " Follow which file?  (Enter use, Esc close) ",
+        };
         let list = List::new(items)
             .block(
                 Block::bordered()
-                    .title(" Pick from which branch?  (Enter use, Esc close) ")
+                    .title(title)
                     .border_style(Style::new().fg(Color::Yellow)),
             )
             .highlight_style(Style::new().add_modifier(Modifier::REVERSED));
@@ -1028,9 +1211,14 @@ impl App {
         let bar = match &self.mode {
             Mode::ConfirmApply { summary } => {
                 let last = summary.lines().last().unwrap_or("").trim();
+                let whole = if self.restored.is_empty() {
+                    String::new()
+                } else {
+                    format!(" (restored whole: {})", self.restored.join(", "))
+                };
                 Line::from(Span::styled(
                     format!(
-                        " Apply {} commit(s) as a patch? {last} [y/n] ",
+                        " Apply {} commit(s) as a patch? {last}{whole} [y/n] ",
                         self.marked_count()
                     ),
                     prompt,
@@ -1051,13 +1239,13 @@ impl App {
                     Style::new().fg(color).add_modifier(Modifier::BOLD),
                 ))
             }
-            Mode::Overlay => hint(" j/k move  Enter use branch  Esc close "),
+            Mode::Overlay => hint(" j/k move  Enter use  Esc close "),
             Mode::Resolve => hint(
-                " j/k conflict  a tree copy  b picked  c both  u undo  Enter continue  Esc leave ",
+                " j/k conflict  a tree  b picked  c both  u undo  X restore file  Enter go  Esc leave ",
             ),
             Mode::Browse => match self.focus {
                 Focus::List => hint(
-                    " j/k move  space mark  R mark older  l diff  Tab branch  Enter pick  q quit",
+                    " j/k move  space mark  R file history  l diff  Tab branch  Enter pick  q quit",
                 ),
                 Focus::Diff => {
                     hint(" j/k h/l scroll  Enter/n next  N prev  space mark  Tab branch  q quit")
@@ -1089,6 +1277,7 @@ pub fn run(cwd: &Path, from: Option<&str>) -> Res<Option<Spec>> {
         base,
         job: None,
         picks: Vec::new(),
+        restores: Vec::new(),
         decided: Vec::new(),
     };
     let mut app = App::new();
@@ -1144,8 +1333,15 @@ mod tests {
         branches: Vec<String>,
         commits: Vec<(String, String)>,
         flows: VecDeque<Result<Flow, String>>,
-        started: Vec<Vec<(String, String)>>,
+        started: Vec<Vec<Sel>>,
         resolved: Vec<Vec<FileConflict>>,
+        // Paths changed by a commit; a commit not listed changes only a.txt.
+        paths: HashMap<String, Vec<String>>,
+        // Commits that `touching` reports.
+        touching: Vec<String>,
+        // (commit, only) of every preview requested.
+        diffs: Vec<(String, Option<String>)>,
+        restored: Vec<String>,
     }
 
     impl Fake {
@@ -1160,6 +1356,10 @@ mod tests {
                 flows: VecDeque::new(),
                 started: Vec::new(),
                 resolved: Vec::new(),
+                paths: HashMap::new(),
+                touching: vec![id('a'), id('c')],
+                diffs: Vec::new(),
+                restored: Vec::new(),
             }
         }
     }
@@ -1177,7 +1377,9 @@ mod tests {
             }
         }
 
-        fn diff(&mut self, commit: &str) -> Result<String, String> {
+        fn diff(&mut self, commit: &str, only: Option<&str>) -> Result<String, String> {
+            self.diffs
+                .push((commit.to_string(), only.map(str::to_string)));
             Ok(format!(
                 "commit {commit}\nAuthor: T <t@e.invalid>\nDate:   now\n\n    msg\n\n \
                  a.txt | 1 +\n\ndiff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n\
@@ -1185,7 +1387,33 @@ mod tests {
             ))
         }
 
-        fn start(&mut self, picks: &[(String, String)]) -> Result<Flow, String> {
+        fn paths(&mut self, commit: &str) -> Result<Vec<String>, String> {
+            Ok(self
+                .paths
+                .get(commit)
+                .cloned()
+                .unwrap_or_else(|| vec!["a.txt".to_string()]))
+        }
+
+        fn touching(&mut self, _branch: &str, _path: &str) -> Result<Vec<String>, String> {
+            Ok(self.touching.clone())
+        }
+
+        fn restore(&mut self, path: &str) -> Result<Flow, String> {
+            let scoped = self
+                .started
+                .last()
+                .is_some_and(|p| p.iter().any(|s| s.only.as_deref() == Some(path)));
+            if !scoped {
+                return Err("whole-file restore is offered for a selection made with R".into());
+            }
+            self.restored.push(path.to_string());
+            self.flows
+                .pop_front()
+                .unwrap_or(Ok(Flow::Ready("1 file changed".into())))
+        }
+
+        fn start(&mut self, picks: &[Sel]) -> Result<Flow, String> {
             self.started.push(picks.to_vec());
             self.flows
                 .pop_front()
@@ -1199,11 +1427,27 @@ mod tests {
                 .unwrap_or(Ok(Flow::Ready("1 file changed".into())))
         }
 
+        fn replaying(&self) -> Option<String> {
+            self.started
+                .last()
+                .and_then(|p| p.first())
+                .map(|s| s.id.clone())
+        }
+
         fn spec(&mut self) -> Result<Spec, String> {
             Ok(Spec {
                 base: id('0'),
-                picks: self.started.last().cloned().unwrap_or_default(),
+                picks: self
+                    .started
+                    .last()
+                    .map(|p| {
+                        p.iter()
+                            .map(|s| (s.id.clone(), s.subject.clone()))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
                 decisions: Vec::new(),
+                ..Spec::default()
             })
         }
     }
@@ -1346,48 +1590,162 @@ mod tests {
         press(&mut a, &mut f, ch('G'));
         press(&mut a, &mut f, ch(' '));
         press(&mut a, &mut f, KeyCode::Enter);
-        let picks: Vec<String> = f.started[0].iter().map(|(i, _)| i.clone()).collect();
+        let picks: Vec<String> = f.started[0].iter().map(|s| s.id.clone()).collect();
         assert_eq!(picks, vec![id('c'), id('a')]);
     }
 
     #[test]
-    fn r_marks_this_commit_and_every_older_one_and_leaves_newer_marks_alone() {
-        let (mut a, mut f) = app();
-        press(&mut a, &mut f, ch('j'));
-        press(&mut a, &mut f, ch('R'));
-        let marks: Vec<bool> = a.entries.iter().map(|e| e.marked).collect();
-        assert_eq!(marks, [false, true, true]);
-        assert!(a.status.contains("marked 2 commit(s)"), "{}", a.status);
-
-        // A mark above the cursor survives, and the submit order is oldest first.
-        press(&mut a, &mut f, ch('k'));
-        press(&mut a, &mut f, ch(' '));
-        press(&mut a, &mut f, KeyCode::Enter);
-        let picks: Vec<String> = f.started[0].iter().map(|(i, _)| i.clone()).collect();
-        assert_eq!(picks, vec![id('c'), id('b'), id('a')]);
-    }
-
-    #[test]
-    fn a_second_r_unmarks_the_range_and_r_works_from_the_diff_pane() {
-        let (mut a, mut f) = app();
-        press(&mut a, &mut f, ch('l'));
-        press(&mut a, &mut f, ch('R'));
-        assert_eq!(a.marked_count(), 3);
-        assert_eq!(a.focus, Focus::Diff);
-        press(&mut a, &mut f, ch('R'));
-        assert_eq!(a.marked_count(), 0);
-        assert!(a.status.contains("unmarked 3"), "{}", a.status);
-    }
-
-    #[test]
-    fn r_on_the_oldest_commit_marks_only_that_one_and_r_with_no_list_is_harmless() {
+    fn r_marks_the_file_chain_older_only_restricted_and_leaves_newer_marks_alone() {
+        // Commit b does not touch the file; a (newer) and c (older) do. The cursor is on c.
         let (mut a, mut f) = app();
         press(&mut a, &mut f, ch('G'));
         press(&mut a, &mut f, ch('R'));
-        assert_eq!(a.marked_count(), 1);
+        let marks: Vec<(bool, Option<&str>)> = a
+            .entries
+            .iter()
+            .map(|e| (e.marked, e.only.as_deref()))
+            .collect();
+        assert_eq!(marks, [(false, None), (false, None), (true, Some("a.txt"))]);
+        assert!(
+            a.status.contains("marked 1 commit(s) for a.txt"),
+            "{}",
+            a.status
+        );
+
+        // From the newest commit the chain is a and c; b does not touch the file and is skipped.
+        press(&mut a, &mut f, ch('g'));
+        press(&mut a, &mut f, ch('R'));
+        let marked: Vec<bool> = a.entries.iter().map(|e| e.marked).collect();
+        assert_eq!(marked, [true, false, true]);
+        press(&mut a, &mut f, KeyCode::Enter);
+        let picks: Vec<(String, Option<String>)> = f.started[0]
+            .iter()
+            .map(|s| (s.id.clone(), s.only.clone()))
+            .collect();
+        assert_eq!(
+            picks,
+            vec![
+                (id('c'), Some("a.txt".to_string())),
+                (id('a'), Some("a.txt".to_string()))
+            ]
+        );
+    }
+
+    #[test]
+    fn r_keeps_a_whole_mark_above_the_cursor_and_a_second_r_clears_the_chain() {
+        let (mut a, mut f) = app();
+        press(&mut a, &mut f, ch(' '));
+        press(&mut a, &mut f, ch('j'));
+        press(&mut a, &mut f, ch('j'));
+        press(&mut a, &mut f, ch('l'));
+        press(&mut a, &mut f, ch('R'));
+        assert_eq!(a.focus, Focus::Diff, "R works from the diff pane");
+        assert_eq!(a.marked_count(), 2);
+        press(&mut a, &mut f, ch('R'));
+        assert_eq!(
+            a.marked_count(),
+            1,
+            "the chain is cleared, the newer mark stays"
+        );
+        assert!(a.status.contains("unmarked 1"), "{}", a.status);
+        assert_eq!(a.entries[0].only, None);
+    }
+
+    #[test]
+    fn a_commit_with_several_files_asks_which_one_to_follow() {
+        let (mut a, mut f) = app();
+        f.paths
+            .insert(id('a'), vec!["x.txt".into(), "y.txt".into()]);
+        press(&mut a, &mut f, ch('R'));
+        assert_eq!(a.mode, Mode::Overlay);
+        assert_eq!(a.overlay.as_ref().unwrap().kind, OverlayKind::File);
+        assert_eq!(a.marked_count(), 0);
+        press(&mut a, &mut f, ch('j'));
+        press(&mut a, &mut f, KeyCode::Enter);
+        assert_eq!(a.mode, Mode::Browse);
+        assert_eq!(a.entries[0].only.as_deref(), Some("y.txt"));
+        assert!(a.status.contains("y.txt"), "{}", a.status);
+        // The overlay can be dismissed without marking anything.
+        let (mut b, mut g) = app();
+        g.paths
+            .insert(id('a'), vec!["x.txt".into(), "y.txt".into()]);
+        press(&mut b, &mut g, ch('R'));
+        press(&mut b, &mut g, KeyCode::Esc);
+        assert_eq!(b.mode, Mode::Browse);
+        assert_eq!(b.marked_count(), 0);
+    }
+
+    #[test]
+    fn a_chain_member_that_also_changes_other_files_is_reported() {
+        let (mut a, mut f) = app();
+        f.paths
+            .insert(id('c'), vec!["a.txt".into(), "z.txt".into()]);
+        press(&mut a, &mut f, ch('R'));
+        assert!(
+            a.status.contains("1 also change other files"),
+            "{}",
+            a.status
+        );
+    }
+
+    #[test]
+    fn a_scoped_mark_renders_as_f_and_titles_its_preview_with_the_file() {
+        let (mut a, mut f) = app();
+        press(&mut a, &mut f, ch('R'));
+        assert!(f
+            .diffs
+            .iter()
+            .any(|(c, o)| *c == id('a') && o.as_deref() == Some("a.txt")));
+        let screen = render_text(&mut a, 100, 12);
+        assert!(screen.contains("[f] aaaaaaaa newest"), "{screen}");
+        assert!(screen.contains("[f] cccccccc oldest"), "{screen}");
+        assert!(screen.contains("only: a.txt"), "{screen}");
+        // A plain space mark is whole again, and its preview is not restricted.
+        press(&mut a, &mut f, ch(' '));
+        press(&mut a, &mut f, ch(' '));
+        assert_eq!(a.entries[0].only, None);
+    }
+
+    #[test]
+    fn r_with_no_list_is_harmless() {
+        let mut f = Fake::new();
         let mut empty = App::new();
         press(&mut empty, &mut f, ch('R'));
         assert_eq!(empty.marked_count(), 0);
+    }
+
+    #[test]
+    fn x_restores_the_file_whole_from_the_decision_screen() {
+        let conflict_flow = Ok(Flow::Conflicts(vec![text_conflict("a.txt", TWO_HUNKS)]));
+        let (mut a, mut f) = app();
+        f.flows = vec![conflict_flow, Ok(Flow::Ready("1 file changed".into()))].into();
+        press(&mut a, &mut f, ch('R'));
+        press(&mut a, &mut f, KeyCode::Enter);
+        assert_eq!(a.mode, Mode::Resolve);
+        press(&mut a, &mut f, ch('X'));
+        assert_eq!(f.restored, vec!["a.txt".to_string()]);
+        assert!(matches!(a.mode, Mode::ConfirmApply { .. }));
+        assert!(a.resolver.is_none());
+        let screen = render_text(&mut a, 120, 10);
+        assert!(screen.contains("restored whole: a.txt"), "{screen}");
+        // Starting over clears the note.
+        press(&mut a, &mut f, ch('n'));
+        press(&mut a, &mut f, KeyCode::Enter);
+        assert!(a.restored.is_empty());
+    }
+
+    #[test]
+    fn x_is_refused_for_a_selection_not_made_with_r() {
+        let conflict_flow = Ok(Flow::Conflicts(vec![text_conflict("a.txt", TWO_HUNKS)]));
+        let (mut a, mut f) = app();
+        f.flows = vec![conflict_flow].into();
+        press(&mut a, &mut f, ch(' '));
+        press(&mut a, &mut f, KeyCode::Enter);
+        press(&mut a, &mut f, ch('X'));
+        assert_eq!(a.mode, Mode::Resolve, "stays on the decision screen");
+        assert!(a.status_is_error);
+        assert!(a.status.contains("selection made with R"), "{}", a.status);
+        assert!(f.restored.is_empty());
     }
 
     #[test]

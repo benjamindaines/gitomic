@@ -34,6 +34,8 @@ use crate::{commands, git, Res};
 pub const MAX_CANDIDATES: usize = 500;
 
 pub struct Opts {
+    // Restrict every named commit to this one path (see `patch::Spec::only`).
+    pub only: Option<String>,
     pub from: Option<String>,
     pub hashes: Vec<String>,
     pub dry_run: bool,
@@ -93,10 +95,54 @@ pub fn candidates(cwd: &Path, source: &str) -> Res<Vec<(String, String)>> {
         .collect())
 }
 
+// Paths changed by `commit` (against its first parent), sorted as git lists them.
+pub fn changed_paths(root: &Path, commit: &str) -> Res<Vec<String>> {
+    let out = git::run(
+        root,
+        &[
+            "diff-tree",
+            "-r",
+            "--root",
+            "--no-commit-id",
+            "--name-only",
+            "-z",
+            commit,
+        ],
+    )?;
+    Ok(out
+        .split('\0')
+        .filter(|p| !p.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+// The commits of `source` that HEAD lacks and that change `path`, as full ids (unordered). The
+// same range as `candidates`, so every id returned is a row of the picker's list. History is not
+// simplified, and renames are not followed: a file is followed under the name it has at each
+// commit.
+pub fn touching(cwd: &Path, source: &str, path: &str) -> Res<Vec<String>> {
+    let root = git::work_tree(cwd)?;
+    let out = git::run(
+        &root,
+        &[
+            "rev-list",
+            "--cherry-pick",
+            "--right-only",
+            "--no-merges",
+            "--full-history",
+            &format!("--max-count={MAX_CANDIDATES}"),
+            &format!("HEAD...{source}"),
+            "--",
+            &format!(":(literal){path}"),
+        ],
+    )?;
+    Ok(out.lines().map(str::to_string).collect())
+}
+
 // The text the picker shows for one commit: its header and message, then what applying it to `base`
 // would change. A conflict is announced ahead of the diff, whose conflicted files show the markers
 // that the decision screen later resolves.
-pub fn preview(root: &Path, base: &str, pick: &str) -> Res<String> {
+pub fn preview(root: &Path, base: &str, pick: &str, only: Option<&str>) -> Res<String> {
     let header = git::run(
         root,
         &[
@@ -109,7 +155,17 @@ pub fn preview(root: &Path, base: &str, pick: &str) -> Res<String> {
     )?;
     let mut text = header;
     text.push_str("\n\n");
-    let tree = match patch::merge(root, base, pick)? {
+    // A pick restricted to one file is previewed as its restricted form, which is what would apply.
+    let effective = match only {
+        Some(path) => {
+            text.push_str(&format!(
+                "Applied for {path} only; other files of this commit are left out.\n\n"
+            ));
+            patch::scoped_commit(root, pick, path)?
+        }
+        None => pick.to_string(),
+    };
+    let tree = match patch::merge(root, base, &effective)? {
         Merged::Clean(tree) => tree,
         Merged::Conflicted { tree, files } => {
             text.push_str("CONFLICT: applying this commit needs a decision in\n");
@@ -166,14 +222,14 @@ pub fn run(cwd: &Path, opts: Opts) -> Res<()> {
             }
         }
     } else {
-        spec_from_hashes(&root, &opts.hashes)?
+        spec_from_hashes(&root, &opts.hashes, opts.only.as_deref())?
     };
     apply_spec(cwd, spec, opts.dry_run, opts.patch_only)
 }
 
 // Resolve command-line selectors into a spec against the current HEAD. The order given is the order
 // of replay. A commit already contained in HEAD, a merge commit, or a root commit is refused.
-fn spec_from_hashes(root: &Path, hashes: &[String]) -> Res<Spec> {
+fn spec_from_hashes(root: &Path, hashes: &[String], only: Option<&str>) -> Res<Spec> {
     let base = git::rev_parse(root, "HEAD")?;
     let mut picks: Vec<(String, String)> = Vec::new();
     for sel in hashes {
@@ -194,10 +250,25 @@ fn spec_from_hashes(root: &Path, hashes: &[String]) -> Res<Spec> {
         let subject = git::run(root, &["show", "-s", "--format=%s", &id])?;
         picks.push((id, subject));
     }
+    let only = match only {
+        Some(path) => {
+            for (id, _) in &picks {
+                if !changed_paths(root, id)?.iter().any(|p| p == path) {
+                    return Err(format!("cherry-pick: {} does not change {path}", short(id)).into());
+                }
+            }
+            picks
+                .iter()
+                .map(|(id, _)| (id.clone(), path.to_string()))
+                .collect()
+        }
+        None => Vec::new(),
+    };
     Ok(Spec {
         base,
         picks,
-        decisions: Vec::new(),
+        only,
+        ..Spec::default()
     })
 }
 
@@ -292,6 +363,9 @@ fn apply_locked(
         };
         println!("gitomic: {verb} {} {subject}", short(id));
     }
+    for (id, path) in &patch.spec.restore {
+        println!("gitomic: {verb} {path} restored whole from {}", short(id));
+    }
     if patch.is_empty() {
         println!("  the change is already present in HEAD; nothing to apply");
         return Ok(());
@@ -347,6 +421,7 @@ mod tests {
 
     fn opts(hashes: &[&str]) -> Opts {
         Opts {
+            only: None,
             from: None,
             hashes: hashes.iter().map(|h| h.to_string()).collect(),
             dry_run: false,
@@ -519,7 +594,7 @@ mod tests {
     #[test]
     fn head_moving_after_the_selection_recomputes_the_patch() {
         let (r, b, _) = setup();
-        let spec = spec_from_hashes(&r.0, &[b]).unwrap();
+        let spec = spec_from_hashes(&r.0, &[b], None).unwrap();
         let old = spec.base.clone();
         // A commit lands between choosing and applying, as a watcher capture would.
         r.commit_file("late.txt", "l\n", "late");
@@ -543,7 +618,7 @@ mod tests {
     fn decisions_in_a_spec_settle_a_conflict_without_a_terminal() {
         let (r, _, f) = setup();
         r.commit_file("f.txt", &Repo::lines_with(&[(3, "MAIN3")]), "main edits f");
-        let spec = spec_from_hashes(&r.0, &[f.clone()]).unwrap();
+        let spec = spec_from_hashes(&r.0, &[f.clone()], None).unwrap();
 
         // Decide through the engine, as the interactive screen does, then hand the spec over.
         let mut job = patch::Job::new(&r.0, &spec.base, &spec.ids(), &[]);
@@ -608,7 +683,13 @@ mod tests {
             .map(|(id, _)| id)
             .collect();
         assert_eq!(all.len(), 3);
-        apply_spec(&r.0, spec_from_hashes(&r.0, &all).unwrap(), false, false).unwrap();
+        apply_spec(
+            &r.0,
+            spec_from_hashes(&r.0, &all, None).unwrap(),
+            false,
+            false,
+        )
+        .unwrap();
 
         for file in ["f.txt", "g.txt"] {
             assert_eq!(
@@ -652,14 +733,102 @@ mod tests {
     fn the_preview_shows_the_change_against_the_base_and_flags_conflicts() {
         let (r, b, f) = setup();
         let base = r.head();
-        let clean = preview(&r.0, &base, &b).unwrap();
+        let clean = preview(&r.0, &base, &b, None).unwrap();
         assert!(clean.contains("add b"), "{clean}");
         assert!(clean.contains("+++ b/b.txt"), "{clean}");
         assert!(!clean.contains("CONFLICT"));
 
         r.commit_file("f.txt", &Repo::lines_with(&[(3, "MAIN3")]), "main edits f");
-        let conflicted = preview(&r.0, &r.head(), &f).unwrap();
+        let conflicted = preview(&r.0, &r.head(), &f, None).unwrap();
         assert!(conflicted.contains("CONFLICT"), "{conflicted}");
         assert!(conflicted.contains("f.txt (1 to decide)"), "{conflicted}");
+    }
+
+    // `feat` history (oldest first): m1 edits f.txt line 3 and adds other.txt (two files), g adds
+    // g.txt, m3 edits f.txt line 7. Returns the three commit ids.
+    fn chain() -> (Repo, [String; 3]) {
+        let r = Repo::new();
+        r.write("f.txt", &Repo::lines());
+        r.git(&["add", "."]);
+        r.git(&["commit", "-q", "-m", "base"]);
+        r.git(&["checkout", "-q", "-b", "feat"]);
+        r.write("f.txt", &Repo::lines_with(&[(3, "FEAT3")]));
+        r.write("other.txt", "o\n");
+        r.git(&["add", "."]);
+        r.git(&["commit", "-q", "-m", "f and other"]);
+        let m1 = r.head();
+        let g = r.commit_file("g.txt", "g\n", "add g");
+        let m3 = r.commit_file(
+            "f.txt",
+            &Repo::lines_with(&[(3, "FEAT3"), (7, "FEAT7")]),
+            "f 7",
+        );
+        r.git(&["checkout", "-q", "main"]);
+        r.commit_file("c.txt", "c\n", "add c");
+        (r, [m1, g, m3])
+    }
+
+    #[test]
+    fn changed_paths_and_touching_follow_one_file() {
+        let (r, [m1, g, m3]) = chain();
+        assert_eq!(
+            changed_paths(&r.0, &m1).unwrap(),
+            vec!["f.txt", "other.txt"]
+        );
+        assert_eq!(changed_paths(&r.0, &g).unwrap(), vec!["g.txt"]);
+        let mut got = touching(&r.0, "feat", "f.txt").unwrap();
+        got.sort();
+        let mut want = vec![m1, m3];
+        want.sort();
+        assert_eq!(got, want);
+        assert_eq!(touching(&r.0, "feat", "g.txt").unwrap(), vec![g]);
+        assert!(touching(&r.0, "feat", "nothing.txt").unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_file_chain_brings_the_file_to_the_branch_state_and_leaves_other_files_alone() {
+        let (r, [m1, _, m3]) = chain();
+        let mut o = opts(&[&m1, &m3]);
+        o.only = Some("f.txt".to_string());
+        run(&r.0, o).unwrap();
+        assert_eq!(
+            r.read("f.txt"),
+            r.git(&["show", &format!("{m3}:f.txt")]) + "\n"
+        );
+        assert!(
+            !r.exists("other.txt"),
+            "the second file of m1 is not applied"
+        );
+        assert!(!r.exists("g.txt"));
+    }
+
+    #[test]
+    fn only_names_a_path_the_commits_must_change_or_is_refused() {
+        let (r, [m1, g, _]) = chain();
+        let mut o = opts(&[&m1, &g]);
+        o.only = Some("f.txt".to_string());
+        let err = run(&r.0, o).unwrap_err().to_string();
+        assert!(err.contains("f.txt"), "{err}");
+        assert_eq!(r.git(&["status", "--porcelain"]), "");
+    }
+
+    #[test]
+    fn a_whole_file_restore_replaces_a_history_that_cannot_be_replayed() {
+        let (r, [_, g, m3]) = chain();
+        // main now edits the same line, so replaying m3's history for f.txt would conflict.
+        r.commit_file("f.txt", &Repo::lines_with(&[(3, "MAIN3")]), "main edits f");
+        let base = r.head();
+        let spec = Spec {
+            base,
+            picks: vec![(g.clone(), "add g".to_string())],
+            restore: vec![(m3.clone(), "f.txt".to_string())],
+            ..Spec::default()
+        };
+        apply_spec(&r.0, spec, false, false).unwrap();
+        assert_eq!(
+            r.read("f.txt"),
+            r.git(&["show", &format!("{m3}:f.txt")]) + "\n"
+        );
+        assert_eq!(r.read("g.txt"), "g\n");
     }
 }

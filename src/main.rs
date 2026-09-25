@@ -211,6 +211,10 @@ USAGE:
   gitomic <command> [options]     run inside a git repository (any subdirectory)
 
 COMMANDS:
+                       NOTE: gitomic does not currently verify that the commit marked at the beginning of
+                       a session is still valid! Until that is added, do not move HEAD outside of gitomic.
+                       Example: don't pull while gitomic is running or merge or anything like that.
+
   init [options]       Mark HEAD as the session base for the checked-out branch and fork a watcher bound to
                        that branch. If a base already exists for it without a running watcher, resume that
                        session. Sessions are independent per branch: switching branches leaves this one's
@@ -262,7 +266,22 @@ FINISH OPTIONS:
 
 NOTES:
   All commits are local; run 'git push' yourself to publish. Atomic commits and the finalize rewrite
-  bypass git hooks. Config: ${{XDG_CONFIG_HOME:-~/.config}}/gitomic/gitomic.cfg.",
+  bypass git hooks. Config: ${{XDG_CONFIG_HOME:-~/.config}}/gitomic/gitomic.cfg.
+
+  Add the following to your .bashrc file to be reminded of running sessions (add a call for it as well
+  where you would like it to run.
+
+    gitomicSessions() { 
+        local c_red c_blu c_grn c_rst c_ylw c_bold 
+        c_red=$'\033[31m'; c_grn=$'\033[32m'; c_ylw=$'\033[33m' 
+        c_blu=$'\033[34m'; c_rst=$'\033[0m'; c_bold=$'\033[1m' 
+        local active=$(gitomic active) 
+        if [ "$active" ]; then 
+                printf "\n%s%s%s\n%s\n\n" \ 
+                        "$c_ylw$c_bold" "Active gitomic sessions:" "$c_rst" \ 
+                        "$active" 
+        fi 
+} ",
         env!("CARGO_PKG_VERSION")
     );
 }

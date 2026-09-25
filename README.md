@@ -144,6 +144,11 @@ vim-style keys, `space` to mark and the same rule that only `y`/`n` answer a pro
   the first thing shown.
 - The right pane shows what each commit would change relative to the `HEAD` that was current when the screen
   opened, not the commit's own diff. A commit that would conflict is announced above its diff.
+- `R` marks the highlighted commit and every older one below it, which are the commits the branch holds that
+  `HEAD` lacks, so that replaying them brings the touched files to the state they have on the source branch
+  at the highlighted commit. Commits above the cursor keep their marks; pressing `R` again on a fully marked
+  range unmarks it. Merge commits are not in the list, so changes that reached the branch only through a
+  merge are not part of such a range.
 - `Enter` on the list replays the marked commits, oldest first. A clean result goes straight to the `y`/`n`
   prompt, which names the number of commits and the size of the change.
 - **Conflicts** open a decision screen: the conflicted files on the left, one entry per conflict hunk, and the

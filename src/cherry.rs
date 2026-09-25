@@ -588,6 +588,38 @@ mod tests {
     }
 
     #[test]
+    fn picking_every_candidate_reproduces_the_branch_state_of_the_files() {
+        // What `R` in the screen asks for: from the chosen commit down to the oldest the branch
+        // holds that HEAD lacks, replayed in order, leaves the touched files as on the branch.
+        let r = Repo::new();
+        r.commit_file("f.txt", &Repo::lines(), "base");
+        r.git(&["checkout", "-q", "-b", "feat"]);
+        r.commit_file("f.txt", &Repo::lines_with(&[(2, "ONE")]), "one");
+        r.commit_file("g.txt", "g\n", "add g");
+        r.commit_file("f.txt", &Repo::lines_with(&[(2, "ONE"), (7, "TWO")]), "two");
+        let tip = r.head();
+        r.git(&["checkout", "-q", "main"]);
+        r.commit_file("other.txt", "o\n", "unrelated main work");
+
+        let all: Vec<String> = candidates(&r.0, "feat")
+            .unwrap()
+            .into_iter()
+            .rev()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(all.len(), 3);
+        apply_spec(&r.0, spec_from_hashes(&r.0, &all).unwrap(), false, false).unwrap();
+
+        for file in ["f.txt", "g.txt"] {
+            assert_eq!(
+                r.read(file),
+                r.git(&["show", &format!("{tip}:{file}")]) + "\n"
+            );
+        }
+        assert_eq!(r.read("other.txt"), "o\n");
+    }
+
+    #[test]
     fn candidates_are_newest_first() {
         let (r, b, f) = setup();
         let got: Vec<String> = candidates(&r.0, "feat")

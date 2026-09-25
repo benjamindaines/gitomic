@@ -14,6 +14,7 @@
 //
 // Keys, list pane:
 //   j/k, arrows  move            g/G  first/last          space  toggle the mark
+//   R            mark this commit and every older one below it (a second press unmarks them)
 //   l, Right     open the diff   Tab  choose the source branch
 //   Enter        prepare the marked commits (conflicts are decided first), then confirm with y/n
 //   q, Esc       quit (confirmed first when commits are marked)
@@ -558,6 +559,28 @@ impl App {
         }
     }
 
+    // Mark the highlighted commit and every commit below it, that is every older commit the branch
+    // holds that HEAD lacks. Replayed in order, they bring the picked files to the state they have
+    // on the source branch at the highlighted commit. Commits above the cursor keep their marks.
+    // When the whole range is already marked, the same key unmarks it.
+    fn mark_through(&mut self) {
+        if self.entries.is_empty() {
+            return;
+        }
+        let range = self.cursor..self.entries.len();
+        let all = self.entries[range.clone()].iter().all(|e| e.marked);
+        let count = range.len();
+        for e in &mut self.entries[range] {
+            e.marked = !all;
+        }
+        let text = if all {
+            format!("unmarked {count} commit(s) from here down")
+        } else {
+            format!("marked {count} commit(s): this one and every older one")
+        };
+        self.say(text, false);
+    }
+
     fn say(&mut self, text: impl Into<String>, is_error: bool) {
         self.status = text.into();
         self.status_is_error = is_error;
@@ -607,6 +630,7 @@ impl App {
             KeyCode::Char('g') | KeyCode::Home => self.jump(0),
             KeyCode::Char('G') | KeyCode::End => self.jump(self.entries.len().saturating_sub(1)),
             KeyCode::Char(' ') => self.toggle(),
+            KeyCode::Char('R') => self.mark_through(),
             KeyCode::Char('l') | KeyCode::Right => self.focus = Focus::Diff,
             KeyCode::Tab => self.open_branches(src),
             KeyCode::Enter => self.submit(src),
@@ -639,6 +663,7 @@ impl App {
             KeyCode::Enter | KeyCode::Char('n') => self.step(1),
             KeyCode::Char('N') => self.step(-1),
             KeyCode::Char(' ') => self.toggle(),
+            KeyCode::Char('R') => self.mark_through(),
             KeyCode::Tab => self.open_branches(src),
             KeyCode::Esc => self.focus = Focus::List,
             KeyCode::Char('q') => return self.request_quit(),
@@ -1031,9 +1056,9 @@ impl App {
                 " j/k conflict  a tree copy  b picked  c both  u undo  Enter continue  Esc leave ",
             ),
             Mode::Browse => match self.focus {
-                Focus::List => {
-                    hint(" j/k move  space mark  l diff  Tab branch  Enter pick marked  q quit ")
-                }
+                Focus::List => hint(
+                    " j/k move  space mark  R mark older  l diff  Tab branch  Enter pick  q quit",
+                ),
                 Focus::Diff => {
                     hint(" j/k h/l scroll  Enter/n next  N prev  space mark  Tab branch  q quit")
                 }
@@ -1323,6 +1348,46 @@ mod tests {
         press(&mut a, &mut f, KeyCode::Enter);
         let picks: Vec<String> = f.started[0].iter().map(|(i, _)| i.clone()).collect();
         assert_eq!(picks, vec![id('c'), id('a')]);
+    }
+
+    #[test]
+    fn r_marks_this_commit_and_every_older_one_and_leaves_newer_marks_alone() {
+        let (mut a, mut f) = app();
+        press(&mut a, &mut f, ch('j'));
+        press(&mut a, &mut f, ch('R'));
+        let marks: Vec<bool> = a.entries.iter().map(|e| e.marked).collect();
+        assert_eq!(marks, [false, true, true]);
+        assert!(a.status.contains("marked 2 commit(s)"), "{}", a.status);
+
+        // A mark above the cursor survives, and the submit order is oldest first.
+        press(&mut a, &mut f, ch('k'));
+        press(&mut a, &mut f, ch(' '));
+        press(&mut a, &mut f, KeyCode::Enter);
+        let picks: Vec<String> = f.started[0].iter().map(|(i, _)| i.clone()).collect();
+        assert_eq!(picks, vec![id('c'), id('b'), id('a')]);
+    }
+
+    #[test]
+    fn a_second_r_unmarks_the_range_and_r_works_from_the_diff_pane() {
+        let (mut a, mut f) = app();
+        press(&mut a, &mut f, ch('l'));
+        press(&mut a, &mut f, ch('R'));
+        assert_eq!(a.marked_count(), 3);
+        assert_eq!(a.focus, Focus::Diff);
+        press(&mut a, &mut f, ch('R'));
+        assert_eq!(a.marked_count(), 0);
+        assert!(a.status.contains("unmarked 3"), "{}", a.status);
+    }
+
+    #[test]
+    fn r_on_the_oldest_commit_marks_only_that_one_and_r_with_no_list_is_harmless() {
+        let (mut a, mut f) = app();
+        press(&mut a, &mut f, ch('G'));
+        press(&mut a, &mut f, ch('R'));
+        assert_eq!(a.marked_count(), 1);
+        let mut empty = App::new();
+        press(&mut empty, &mut f, ch('R'));
+        assert_eq!(empty.marked_count(), 0);
     }
 
     #[test]

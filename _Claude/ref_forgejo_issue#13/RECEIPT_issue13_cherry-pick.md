@@ -151,3 +151,38 @@ it was.
 - A restarted watcher still does not inherit `-v/--verbose` (from part 1 of #12).
 - Delivered as a zip and patch on the issue thread; the patch excludes nothing (`Cargo.toml` and `Cargo.lock`
   are unchanged).
+
+## Addendum (comment 278): `R`, mark from the highlighted commit down to the oldest
+
+### Context
+
+Requested after testing: select a commit with `R` and have every commit below it marked automatically, so that
+the files reach the state they have on the source branch at the selected commit.
+
+### Design decisions
+
+- **Reading of "recursive".** The list holds exactly the commits the source branch has and HEAD lacks, newest
+  first, so "down to the current HEAD" is the rest of the list below the cursor. `R` marks the highlighted
+  commit and everything below it. Replay order is unchanged (oldest first), so the chain applies as a whole.
+- **Marks above the cursor are left alone**, so `R` composes with `space`. When the whole range is already
+  marked, `R` unmarks it, giving a way back without walking the list. The bottom line reports the count.
+- **Works from both panes.** The key is `R` (capital), leaving `r` free.
+- **Limit, stated in the README.** Merge commits are not in the list, and commits whose change HEAD already
+  holds under another id are hidden. Content that reached the branch only through a merge commit is therefore
+  not part of a marked range. A conflict in the chain opens the decision screen as usual.
+
+### Changes
+
+- `src/cherry_ui.rs`: `mark_through` added before `say`; `R` arm added to `key_list` and `key_diff`; the two
+  bottom-line hints and the header comment mention it; 3 tests.
+- `src/cherry.rs`: 1 test that replays every candidate of a branch and compares the touched files with the
+  branch tip.
+- `src/main.rs`: usage text for `cherry-pick`.
+- `README.md`: `R` described in the interactive screen list.
+
+### Verification
+
+- `cargo test`: 123 passed (119 before; 4 new). `cargo fmt --check` clean; added lines at most 100 columns.
+- Real terminal against a live session: `R` on the middle of three commits marked two ("2 of 3 marked" and the
+  count message); a second `R` unmarked; `R` on the newest marked all three; confirming produced one atomic
+  commit and `f.txt` and `b.txt` were byte-identical to the branch tip's.

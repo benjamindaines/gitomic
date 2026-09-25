@@ -310,11 +310,12 @@ COMMANDS:
                        open it is recorded as one atomic commit (a live watcher is paused
                        meanwhile), otherwise it is left uncommitted. With no hash, opens an
                        interactive screen: commits on the left, what each would change on the
-                       right, space to mark, Tab to choose the branch, Enter to prepare. A
-                       conflict opens a decision screen: a keeps the tree copy, b takes the picked
-                       commit's, c keeps both, per conflict hunk. Options: --from <branch>,
-                       -n/--dry-run (report only), -p/--patch-only (write the patch file, apply
-                       nothing). With hashes, conflicts are refused. Aliases: pick.
+                       right, space to mark, R to mark a commit and every older one, Tab to choose
+                       the branch, Enter to prepare. A conflict opens a decision screen: a keeps
+                       the tree copy, b takes the picked commit's, c keeps both, per conflict
+                       hunk. Options: --from <branch>, -n/--dry-run (report only), -p/--patch-only
+                       (write the patch file, apply nothing). With hashes, conflicts are refused.
+                       Aliases: pick.
   stop                 Stop the watcher but keep the base and recorded commits for later finish/resume.
   abort [--force]      Discard the session: reset the branch to the base and drop the atomic commits.
   help, --version

@@ -203,6 +203,21 @@ fn as_path(s: &str) -> PathBuf {
     PathBuf::from(s)
 }
 
+// Shell function offered to users for their .bashrc. Held as a raw string so that braces, backslashes and quotes
+// reach the terminal verbatim; substituted into the help text as a format argument, which is not re-parsed.
+const BASHRC_SNIPPET: &str = r#"    gitomicSessions() {
+        local c_red c_blu c_grn c_rst c_ylw c_bold
+        c_red=$'\033[31m'; c_grn=$'\033[32m'; c_ylw=$'\033[33m'
+        c_blu=$'\033[34m'; c_rst=$'\033[0m'; c_bold=$'\033[1m'
+        local active
+        active=$(gitomic active)
+        if [ "$active" ]; then
+            printf "\n%s%s%s\n%s\n\n" \
+                "$c_ylw$c_bold" "Active gitomic sessions:" "$c_rst" \
+                "$active"
+        fi
+    }"#;
+
 fn print_usage() {
     println!(
         "gitomic {} — record atomic commits as a repository changes, then stamp one message across the batch
@@ -268,20 +283,12 @@ NOTES:
   All commits are local; run 'git push' yourself to publish. Atomic commits and the finalize rewrite
   bypass git hooks. Config: ${{XDG_CONFIG_HOME:-~/.config}}/gitomic/gitomic.cfg.
 
-  Add the following to your .bashrc file to be reminded of running sessions (add a call for it as well
-  where you would like it to run.
+  Add the following to your .bashrc file to be reminded of running sessions, and call it where it should run
+  (for example, on its own line after the definition):
 
-    gitomicSessions() { 
-        local c_red c_blu c_grn c_rst c_ylw c_bold 
-        c_red=$'\033[31m'; c_grn=$'\033[32m'; c_ylw=$'\033[33m' 
-        c_blu=$'\033[34m'; c_rst=$'\033[0m'; c_bold=$'\033[1m' 
-        local active=$(gitomic active) 
-        if [ "$active" ]; then 
-                printf "\n%s%s%s\n%s\n\n" \ 
-                        "$c_ylw$c_bold" "Active gitomic sessions:" "$c_rst" \ 
-                        "$active" 
-        fi 
-} ",
-        env!("CARGO_PKG_VERSION")
+{snippet}
+",
+        env!("CARGO_PKG_VERSION"),
+        snippet = BASHRC_SNIPPET
     );
 }

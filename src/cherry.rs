@@ -22,7 +22,9 @@
 // Interactive use is `gitomic cherry-pick` with no commit (cherry_ui.rs). With commits named, the
 // same pipeline runs without a terminal and refuses any conflict.
 
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use crate::commands::{live_watcher, report_flush, short, terminate_watcher};
 use crate::config::Config;
@@ -143,6 +145,8 @@ pub fn touching(cwd: &Path, source: &str, path: &str) -> Res<Vec<String>> {
 // already holds in another form (the same edit made by hand, or a later commit that supersedes it)
 // merges to exactly the tree of `base` and reports false. A conflict, or a conflict the picker
 // cannot present, reports true: those commits need the user's attention and stay selectable.
+// Kept for the tests, which check the picker's `Reader` against it.
+#[cfg(test)]
 pub fn applies(root: &Path, base: &str, pick: &str) -> Res<bool> {
     match patch::merge(root, base, pick)? {
         Merged::Clean(tree) => {
@@ -153,11 +157,92 @@ pub fn applies(root: &Path, base: &str, pick: &str) -> Res<bool> {
     }
 }
 
+// Cap on the text of one preview, so that a commit touching a huge generated file is stopped while
+// git is still producing it. The cut is announced in the text.
+pub const MAX_PREVIEW_BYTES: usize = 8 * 1024 * 1024;
+
+// Cap on the commit header shown above a preview.
+const MAX_HEADER_BYTES: usize = 1024 * 1024;
+
+// A changed file that a preview did not read because it exceeds the size limit.
+#[derive(Clone, PartialEq, Debug)]
+pub struct Gated {
+    pub path: String,
+    // The larger of the file's size before and after the commit.
+    pub bytes: u64,
+}
+
+// What the picker shows for one commit, and which of its files were left unread.
+pub struct Preview {
+    pub text: String,
+    pub gated: Vec<Gated>,
+}
+
+// A size in bytes as a short human-readable string, in powers of 1024.
+pub fn human(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+// The files a `--stat` block reports as binary with a size above `limit`. With
+// `core.bigFileThreshold` at `limit`, git treats every larger file as binary without reading it, so
+// each one appears as "path | Bin <old> -> <new> bytes"; smaller binary files appear the same way and
+// are filtered out here by their sizes.
+fn gated_from_stat(stat: &str, limit: u64) -> Vec<Gated> {
+    stat.lines()
+        .filter_map(|line| {
+            let (name, rest) = line.split_once(" | Bin ")?;
+            let sizes = rest.strip_suffix(" bytes")?;
+            let (old, new) = match sizes.split_once(" -> ") {
+                Some((o, n)) => (o.trim().parse::<u64>().ok()?, n.trim().parse::<u64>().ok()?),
+                None => {
+                    let n = sizes.trim().parse::<u64>().ok()?;
+                    (n, n)
+                }
+            };
+            let bytes = old.max(new);
+            (bytes > limit).then(|| Gated {
+                path: name.trim().to_string(),
+                bytes,
+            })
+        })
+        .collect()
+}
+
 // The text the picker shows for one commit: its header and message, then what applying it to `base`
 // would change. A conflict is announced ahead of the diff, whose conflicted files show the markers
 // that the decision screen later resolves.
+#[cfg(test)]
 pub fn preview(root: &Path, base: &str, pick: &str, only: Option<&str>) -> Res<String> {
-    let header = git::run(
+    preview_with(root, base, pick, only, None, None, None).map(|p| p.text)
+}
+
+// `preview` with the two refinements the interactive screen needs:
+//   - `limit`: a size in bytes above which a changed file is not read. Such files are named, with
+//     their sizes, in the text and in `Preview::gated`; None reads everything.
+//   - `known_tree`: the tree already obtained by merging `pick` onto `base`, which saves repeating
+//     the merge. Ignored for a pick restricted to one file, whose merge is a different one.
+// `cancel` lets another thread abandon the work between and during its git commands.
+pub fn preview_with(
+    root: &Path,
+    base: &str,
+    pick: &str,
+    only: Option<&str>,
+    limit: Option<u64>,
+    known_tree: Option<&str>,
+    cancel: Option<&git::Cancel>,
+) -> Res<Preview> {
+    let header = git::run_capped(
         root,
         &[
             "show",
@@ -166,8 +251,10 @@ pub fn preview(root: &Path, base: &str, pick: &str, only: Option<&str>) -> Res<S
             "--format=commit %H%nAuthor: %an <%ae>%nDate:   %ad%n%n%B",
             pick,
         ],
+        MAX_HEADER_BYTES,
+        cancel,
     )?;
-    let mut text = header;
+    let mut text = header.text;
     text.push_str("\n\n");
     // A pick restricted to one file is previewed as its restricted form, which is what would apply.
     let effective = match only {
@@ -179,43 +266,162 @@ pub fn preview(root: &Path, base: &str, pick: &str, only: Option<&str>) -> Res<S
         }
         None => pick.to_string(),
     };
-    let tree = match patch::merge(root, base, &effective)? {
-        Merged::Clean(tree) => tree,
-        Merged::Conflicted { tree, files } => {
-            text.push_str("CONFLICT: applying this commit needs a decision in\n");
-            for f in &files {
-                text.push_str(&format!("  {} ({} to decide)\n", f.path, f.units()));
+    if cancel.is_some_and(git::Cancel::is_cancelled) {
+        return Err(git::CANCELLED.into());
+    }
+    let tree = match (only, known_tree) {
+        (None, Some(tree)) => tree.to_string(),
+        _ => match patch::merge(root, base, &effective)? {
+            Merged::Clean(tree) => tree,
+            Merged::Conflicted { tree, files } => {
+                text.push_str("CONFLICT: applying this commit needs a decision in\n");
+                for f in &files {
+                    text.push_str(&format!("  {} ({} to decide)\n", f.path, f.units()));
+                }
+                text.push_str(
+                    "Enter on a marked selection opens the decision screen for each.\n\n",
+                );
+                tree
             }
-            text.push_str("Enter on a marked selection opens the decision screen for each.\n\n");
-            tree
-        }
-        Merged::Unsupported(list) => {
-            text.push_str("CANNOT BE PICKED here: the conflict has no A/B decision.\n");
-            for l in list {
-                text.push_str(&format!("  {l}\n"));
+            Merged::Unsupported(list) => {
+                text.push_str("CANNOT BE PICKED here: the conflict has no A/B decision.\n");
+                for l in list {
+                    text.push_str(&format!("  {l}\n"));
+                }
+                return Ok(Preview {
+                    text,
+                    gated: Vec::new(),
+                });
             }
-            return Ok(text);
-        }
+        },
     };
-    let diff = git::run(
-        root,
-        &[
-            "diff",
-            "--stat",
-            "--patch",
-            "--no-color",
-            "--no-renames",
-            base,
-            &tree,
-        ],
-    )?;
-    if diff.is_empty() {
-        text.push_str("(this commit changes nothing relative to the current HEAD)\n");
-    } else {
-        text.push_str(&diff);
+    let threshold = limit.map(|n| format!("core.bigFileThreshold={n}"));
+    let mut args: Vec<&str> = Vec::new();
+    if let Some(t) = &threshold {
+        args.extend(["-c", t]);
+    }
+    args.extend([
+        "diff",
+        "--stat",
+        "--patch",
+        "--no-color",
+        "--no-renames",
+        "--no-ext-diff",
+        "--no-textconv",
+        base,
+        &tree,
+    ]);
+    let diff = git::run_capped(root, &args, MAX_PREVIEW_BYTES, cancel)?;
+    let gated = limit.map_or_else(Vec::new, |n| gated_from_stat(&diff.text, n));
+    if !gated.is_empty() {
+        text.push_str(&format!(
+            "Not read (over {}); press D to load this commit in full:\n",
+            human(limit.unwrap_or(0))
+        ));
+        for g in &gated {
+            text.push_str(&format!("  {}  {}\n", g.path, human(g.bytes)));
+        }
         text.push('\n');
     }
-    Ok(text)
+    if diff.text.is_empty() {
+        text.push_str("(this commit changes nothing relative to the current HEAD)\n");
+    } else {
+        text.push_str(&diff.text);
+        text.push('\n');
+        if diff.truncated {
+            text.push_str(&format!(
+                "... output cut after {} of diff text\n",
+                human(MAX_PREVIEW_BYTES as u64)
+            ));
+        }
+    }
+    Ok(Preview { text, gated })
+}
+
+// Everything the interactive screen reads from git, gathered so that it can be cloned and used from
+// several threads. Whatever one thread learns is shared: a merge is computed once per commit, and
+// the base tree once.
+#[derive(Clone)]
+pub struct Reader {
+    root: PathBuf,
+    base: String,
+    // Size limit in bytes for `preview`; 0 disables it.
+    limit: u64,
+    shared: Arc<Mutex<Known>>,
+}
+
+#[derive(Default)]
+struct Known {
+    base_tree: Option<String>,
+    // Tree produced by merging a commit onto the base, for commits that merge cleanly. A conflicted
+    // merge is not kept: its files carry whole file bodies, and those commits are seldom revisited.
+    clean: HashMap<String, String>,
+}
+
+impl Reader {
+    pub fn new(root: PathBuf, base: String, limit_bytes: u64) -> Reader {
+        Reader {
+            root,
+            base,
+            limit: limit_bytes,
+            shared: Arc::new(Mutex::new(Known::default())),
+        }
+    }
+
+    fn known(&self) -> std::sync::MutexGuard<'_, Known> {
+        // A panic in another thread must not turn every later lookup into a panic as well.
+        self.shared.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn base_tree(&self) -> Res<String> {
+        let cached = self.known().base_tree.clone();
+        if let Some(t) = cached {
+            return Ok(t);
+        }
+        let tree = git::rev_parse(&self.root, &format!("{}^{{tree}}", self.base))?;
+        self.known().base_tree = Some(tree.clone());
+        Ok(tree)
+    }
+
+    // Same answer as the free function `applies`, with the merge remembered for `preview`.
+    pub fn applies(&self, pick: &str) -> Res<bool> {
+        // The lock is released before `base_tree` takes it again; the guard of an `if let`
+        // scrutinee would otherwise live through the whole body.
+        let cached = self.known().clean.get(pick).cloned();
+        if let Some(tree) = cached {
+            return Ok(tree != self.base_tree()?);
+        }
+        match patch::merge(&self.root, &self.base, pick)? {
+            Merged::Clean(tree) => {
+                let changes = tree != self.base_tree()?;
+                self.known().clean.insert(pick.to_string(), tree);
+                Ok(changes)
+            }
+            Merged::Conflicted { .. } | Merged::Unsupported(_) => Ok(true),
+        }
+    }
+
+    // `preview_with` for this reader's base and size limit. `full` reads every file regardless of
+    // the limit.
+    pub fn preview(
+        &self,
+        pick: &str,
+        only: Option<&str>,
+        full: bool,
+        cancel: Option<&git::Cancel>,
+    ) -> Res<Preview> {
+        let limit = (!full && self.limit > 0).then_some(self.limit);
+        let known = self.known().clean.get(pick).cloned();
+        preview_with(
+            &self.root,
+            &self.base,
+            pick,
+            only,
+            limit,
+            known.as_deref(),
+            cancel,
+        )
+    }
 }
 
 // Entry point for the command.
@@ -878,5 +1084,141 @@ mod tests {
             r.git(&["show", &format!("{m3}:f.txt")]) + "\n"
         );
         assert_eq!(r.read("g.txt"), "g\n");
+    }
+    // `main` holds a.txt; `feat` adds a 3 MiB binary blob and a small text file in one commit.
+    // Returns (repo, that commit).
+    fn setup_big() -> (Repo, String) {
+        let r = Repo::new();
+        r.write("a.txt", "a\n");
+        r.git(&["add", "."]);
+        r.git(&["commit", "-q", "-m", "base"]);
+        r.git(&["checkout", "-q", "-b", "feat"]);
+        let blob: Vec<u8> = (0..3 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(r.0.join("rom.img"), blob).unwrap();
+        r.write("small.txt", "small\n");
+        r.git(&["add", "."]);
+        r.git(&["commit", "-q", "-m", "add image"]);
+        let c = r.head();
+        r.git(&["checkout", "-q", "main"]);
+        (r, c)
+    }
+
+    #[test]
+    fn human_sizes_use_powers_of_1024() {
+        assert_eq!(human(0), "0 B");
+        assert_eq!(human(1023), "1023 B");
+        assert_eq!(human(1024), "1.0 KB");
+        assert_eq!(human(32 << 20), "32.0 MB");
+        assert_eq!(human(5 << 30), "5.0 GB");
+    }
+
+    #[test]
+    fn the_stat_of_a_large_binary_is_recognised_and_small_ones_are_not() {
+        let stat = " a.txt        |   2 +-\n rom/seed.img | Bin 0 -> 5368709120 bytes\n \
+                    tiny.bin     | Bin 3 -> 9 bytes\n old.img      | Bin 900000000 -> 0 bytes\n \
+                    4 files changed\n";
+        let got = gated_from_stat(stat, 32 << 20);
+        assert_eq!(
+            got,
+            vec![
+                Gated {
+                    path: "rom/seed.img".into(),
+                    bytes: 5 << 30
+                },
+                Gated {
+                    path: "old.img".into(),
+                    bytes: 900_000_000
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_file_over_the_limit_is_named_not_read_and_the_rest_of_the_commit_still_shows() {
+        let (r, c) = setup_big();
+        let base = r.head();
+        let p = preview_with(&r.0, &base, &c, None, Some(1 << 20), None, None).unwrap();
+        assert_eq!(
+            p.gated,
+            vec![Gated {
+                path: "rom.img".into(),
+                bytes: 3 << 20
+            }]
+        );
+        assert!(p.text.contains("Not read (over 1.0 MB)"), "{}", p.text);
+        assert!(p.text.contains("press D"), "{}", p.text);
+        assert!(p.text.contains("rom.img  3.0 MB"), "{}", p.text);
+        assert!(
+            p.text.contains("+small"),
+            "the small file is diffed: {}",
+            p.text
+        );
+
+        let all = preview_with(&r.0, &base, &c, None, None, None, None).unwrap();
+        assert!(all.gated.is_empty());
+        assert!(!all.text.contains("Not read"));
+        assert!(all.text.contains("rom.img"));
+    }
+
+    #[test]
+    fn a_large_text_file_is_gated_by_size_alike() {
+        let r = Repo::new();
+        r.write("a.txt", "a\n");
+        r.git(&["add", "."]);
+        r.git(&["commit", "-q", "-m", "base"]);
+        r.git(&["checkout", "-q", "-b", "feat"]);
+        let c = r.commit_file("big.txt", &"line of text\n".repeat(300_000), "big text");
+        r.git(&["checkout", "-q", "main"]);
+        let p = preview_with(&r.0, &r.head(), &c, None, Some(1 << 20), None, None).unwrap();
+        assert_eq!(p.gated.len(), 1, "{}", p.text);
+        assert!(!p.text.contains("+line of text"), "not read");
+    }
+
+    #[test]
+    fn a_preview_larger_than_the_cap_is_cut_and_says_so() {
+        let r = Repo::new();
+        r.write("a.txt", "a\n");
+        r.git(&["add", "."]);
+        r.git(&["commit", "-q", "-m", "base"]);
+        r.git(&["checkout", "-q", "-b", "feat"]);
+        let c = r.commit_file("gen.txt", &"abcdefghij\n".repeat(1_200_000), "generated");
+        r.git(&["checkout", "-q", "main"]);
+        let p = preview_with(&r.0, &r.head(), &c, None, None, None, None).unwrap();
+        let tail = &p.text[p.text.len().saturating_sub(80)..];
+        assert!(p.text.contains("output cut after 8.0 MB"), "tail: {tail}");
+        assert!(p.text.len() < MAX_PREVIEW_BYTES + 4096);
+    }
+
+    #[test]
+    fn the_reader_gives_the_same_answers_and_remembers_the_merge() {
+        let (r, b, f) = setup();
+        let rd = Reader::new(r.0.clone(), r.head(), 0);
+        assert!(rd.applies(&b).unwrap());
+        assert!(rd.known().clean.contains_key(&b), "the merge is kept");
+        assert!(rd.applies(&b).unwrap(), "answered from what is kept");
+        assert!(rd.known().base_tree.is_some());
+
+        let free = preview(&r.0, &r.head(), &b, None).unwrap();
+        let via = rd.preview(&b, None, false, None).unwrap();
+        assert_eq!(via.text, free);
+        assert!(via.gated.is_empty(), "a limit of 0 gates nothing");
+        // A commit already present in another form is reported as changing nothing.
+        r.write("b.txt", "b\n");
+        r.git(&["add", "b.txt"]);
+        r.git(&["commit", "-q", "-m", "same edit by hand"]);
+        let rd = Reader::new(r.0.clone(), r.head(), 0);
+        assert!(!rd.applies(&b).unwrap());
+        assert!(rd.applies(&f).unwrap());
+    }
+
+    #[test]
+    fn a_cancelled_preview_stops_with_the_cancel_error() {
+        let (r, c) = setup_big();
+        let cancel = git::Cancel::default();
+        cancel.cancel();
+        let err = preview_with(&r.0, &r.head(), &c, None, None, None, Some(&cancel))
+            .err()
+            .expect("cancelled");
+        assert_eq!(err.to_string(), git::CANCELLED);
     }
 }

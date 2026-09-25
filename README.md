@@ -155,6 +155,11 @@ vim-style keys, `space` to mark and the same rule that only `y`/`n` answer a pro
   is highlighted and no diff is loaded. `j` (or `Down`) enters from the top and lands on the first commit that
   applies; `k` (or `Up`) enters from the bottom. `g` and `G` also leave this state. While it lasts, the two ends
   of the list are classified in the background, and `space`, `R` and `l` do nothing.
+- A changed file larger than `cherry_size_limit_mb` (32 MiB by default) is not read for the preview: it is
+  listed with its size above the diff, and the rest of the commit is shown as usual. `D` offers to read the
+  withheld files of the highlighted commit; only `y` confirms. Reading a multi-gigabyte image to draw a
+  preview is what makes the screen unusable on slow hardware, and the sizes are already known without it.
+  The text of one preview is also capped at 8 MiB, after which git is stopped and the cut is announced.
 - `R` follows one file. It marks the highlighted commit and every older commit of the source branch that
   changes the same file (the commits `HEAD` lacks), each restricted to that file, so that replaying them
   brings the file to its state on the source branch at the highlighted commit. When the highlighted commit
@@ -191,6 +196,7 @@ default, so the file is optional. See `gitomic.cfg.example`.
 | `finalize_numbering` | `false` | Append ` [i/N]` to each finalized message.                              |
 | `stage`              | `observed` | Staging breadth: `observed` (only the paths the watcher saw change, new/renamed/copy-over included), `tracked` (`git add -u`), or `all` (`git add -A`). |
 | `coalesce_same_file` | `true`  | Extend the prior atomic commit instead of starting a new one when a capture's paths exactly match it. |
+| `cherry_size_limit_mb` | `32`  | Size in MiB above which `cherry-pick`'s screen does not read a changed file for its preview (see below). `0` turns the limit off. |
 
 ## Behaviour and ~~guarantees~~ Intentions
 (guarantees is a very strong word)

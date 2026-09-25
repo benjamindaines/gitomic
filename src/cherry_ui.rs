@@ -32,7 +32,7 @@
 //   X            restore this file whole from the newest commit marked for it with R
 //   Enter        continue once every conflict is decided               Esc, q  leave
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -44,10 +44,11 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph};
 use ratatui::{DefaultTerminal, Frame};
 
+use crate::cherry::{self, Gated, Preview};
 use crate::conflict::{Segment, Side};
 use crate::patch::{Body, FileConflict, Job, Spec, Step};
 use crate::pick::{style_diff, with_terminal, DiffView, H_STEP, RUN_WINDOW};
-use crate::{cherry, git, Res};
+use crate::{git, Res};
 
 // Lines of unchanged text shown above and below a conflict hunk.
 const CONTEXT: usize = 3;
@@ -82,8 +83,9 @@ pub trait Source {
     fn branches(&mut self) -> Result<Vec<String>, String>;
     // Commits on `branch` that HEAD lacks, newest first.
     fn commits(&mut self, branch: &str) -> Result<Vec<(String, String)>, String>;
-    // The preview text for one commit, restricted to one file when `only` is given.
-    fn diff(&mut self, commit: &str, only: Option<&str>) -> Result<String, String>;
+    // The preview for one commit, restricted to one file when `only` is given. Files over the size
+    // limit are left unread and reported in the result, unless `full` asks for everything.
+    fn diff(&mut self, commit: &str, only: Option<&str>, full: bool) -> Result<Preview, String>;
     // Whether replaying a commit onto HEAD would change anything. Commits that would not are shown
     // gray and skipped by the movement keys.
     fn applies(&mut self, _commit: &str) -> Result<bool, String> {
@@ -113,6 +115,8 @@ struct GitSource {
     root: PathBuf,
     // HEAD when the screen opened; every preview and the replay are relative to it.
     base: String,
+    // Reads for the previews and the applicability checks; remembers what it has merged.
+    reader: cherry::Reader,
     job: Option<Job>,
     picks: Vec<Sel>,
     // (commit, path) whole-file restores that replaced restricted picks.
@@ -177,12 +181,14 @@ impl Source for GitSource {
         cherry::candidates(&self.cwd, branch).map_err(|e| e.to_string())
     }
 
-    fn diff(&mut self, commit: &str, only: Option<&str>) -> Result<String, String> {
-        cherry::preview(&self.root, &self.base, commit, only).map_err(|e| e.to_string())
+    fn diff(&mut self, commit: &str, only: Option<&str>, full: bool) -> Result<Preview, String> {
+        self.reader
+            .preview(commit, only, full, None)
+            .map_err(|e| e.to_string())
     }
 
     fn applies(&mut self, commit: &str) -> Result<bool, String> {
-        cherry::applies(&self.root, &self.base, commit).map_err(|e| e.to_string())
+        self.reader.applies(commit).map_err(|e| e.to_string())
     }
 
     fn paths(&mut self, commit: &str) -> Result<Vec<String>, String> {
@@ -252,6 +258,8 @@ enum Mode {
     Resolve,
     ConfirmApply { summary: String },
     ConfirmQuit,
+    // Asked before a commit's withheld large files are read; `what` names them.
+    ConfirmFull { what: String },
 }
 
 #[derive(PartialEq, Debug)]
@@ -269,6 +277,12 @@ struct Entry {
     only: Option<String>,
     // Whether replaying the commit onto HEAD changes anything; unknown until worked out.
     applies: Option<bool>,
+}
+
+// A loaded preview: the styled text and the large files it left unread.
+struct Loaded {
+    view: DiffView,
+    gated: Vec<Gated>,
 }
 
 // What the overlay is choosing.
@@ -530,7 +544,9 @@ pub struct App {
     cursor: usize,
     focus: Focus,
     mode: Mode,
-    views: HashMap<String, DiffView>,
+    views: HashMap<String, Loaded>,
+    // View keys whose large files the operator asked to have read.
+    full: HashSet<String>,
     vscroll: usize,
     hscroll: usize,
     view_h: usize,
@@ -563,6 +579,7 @@ impl App {
             focus: Focus::List,
             mode: Mode::Browse,
             views: HashMap::new(),
+            full: HashSet::new(),
             vscroll: 0,
             hscroll: 0,
             view_h: 20,
@@ -596,6 +613,7 @@ impl App {
             .collect();
         self.source_label = Some(branch.to_string());
         self.views.clear();
+        self.full.clear();
         self.cursor = 0;
         self.vscroll = 0;
         self.hscroll = 0;
@@ -765,12 +783,19 @@ impl App {
         {
             return;
         }
-        let (full, only) = (entry.full.clone(), entry.only.clone());
-        let view = match src.diff(&full, only.as_deref()) {
-            Ok(text) => style_diff(&text),
-            Err(e) => style_diff(&format!("could not show {full}: {e}")),
+        let (id, only) = (entry.full.clone(), entry.only.clone());
+        let read_all = self.full.contains(&key);
+        let loaded = match src.diff(&id, only.as_deref(), read_all) {
+            Ok(p) => Loaded {
+                view: style_diff(&p.text),
+                gated: p.gated,
+            },
+            Err(e) => Loaded {
+                view: style_diff(&format!("could not show {id}: {e}")),
+                gated: Vec::new(),
+            },
         };
-        self.views.insert(key, view);
+        self.views.insert(key, loaded);
     }
 
     fn view(&self) -> Option<&DiffView> {
@@ -780,6 +805,7 @@ impl App {
         self.entries
             .get(self.cursor)
             .and_then(|e| self.views.get(&Self::view_key(e)))
+            .map(|l| &l.view)
     }
 
     fn max_v(&self) -> usize {
@@ -833,6 +859,46 @@ impl App {
             self.vscroll = 0;
             self.hscroll = 0;
             self.moved = Some(now);
+        }
+    }
+
+    // D: offer to read the large files the preview of the highlighted commit left out.
+    fn ask_full(&mut self) {
+        if self.parked {
+            self.say("no commit is selected; press j or k first", false);
+            return;
+        }
+        let Some(entry) = self.entries.get(self.cursor) else {
+            return;
+        };
+        let key = Self::view_key(entry);
+        let gated = self.views.get(&key).map(|l| l.gated.clone());
+        match gated {
+            Some(g) if !g.is_empty() => {
+                let total: u64 = g.iter().map(|f| f.bytes).sum();
+                let what = format!("{} file(s), {}", g.len(), cherry::human(total));
+                self.mode = Mode::ConfirmFull { what };
+            }
+            Some(_) => self.say("this commit has no file over the size limit", false),
+            None => self.say("the diff is still loading", false),
+        }
+    }
+
+    // Only y and n answer, like the other confirmations.
+    fn key_confirm_full(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                if let Some(entry) = self.entries.get(self.cursor) {
+                    let k = Self::view_key(entry);
+                    self.views.remove(&k);
+                    self.full.insert(k);
+                    self.vscroll = 0;
+                    self.hscroll = 0;
+                }
+                self.mode = Mode::Browse;
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => self.mode = Mode::Browse,
+            _ => {}
         }
     }
 
@@ -941,6 +1007,10 @@ impl App {
             }
             Mode::ConfirmApply { .. } => return self.key_confirm_apply(key, src),
             Mode::ConfirmQuit => return self.key_confirm_quit(key),
+            Mode::ConfirmFull { .. } => {
+                self.key_confirm_full(key);
+                return Outcome::Continue;
+            }
             Mode::Browse => {}
         }
         self.status.clear();
@@ -972,6 +1042,7 @@ impl App {
             }
             KeyCode::Char(' ') => self.toggle(),
             KeyCode::Char('R') => self.mark_file_chain(src),
+            KeyCode::Char('D') => self.ask_full(),
             KeyCode::Char('l') | KeyCode::Right if !self.parked => self.focus = Focus::Diff,
             KeyCode::Tab => self.open_branches(src),
             KeyCode::Enter => self.submit(src),
@@ -1007,6 +1078,7 @@ impl App {
             KeyCode::Char('N') => self.step(-1, now, src),
             KeyCode::Char(' ') => self.toggle(),
             KeyCode::Char('R') => self.mark_file_chain(src),
+            KeyCode::Char('D') => self.ask_full(),
             KeyCode::Tab => self.open_branches(src),
             KeyCode::Esc => self.focus = Focus::List,
             KeyCode::Char('q') => return self.request_quit(),
@@ -1430,6 +1502,10 @@ impl App {
                 format!(" Quit and discard {} mark(s)? [y/n] ", self.marked_count()),
                 prompt,
             )),
+            Mode::ConfirmFull { what } => Line::from(Span::styled(
+                format!(" Read {what} in full? This can take a long time. [y/n] "),
+                prompt,
+            )),
             _ if !self.status.is_empty() => {
                 let color = if self.status_is_error {
                     Color::Red
@@ -1447,7 +1523,7 @@ impl App {
             ),
             Mode::Browse => match self.focus {
                 Focus::List => hint(
-                    " j/k move  space mark  R file history  l diff  Tab branch  Enter pick  q quit",
+                    " j/k move  space mark  R file  D large  l diff  Tab branch  Enter pick  q quit",
                 ),
                 Focus::Diff => {
                     hint(" j/k h/l scroll  Enter/n next  N prev  space mark  Tab branch  q quit")
@@ -1473,8 +1549,12 @@ pub fn run(cwd: &Path, from: Option<&str>) -> Res<Option<Spec>> {
     }
     let root = git::work_tree(cwd)?;
     let base = git::rev_parse(&root, "HEAD")?;
+    let limit = crate::config::Config::load()?
+        .cherry_size_limit_mb
+        .saturating_mul(1024 * 1024);
     let mut src = GitSource {
         cwd: cwd.to_path_buf(),
+        reader: cherry::Reader::new(root.clone(), base.clone(), limit),
         root,
         base,
         job: None,
@@ -1555,6 +1635,10 @@ mod tests {
         inert: Vec<String>,
         // Every commit asked about, in order.
         asked: Vec<String>,
+        // Large files a commit's preview leaves out, as (path, bytes).
+        gated: HashMap<String, Vec<(String, u64)>>,
+        // Commits whose preview was requested with every file read.
+        full_reads: Vec<String>,
     }
 
     impl Fake {
@@ -1575,6 +1659,8 @@ mod tests {
                 restored: Vec::new(),
                 inert: Vec::new(),
                 asked: Vec::new(),
+                gated: HashMap::new(),
+                full_reads: Vec::new(),
             }
         }
     }
@@ -1592,14 +1678,35 @@ mod tests {
             }
         }
 
-        fn diff(&mut self, commit: &str, only: Option<&str>) -> Result<String, String> {
+        fn diff(
+            &mut self,
+            commit: &str,
+            only: Option<&str>,
+            full: bool,
+        ) -> Result<Preview, String> {
             self.diffs
                 .push((commit.to_string(), only.map(str::to_string)));
-            Ok(format!(
-                "commit {commit}\nAuthor: T <t@e.invalid>\nDate:   now\n\n    msg\n\n \
-                 a.txt | 1 +\n\ndiff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n\
-                 @@ -1 +1 @@\n-old\n+new\n"
-            ))
+            if full {
+                self.full_reads.push(commit.to_string());
+            }
+            let gated: Vec<Gated> = match (full, self.gated.get(commit)) {
+                (false, Some(list)) => list
+                    .iter()
+                    .map(|(path, bytes)| Gated {
+                        path: path.clone(),
+                        bytes: *bytes,
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            };
+            Ok(Preview {
+                text: format!(
+                    "commit {commit}\nAuthor: T <t@e.invalid>\nDate:   now\n\n    msg\n\n \
+                     a.txt | 1 +\n\ndiff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n\
+                     @@ -1 +1 @@\n-old\n+new\n"
+                ),
+                gated,
+            })
         }
 
         fn applies(&mut self, commit: &str) -> Result<bool, String> {
@@ -2402,6 +2509,82 @@ mod tests {
         assert_eq!(a.source_label.as_deref(), Some("feat"));
         assert!(a.parked);
         assert_eq!(a.list_state.selected(), None);
+    }
+
+    #[test]
+    fn d_asks_before_reading_the_withheld_files_and_only_y_reads_them() {
+        let mut fake = Fake::new();
+        fake.gated
+            .insert(id('a'), vec![("rom/seed.img".into(), 5 << 30)]);
+        let (mut a, mut f) = entered(fake);
+        assert!(f.full_reads.is_empty());
+        press(&mut a, &mut f, ch('D'));
+        assert_eq!(
+            a.mode,
+            Mode::ConfirmFull {
+                what: "1 file(s), 5.0 GB".to_string()
+            }
+        );
+        let screen = render_text(&mut a, 100, 12);
+        assert!(
+            screen.contains("Read 1 file(s), 5.0 GB in full?"),
+            "{screen}"
+        );
+        for code in [KeyCode::Enter, ch('j'), ch('x'), ch(' ')] {
+            press(&mut a, &mut f, code);
+            assert!(matches!(a.mode, Mode::ConfirmFull { .. }));
+        }
+        assert_eq!(a.cursor, 0, "no navigation while asking");
+        press(&mut a, &mut f, ch('n'));
+        assert_eq!(a.mode, Mode::Browse);
+        assert!(f.full_reads.is_empty(), "declining reads nothing");
+
+        press(&mut a, &mut f, ch('D'));
+        press(&mut a, &mut f, ch('y'));
+        assert_eq!(a.mode, Mode::Browse);
+        assert_eq!(
+            f.full_reads,
+            vec![id('a')],
+            "the commit is reloaded with every file read"
+        );
+        assert!(a.views.values().all(|l| l.gated.is_empty()));
+        press(&mut a, &mut f, ch('D'));
+        assert!(
+            a.status.contains("no file over the size limit"),
+            "{}",
+            a.status
+        );
+    }
+
+    #[test]
+    fn d_says_so_when_nothing_was_withheld_or_nothing_is_selected() {
+        let (mut a, mut f) = app();
+        press(&mut a, &mut f, ch('D'));
+        assert!(
+            a.status.contains("no file over the size limit"),
+            "{}",
+            a.status
+        );
+        assert_eq!(a.mode, Mode::Browse);
+
+        let (mut a, mut f) = parked_app(Fake::new());
+        press(&mut a, &mut f, ch('D'));
+        assert!(a.status.contains("no commit is selected"), "{}", a.status);
+    }
+
+    #[test]
+    fn a_full_read_survives_moving_away_and_back_and_is_forgotten_with_the_source() {
+        let mut fake = Fake::new();
+        fake.gated
+            .insert(id('a'), vec![("x.bin".into(), 100 << 20)]);
+        let (mut a, mut f) = entered(fake);
+        press(&mut a, &mut f, ch('D'));
+        press(&mut a, &mut f, ch('y'));
+        press(&mut a, &mut f, ch('j'));
+        press(&mut a, &mut f, ch('k'));
+        assert_eq!(f.full_reads.len(), 1, "the loaded diff is kept");
+        a.set_source("feat", f.commits.clone());
+        assert!(a.full.is_empty());
     }
 
     fn render_text(a: &mut App, w: u16, h: u16) -> String {

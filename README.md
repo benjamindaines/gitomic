@@ -151,6 +151,10 @@ vim-style keys, `space` to mark and the same rule that only `y`/`n` answer a pro
   line says so.
 - The diff of a commit loads once the selection has rested on it for 150 ms, so holding `j` or `k` does not
   run a merge for every commit passed. A diff already loaded is shown at once.
+- The screen opens, and a newly chosen branch is shown, with the selection marker outside the list: no commit
+  is highlighted and no diff is loaded. `j` (or `Down`) enters from the top and lands on the first commit that
+  applies; `k` (or `Up`) enters from the bottom. `g` and `G` also leave this state. While it lasts, the two ends
+  of the list are classified in the background, and `space`, `R` and `l` do nothing.
 - `R` follows one file. It marks the highlighted commit and every older commit of the source branch that
   changes the same file (the commits `HEAD` lacks), each restricted to that file, so that replaying them
   brings the file to its state on the source branch at the highlighted commit. When the highlighted commit

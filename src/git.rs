@@ -174,6 +174,68 @@ pub fn run_capped(dir: &Path, args: &[&str], max: usize, cancel: Option<&Cancel>
     })
 }
 
+// Run a prepared git command to completion and return its whole output, like `Command::output`,
+// but abandonable: with a `cancel` handle the child is killed when it fires and the result is
+// `CANCELLED`. For commands whose output is binary or structured and needs no cap.
+pub fn output_cancellable(mut cmd: Command, cancel: Option<&Cancel>) -> Res<std::process::Output> {
+    let Some(cancel) = cancel else {
+        return Ok(cmd.output()?);
+    };
+    if cancel.is_cancelled() {
+        return Err(CANCELLED.into());
+    }
+    let child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    cancel.pid.store(child.id(), Ordering::SeqCst);
+    // A cancel that arrived between the check above and the registration killed nothing.
+    if cancel.is_cancelled() {
+        unsafe {
+            // SAFETY: signals the child just started, which has not been waited for.
+            libc::kill(child.id() as libc::pid_t, libc::SIGKILL);
+        }
+    }
+    let out = child.wait_with_output();
+    cancel.pid.store(0, Ordering::SeqCst);
+    if cancel.is_cancelled() {
+        return Err(CANCELLED.into());
+    }
+    Ok(out?)
+}
+
+// Sizes in bytes of the objects `ids`, in the same order, read from their headers alone; None for an
+// id that names no object. One `cat-file --batch-check` process answers for all of them.
+pub fn blob_sizes(dir: &Path, ids: &[String]) -> Res<Vec<Option<u64>>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["cat-file", "--batch-check=%(objectsize)"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let mut stdin = child.stdin.take().ok_or("git cat-file: no stdin pipe")?;
+    let input: String = ids.iter().map(|i| format!("{i}\n")).collect();
+    // The ids are written on their own thread, so a long list cannot fill the pipe that the answers
+    // are waiting to leave through.
+    let writer = std::thread::spawn(move || {
+        let _ = stdin.write_all(input.as_bytes());
+    });
+    let out = child.wait_with_output()?;
+    let _ = writer.join();
+    let text = String::from_utf8_lossy(&out.stdout);
+    let sizes: Vec<Option<u64>> = text.lines().map(|l| l.trim().parse::<u64>().ok()).collect();
+    if sizes.len() != ids.len() {
+        return Err("git cat-file: unexpected number of answers".into());
+    }
+    Ok(sizes)
+}
+
 // Run git purely for its exit status, treating a clean non-zero exit as `false` rather than an error. Used
 // for predicate-style commands such as `diff --quiet`, where exit code 1 is a valid answer, not a fault.
 pub fn succeeds(dir: &Path, args: &[&str]) -> Res<bool> {

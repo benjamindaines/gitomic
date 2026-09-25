@@ -44,10 +44,11 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph};
 use ratatui::{DefaultTerminal, Frame};
 
-use crate::cherry::{self, Gated, Preview};
+use crate::cherry::{self, Preview};
 use crate::conflict::{Segment, Side};
 use crate::patch::{Body, FileConflict, Job, Spec, Step};
 use crate::pick::{style_diff, with_terminal, DiffView, H_STEP, RUN_WINDOW};
+use crate::work::{Done, Loaded, Pool};
 use crate::{git, Res};
 
 // Lines of unchanged text shown above and below a conflict hunk.
@@ -59,6 +60,9 @@ const DWELL: Duration = Duration::from_millis(150);
 
 // Rows on either side of the selection whose applicability is worked out while the screen is idle.
 const IDLE_REACH: usize = 60;
+
+// How often the event loop looks for answers from the workers while any are outstanding.
+const POLL: Duration = Duration::from_millis(25);
 
 // Where a replay stands after the picks were submitted.
 pub enum Flow {
@@ -277,12 +281,6 @@ struct Entry {
     only: Option<String>,
     // Whether replaying the commit onto HEAD changes anything; unknown until worked out.
     applies: Option<bool>,
-}
-
-// A loaded preview: the styled text and the large files it left unread.
-struct Loaded {
-    view: DiffView,
-    gated: Vec<Gated>,
 }
 
 // What the overlay is choosing.
@@ -547,6 +545,10 @@ pub struct App {
     views: HashMap<String, Loaded>,
     // View keys whose large files the operator asked to have read.
     full: HashSet<String>,
+    // The worker threads, when the screen runs with them; without, git is read on the spot.
+    pool: Option<Pool>,
+    // View keys requested from the diff worker and not yet answered.
+    pending: HashSet<String>,
     vscroll: usize,
     hscroll: usize,
     view_h: usize,
@@ -580,6 +582,8 @@ impl App {
             mode: Mode::Browse,
             views: HashMap::new(),
             full: HashSet::new(),
+            pool: None,
+            pending: HashSet::new(),
             vscroll: 0,
             hscroll: 0,
             view_h: 20,
@@ -621,6 +625,13 @@ impl App {
         self.moved = None;
         self.parked = true;
         self.list_state = ListState::default();
+        self.refill();
+    }
+
+    // Let the worker threads do the git reading. Called once, before the first frame.
+    pub fn use_workers(&mut self, pool: Pool) {
+        self.pool = Some(pool);
+        self.refill();
     }
 
     // Open the branch overlay on `names`.
@@ -701,6 +712,8 @@ impl App {
             self.vscroll = 0;
             self.hscroll = 0;
             self.moved = Some(now);
+            self.parked = false;
+            self.moved_on();
         }
         self.parked = false;
         true
@@ -719,6 +732,25 @@ impl App {
     // How long the event loop may sleep before it has something to do: the rest of the dwell before
     // a diff is loaded, or nothing at all while commits near the selection await classification.
     pub fn wakeup(&self, now: Instant) -> Option<Duration> {
+        if let Some(pool) = &self.pool {
+            // With workers nothing is done on idle beyond collecting their answers, so the loop wakes
+            // for the end of the dwell and, while answers are outstanding, at a short interval.
+            let mut wait = None;
+            if let (false, Some(entry), Some(t)) =
+                (self.parked, self.entries.get(self.cursor), self.moved)
+            {
+                let key = Self::view_key(entry);
+                let waited = now.saturating_duration_since(t);
+                if !self.views.contains_key(&key) && !self.pending.contains(&key) && waited < DWELL
+                {
+                    wait = Some(DWELL - waited);
+                }
+            }
+            if !self.pending.is_empty() || pool.classifying_busy() {
+                wait = Some(wait.map_or(POLL, |w: Duration| w.min(POLL)));
+            }
+            return wait;
+        }
         if self.parked {
             return self.next_unclassified().map(|_| Duration::ZERO);
         }
@@ -756,6 +788,10 @@ impl App {
 
     // One unit of idle work: classify a commit near the selection.
     pub fn tick(&mut self, src: &mut dyn Source, now: Instant) {
+        if self.pool.is_some() {
+            self.pump();
+            return;
+        }
         if self.wakeup(now).is_some_and(|d| d > Duration::ZERO) {
             return;
         }
@@ -785,6 +821,12 @@ impl App {
         }
         let (id, only) = (entry.full.clone(), entry.only.clone());
         let read_all = self.full.contains(&key);
+        if let Some(pool) = &self.pool {
+            if self.pending.insert(key.clone()) {
+                pool.request_diff(key, id, only, read_all);
+            }
+            return;
+        }
         let loaded = match src.diff(&id, only.as_deref(), read_all) {
             Ok(p) => Loaded {
                 view: style_diff(&p.text),
@@ -796,6 +838,90 @@ impl App {
             },
         };
         self.views.insert(key, loaded);
+    }
+
+    // The commits whose applicability is not yet known, nearest the selection first: alternately
+    // below and above it, within `IDLE_REACH`. While the selection is parked, the top of the list
+    // and then the bottom, since those are where j and k will enter.
+    fn wanted_indices(&self) -> Vec<usize> {
+        let len = self.entries.len();
+        let unknown = |i: usize| self.entries[i].applies.is_none();
+        let mut out = Vec::new();
+        if self.parked {
+            let top_end = len.min(IDLE_REACH);
+            out.extend((0..top_end).filter(|&i| unknown(i)));
+            let bottom_start = len.saturating_sub(IDLE_REACH).max(top_end);
+            out.extend((bottom_start..len).rev().filter(|&i| unknown(i)));
+            return out;
+        }
+        for d in 0..=IDLE_REACH {
+            let below = self.cursor + d;
+            if below < len && unknown(below) {
+                out.push(below);
+            }
+            if let Some(above) = self.cursor.checked_sub(d).filter(|_| d > 0) {
+                if unknown(above) {
+                    out.push(above);
+                }
+            }
+        }
+        out
+    }
+
+    // Hand the classification worker an up-to-date queue.
+    fn refill(&mut self) {
+        let Some(pool) = &self.pool else {
+            return;
+        };
+        let busy = pool.classifying();
+        let list: Vec<(usize, String)> = self
+            .wanted_indices()
+            .into_iter()
+            .filter(|&i| Some(i) != busy)
+            .map(|i| (i, self.entries[i].full.clone()))
+            .collect();
+        pool.want(list);
+    }
+
+    // The selection has moved: stop loading the preview of the commit it left, and re-aim the
+    // classification at the new surroundings.
+    fn moved_on(&mut self) {
+        self.refill();
+        if let (Some(pool), Some(entry)) = (&self.pool, self.entries.get(self.cursor)) {
+            pool.supersede(Some(&Self::view_key(entry)));
+        }
+    }
+
+    // Take in whatever the workers have finished. Returns whether anything arrived, so that the
+    // screen is drawn again.
+    pub fn pump(&mut self) -> bool {
+        let mut changed = false;
+        while let Some(done) = self.pool.as_ref().and_then(Pool::try_recv) {
+            changed = true;
+            match done {
+                Done::Diff { key, loaded } => {
+                    self.pending.remove(&key);
+                    self.views.insert(key, loaded);
+                }
+                Done::Dropped { key } => {
+                    self.pending.remove(&key);
+                }
+                Done::Applies {
+                    index,
+                    commit,
+                    applies,
+                } => {
+                    if let Some(e) = self.entries.get_mut(index).filter(|e| e.full == commit) {
+                        e.applies = Some(applies);
+                    }
+                }
+            }
+        }
+        if changed {
+            self.clamp_scroll();
+            self.refill();
+        }
+        changed
     }
 
     fn view(&self) -> Option<&DiffView> {
@@ -859,6 +985,7 @@ impl App {
             self.vscroll = 0;
             self.hscroll = 0;
             self.moved = Some(now);
+            self.moved_on();
         }
     }
 
@@ -1563,6 +1690,7 @@ pub fn run(cwd: &Path, from: Option<&str>) -> Res<Option<Spec>> {
         decided: Vec::new(),
     };
     let mut app = App::new();
+    app.use_workers(Pool::start(std::sync::Arc::new(src.reader.clone())));
     match from {
         Some(branch) => {
             let commits = src.commits(branch)?;
@@ -1591,6 +1719,7 @@ pub fn run(cwd: &Path, from: Option<&str>) -> Res<Option<Spec>> {
 
 fn event_loop(term: &mut DefaultTerminal, app: &mut App, src: &mut dyn Source) -> Res<Outcome> {
     loop {
+        app.pump();
         app.ensure_diff(src, Instant::now());
         term.draw(|f| app.render(f))?;
         // Sleep until a key arrives, the dwell before a diff ends, or idle work is due.
@@ -1612,8 +1741,10 @@ fn event_loop(term: &mut DefaultTerminal, app: &mut App, src: &mut dyn Source) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cherry::Gated;
     use crate::conflict;
     use crate::patch::Blob;
+    use crate::work::tests::Slow;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
     use std::collections::VecDeque;
@@ -2585,6 +2716,141 @@ mod tests {
         assert_eq!(f.full_reads.len(), 1, "the loaded diff is kept");
         a.set_source("feat", f.commits.clone());
         assert!(a.full.is_empty());
+    }
+
+    // Pump the app until `done` holds, or fail after a generous time.
+    fn wait_for(a: &mut App, done: impl Fn(&App) -> bool) {
+        let end = Instant::now() + Duration::from_secs(10);
+        while !done(a) {
+            assert!(Instant::now() < end, "timed out waiting for the workers");
+            a.pump();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    // An app on the fake's commits that reads through worker threads on `slow`, selection parked.
+    fn worker_app(slow: &std::sync::Arc<Slow>, fake: &Fake) -> App {
+        let mut a = App::new();
+        a.use_workers(Pool::start(slow.clone()));
+        a.set_source("feat", fake.commits.clone());
+        a.view_h = 10;
+        a.view_w = 40;
+        a
+    }
+
+    fn key_of(a: &App, i: usize) -> String {
+        App::view_key(&a.entries[i])
+    }
+
+    #[test]
+    fn with_workers_a_preview_is_requested_not_run_on_the_spot_and_arrives_later() {
+        let slow = Slow::new();
+        let mut f = Fake::new();
+        let mut a = worker_app(&slow, &f);
+        press(&mut a, &mut f, ch('j'));
+        assert!(a.pending.contains(&key_of(&a, 0)), "requested");
+        assert!(f.diffs.is_empty(), "nothing was read on this thread");
+        assert!(a.view().is_none());
+        let screen = render_text(&mut a, 100, 12);
+        assert!(screen.contains("loading the diff"), "{screen}");
+        assert!(
+            a.wakeup(Instant::now()).is_some(),
+            "the loop keeps looking for the answer"
+        );
+
+        slow.open();
+        wait_for(&mut a, |a| a.view().is_some());
+        assert!(a.pending.is_empty());
+        let screen = render_text(&mut a, 100, 12);
+        assert!(screen.contains(&format!("commit {}", id('a'))), "{screen}");
+        assert!(f.diffs.is_empty());
+    }
+
+    #[test]
+    fn moving_on_stops_the_preview_of_the_commit_left_and_shows_the_new_one() {
+        let slow = Slow::new();
+        let mut f = Fake::new();
+        let mut a = worker_app(&slow, &f);
+        press(&mut a, &mut f, ch('j'));
+        // Wait until the worker is inside the first preview, then leave it.
+        let end = Instant::now() + Duration::from_secs(10);
+        while slow.started.lock().unwrap().is_empty() {
+            assert!(Instant::now() < end);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        press(&mut a, &mut f, ch('j'));
+        wait_for(&mut a, |a| !a.pending.contains(&key_of(a, 0)));
+        slow.open();
+        wait_for(&mut a, |a| a.view().is_some());
+        assert_eq!(a.cursor, 1);
+        assert!(
+            !a.views.contains_key(&key_of(&a, 0)),
+            "the abandoned preview left nothing behind"
+        );
+        assert_eq!(*slow.started.lock().unwrap(), vec![id('a'), id('b')]);
+    }
+
+    #[test]
+    fn a_commit_passed_within_the_dwell_is_never_requested() {
+        let slow = Slow::new();
+        slow.open();
+        let mut f = Fake::new();
+        let mut a = worker_app(&slow, &f);
+        let t0 = Instant::now();
+        a.handle_key(key(ch('j')), t0, &mut f);
+        a.handle_key(key(ch('j')), t0 + DWELL / 4, &mut f);
+        a.handle_key(key(ch('j')), t0 + DWELL / 2, &mut f);
+        a.ensure_diff(&mut f, t0 + DWELL / 2 + DWELL / 4);
+        assert!(
+            a.pending.is_empty(),
+            "still within the dwell of the last move"
+        );
+        a.ensure_diff(&mut f, t0 + DWELL * 2);
+        assert_eq!(a.pending.len(), 1);
+        wait_for(&mut a, |a| a.view().is_some());
+        assert_eq!(*slow.started.lock().unwrap(), vec![id('c')]);
+    }
+
+    #[test]
+    fn the_classification_worker_grays_rows_without_a_key_press() {
+        let mut slow = Slow::new();
+        std::sync::Arc::get_mut(&mut slow).unwrap().inert = vec![id('b')];
+        let f = Fake::new();
+        let mut a = worker_app(&slow, &f);
+        assert!(a.parked);
+        wait_for(&mut a, |a| a.entries.iter().all(|e| e.applies.is_some()));
+        assert_eq!(a.entries[1].applies, Some(false));
+        assert_eq!(a.entries[0].applies, Some(true));
+        assert!(a.parked, "classifying does not move the selection");
+        assert!(
+            a.wakeup(Instant::now()).is_none(),
+            "nothing outstanding: the loop sleeps"
+        );
+        let mut term = Terminal::new(TestBackend::new(100, 12)).unwrap();
+        term.draw(|fr| a.render(fr)).unwrap();
+        let buf = term.backend().buffer().clone();
+        assert_eq!(
+            buf[(6, 2)].fg,
+            Color::DarkGray,
+            "the inert commit is drawn gray"
+        );
+    }
+
+    #[test]
+    fn a_full_read_is_requested_from_the_worker_with_every_file() {
+        let slow = Slow::new();
+        slow.open();
+        let mut f = Fake::new();
+        let mut a = worker_app(&slow, &f);
+        press(&mut a, &mut f, ch('j'));
+        wait_for(&mut a, |a| a.view().is_some());
+        // Nothing withheld by this loader, so D only explains.
+        press(&mut a, &mut f, ch('D'));
+        assert!(
+            a.status.contains("no file over the size limit"),
+            "{}",
+            a.status
+        );
     }
 
     fn render_text(a: &mut App, w: u16, h: u16) -> String {

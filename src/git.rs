@@ -394,3 +394,95 @@ pub fn add_pathspec(dir: &Path, paths: &[&str]) -> Res<()> {
 pub fn index_locked(git_dir: &Path) -> bool {
     git_dir.join("index.lock").exists()
 }
+
+// Raw bytes of a blob or of a `<tree>:<path>` entry. The other wrappers here return trimmed UTF-8
+// text; file content may be neither, so this one returns the bytes untouched.
+pub fn cat_blob(dir: &Path, spec: &str) -> Res<Vec<u8>> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["cat-file", "blob", spec])
+        .output()?;
+    if !out.status.success() {
+        let msg = String::from_utf8_lossy(&out.stderr);
+        return Err(format!("git cat-file {spec}: {}", msg.trim()).into());
+    }
+    Ok(out.stdout)
+}
+
+// Store `bytes` as a loose blob and return its object id.
+pub fn hash_object_write(dir: &Path, bytes: &[u8]) -> Res<String> {
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["hash-object", "-w", "--stdin"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    {
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or("git hash-object: stdin unavailable")?;
+        stdin.write_all(bytes)?;
+    }
+    let out = child.wait_with_output()?;
+    if !out.status.success() {
+        let msg = String::from_utf8_lossy(&out.stderr);
+        return Err(format!("git hash-object: {}", msg.trim()).into());
+    }
+    Ok(String::from_utf8(out.stdout)?.trim().to_string())
+}
+
+// Record exactly the given work-tree-relative paths as one commit with an empty message, leaving any
+// other staged change out of it. The paths are staged first so that a newly created file is known to
+// the index; `--only` then restricts the commit to them. Hooks are bypassed, matching the watcher's
+// atomic commits. Returns the new commit's object id, or None when the paths held no change.
+pub fn commit_only(dir: &Path, paths: &[&str]) -> Res<Option<String>> {
+    if paths.is_empty() {
+        return Ok(None);
+    }
+    add_pathspec(dir, paths)?;
+    let mut input = String::new();
+    for p in paths {
+        input.push_str(p);
+        input.push(NUL);
+    }
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args([
+            "commit",
+            "--only",
+            "--allow-empty-message",
+            "--no-verify",
+            "--quiet",
+            "-m",
+            "",
+            "--pathspec-from-file=-",
+            "--pathspec-file-nul",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    {
+        let mut stdin = child.stdin.take().ok_or("git commit: stdin unavailable")?;
+        stdin.write_all(input.as_bytes())?;
+    }
+    let out = child.wait_with_output()?;
+    if !out.status.success() {
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        // Nothing to commit is an answer, not a fault: the paths already matched HEAD.
+        if text.contains("nothing to commit") || text.contains("no changes added") {
+            return Ok(None);
+        }
+        return Err(format!("git commit: {}", text.trim()).into());
+    }
+    Ok(Some(rev_parse(dir, "HEAD")?))
+}

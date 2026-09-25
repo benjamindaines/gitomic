@@ -11,11 +11,17 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+mod cherry;
+mod cherry_ui;
 mod commands;
 mod config;
+mod conflict;
 mod git;
+mod patch;
 mod pick;
 mod proc;
+#[cfg(test)]
+mod testrepo;
 mod watch;
 
 // Application-wide fallible result. A boxed trait object keeps the error surface dependency-free while still
@@ -98,6 +104,7 @@ fn dispatch(args: &[String]) -> Res<()> {
                 commands::drop_commits(&cwd, &opts.hashes, opts.dry_run)
             }
         }
+        "cherry-pick" | "pick" => cherry::run(&cwd, parse_cherry(&args[1..])?),
         "stop" => commands::stop(&cwd),
         "abort" => commands::abort(&cwd, args[1..].iter().any(|a| a == "--force" || a == "-f")),
         "-h" | "--help" | "help" | "" => {
@@ -166,6 +173,43 @@ impl DropOpts {
         }
         Ok(DropOpts { hashes, dry_run })
     }
+}
+
+// Parse cherry-pick arguments. Every positional word is a commit (abbreviated or full), replayed in
+// the order given; with none, the interactive screen opens. `--from <branch>` names the branch that
+// screen lists first; `-n/--dry-run` reports the patch without writing or applying it;
+// `-p/--patch-only` writes the patch file and stops.
+fn parse_cherry(rest: &[String]) -> Res<cherry::Opts> {
+    let mut opts = cherry::Opts {
+        only: None,
+        from: None,
+        hashes: Vec::new(),
+        dry_run: false,
+        patch_only: false,
+    };
+    let mut it = rest.iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "-n" | "--dry-run" => opts.dry_run = true,
+            "-p" | "--patch-only" => opts.patch_only = true,
+            "--only" => {
+                let value = it.next().ok_or("expected a path after --only")?;
+                opts.only = Some(value.clone());
+            }
+            "--from" => {
+                let value = it.next().ok_or("expected a branch after --from")?;
+                opts.from = Some(value.clone());
+            }
+            flag if flag.starts_with("--from=") => {
+                opts.from = Some(flag["--from=".len()..].to_string());
+            }
+            flag if flag.starts_with('-') => {
+                return Err(format!("unexpected option '{flag}' for cherry-pick").into())
+            }
+            hash => opts.hashes.push(hash.to_string()),
+        }
+    }
+    Ok(opts)
 }
 
 // Parsed options for the init command.
@@ -264,6 +308,22 @@ COMMANDS:
                        'git cherry-pick <full id>' (printed). With no hash, opens an interactive
                        picker: commits on the left, the highlighted diff on the right, space to
                        mark, Enter to drop the marked commits after a y/n confirmation. Aliases: rm.
+  cherry-pick [options] [<hash>...]
+                       Bring commits from another branch onto the checked-out one by way of a
+                       patch file, without rewriting history. The chosen commits are replayed onto
+                       the current HEAD and the result is applied to the work tree; with a session
+                       open it is recorded as one atomic commit (a live watcher is paused
+                       meanwhile), otherwise it is left uncommitted. With no hash, opens an
+                       interactive screen: commits on the left, what each would change on the
+                       right, space to mark, R to follow one file (marks the commit and every older
+                       commit that changes the same file, each applied for that file only), Tab to
+                       choose the branch, Enter to prepare. A conflict opens a decision screen: a
+                       keeps the tree copy, b takes the picked commit's, c keeps both, per conflict
+                       hunk; X restores the whole file from the newest R-marked commit instead.
+                       Options: --from <branch>, --only <path> (apply each named commit for that
+                       file only), -n/--dry-run (report only), -p/--patch-only (write the patch
+                       file, apply nothing). With hashes, conflicts are refused.
+                       Aliases: pick.
   stop                 Stop the watcher but keep the base and recorded commits for later finish/resume.
   abort [--force]      Discard the session: reset the branch to the base and drop the atomic commits.
   help, --version

@@ -21,7 +21,7 @@ use crate::{git, watch, Res};
 
 // The pid of a live watcher for `branch`, or None when no watcher is running for it. A pidfile whose process
 // has died is treated as absent, so a crash leaves no lingering "running" illusion.
-fn live_watcher(git_dir: &Path, branch: &str) -> Option<i32> {
+pub(crate) fn live_watcher(git_dir: &Path, branch: &str) -> Option<i32> {
     let pid = proc::read_pid(&state_dir(git_dir, branch))?;
     if proc::alive(pid) {
         Some(pid)
@@ -798,7 +798,7 @@ fn template(commits: &[String]) -> String {
 // watcher is still live. Confirming the watcher has exited before returning is what lets a caller safely run a
 // subsequent reset without racing a live watcher over the index. A genuinely wedged watcher is interrupted by
 // the operator (Ctrl-C) rather than by a timer.
-fn terminate_watcher(git_dir: &Path, branch: &str) -> Res<bool> {
+pub(crate) fn terminate_watcher(git_dir: &Path, branch: &str) -> Res<bool> {
     let sdir = state_dir(git_dir, branch);
     let pid = match proc::read_pid(&sdir) {
         Some(p) => p,
@@ -839,7 +839,7 @@ fn terminate_watcher(git_dir: &Path, branch: &str) -> Res<bool> {
 // had not yet committed are recovered from the state directory and used for this capture, so a change made
 // after the watcher's last debounce cycle — including a rename, whose new half tracked-only staging would drop
 // — is still captured whole. For tracked/all modes the set is consumed and ignored.
-fn report_flush(root: &Path, git_dir: &Path, branch: &str, cfg: &Config) {
+pub(crate) fn report_flush(root: &Path, git_dir: &Path, branch: &str, cfg: &Config) {
     let observed = watch::take_pending_observed(&state_dir(git_dir, branch));
     match watch::flush_once(root, git_dir, &git::base_ref(branch), cfg, &observed) {
         watch::Flush::Committed(sha) if !sha.is_empty() => {
@@ -886,7 +886,7 @@ fn reject_legacy_session(root: &Path) -> Res<()> {
 }
 
 // Abbreviate an object id for display, matching git's conventional short length.
-fn short(sha: &str) -> String {
+pub(crate) fn short(sha: &str) -> String {
     sha.chars().take(12).collect()
 }
 

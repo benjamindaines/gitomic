@@ -1,0 +1,1995 @@
+diff -ruN cur/README.md pd3/README.md
+--- cur/README.md	2026-09-25 13:22:59.518953910 +0000
++++ pd3/README.md	2026-09-25 13:54:52.000000000 +0000
+@@ -144,6 +144,18 @@
+   the first thing shown.
+ - The right pane shows what each commit would change relative to the `HEAD` that was current when the screen
+   opened, not the commit's own diff. A commit that would conflict is announced above its diff.
++- `R` follows one file. It marks the highlighted commit and every older commit of the source branch that
++  changes the same file (the commits `HEAD` lacks), each restricted to that file, so that replaying them
++  brings the file to its state on the source branch at the highlighted commit. When the highlighted commit
++  changes several files, a small overlay asks which one to follow. A commit in the chain that also changes
++  other files (one made with `git add` rather than by gitomic) is applied for the followed file only; its
++  other files are left out, and the status line counts such commits. Restricted marks show as `[f]` (plain
++  space marks stay `[x]`) and the diff title names the file; the preview shows the restricted form.
++  Commits above the cursor keep their marks, and pressing `R` again on a fully marked chain clears it. Renames
++  are not followed (a file is tracked under the name it has in each commit), and merge commits are not in the
++  list, so changes that reached the branch only through a merge are not part of a chain.
++- On the command line the same restriction is `--only <path>`: every named commit is applied for that file
++  only, and a commit that does not change it is refused.
+ - `Enter` on the list replays the marked commits, oldest first. A clean result goes straight to the `y`/`n`
+   prompt, which names the number of commits and the size of the change.
+ - **Conflicts** open a decision screen: the conflicted files on the left, one entry per conflict hunk, and the
+@@ -151,7 +163,9 @@
+   `b` takes the picked commit's version, `c` keeps both (tree copy first), `u` undoes, `j`/`k` move between
+   conflicts and `Enter` continues once every one is decided. A file that cannot be split into hunks (binary
+   content, or one side deleted the file) is decided as a whole with `a`/`b`. A later commit in the selection
+-  that conflicts opens the screen again.
++  that conflicts opens the screen again. When the selection was made with `R`, `X` abandons the replay of
++  that file's history and restores the file whole from the newest commit marked for it (its content on the
++  source branch, or absent if the commit lacks it); the confirmation prompt names the restored files.
+ - Conflicts with no A/B meaning (a file renamed differently on both sides, a file/directory clash) are
+   reported and the selection is refused; `git cherry-pick` handles those.
+ 
+diff -ruN cur/_Claude/ref_forgejo_issue#13/RECEIPT_issue13_cherry-pick.md pd3/_Claude/ref_forgejo_issue#13/RECEIPT_issue13_cherry-pick.md
+--- cur/_Claude/ref_forgejo_issue#13/RECEIPT_issue13_cherry-pick.md	1970-01-01 00:00:00.000000000 +0000
++++ pd3/_Claude/ref_forgejo_issue#13/RECEIPT_issue13_cherry-pick.md	2026-09-25 13:57:55.000000000 +0000
+@@ -0,0 +1,248 @@
++# Receipt — issue #13: `gitomic cherry-pick` with the picker UI and in-screen conflict resolution
++
++## Context
++
++Issue #13 asks for the `drop` picker's interface to exist for cherry-picking: same layout and vim keys, Tab
++to choose the source branch, multi-select, a diff pane computed against the HEAD current when the screen
++opened, application through a patch file, a patch that can be recomputed when HEAD has moved, and conflict
++resolution that opens at the conflict and is settled with A or B per hunk. The issue also asks whether a pick
++can work cleanly inside a live session, and to flag (and skip) anything needing a stronger model. Built on the
++`exitScopeFullSpeed` branch tip; not merged and not committed to the tree.
++
++## Answers to the questions in the issue
++
++- **Live session pick: clean, so implemented.** The operation never rewrites history. The patch is computed
++  against HEAD (unpushed commits included) and applied to the work tree; HEAD only moves forward through
++  gitomic's own capture. Uncommitted work and unpushed commits therefore need no special handling, and
++  refusing until everything is committed and pushed is unnecessary. The one real hazard, HEAD moving while
++  the screen is open, is handled by recomputing the patch (below).
++- **Model recommendation:** nothing requested was skipped for capability reasons. Items that were left out,
++  with a recommendation for each, are under "Not done".
++- **Diffuse / external source:** not needed. Per-hunk A/B/both is a small module of its own
++  (`src/conflict.rs`); nothing was pulled in and `Cargo.toml` and `Cargo.lock` are unchanged.
++
++## Design decisions
++
++- **Pipeline.** Chosen commits are replayed oldest first onto HEAD with
++  `git merge-tree --write-tree` (merge base `<commit>^`), entirely in the object database; the patch is
++  `git diff --binary --full-index --no-renames <HEAD> <result>`; it is written to `.git/gitomic-picks/` and
++  applied with `git apply` (work tree only, index untouched) after a `git apply --check`. Merge inputs must be
++  commits, so each intermediate result is wrapped in an unreferenced scratch commit (collected at gc).
++- **Outcome by situation.** No session on the branch: change left in the work tree, uncommitted (as
++  `git cherry-pick -n`). Session present (live or stopped): recorded as one atomic commit with the empty
++  placeholder message, restricted to the patch's own paths (`commit --only`), so other staged changes stay out
++  and `finish` stamps it like any other step. A live watcher is stopped, its final capture flushed, and then
++  restarted, using the same helpers as `drop`.
++- **One patch, one atomic commit** for a multi-commit selection. Per-commit granularity inside a session would
++  need one apply/commit per pick; the intermediate trees already exist, so it is a contained follow-up.
++- **Diff pane reading.** "Diff between the current HEAD established when the UI opened" is implemented as:
++  what applying the highlighted commit to that HEAD would change (`git diff <HEAD> <merge result>`), not the
++  commit's own diff. A conflicting commit is announced above its diff; the conflicted files show their markers.
++  Each preview is for the commit alone. A commit that depends on an earlier one in the selection therefore
++  previews as conflicting yet replays cleanly in sequence.
++- **Rebuild on HEAD movement.** After the watcher is quiet, HEAD is compared with the base the selection was
++  made against. If they differ the patch is rebuilt on the new HEAD (`patch::rebuild`). Each conflict decision
++  is keyed by a fingerprint of (path, tree side, picked side); a conflict that recurs identically reuses its
++  decision, a changed one is undecided, and an undecided conflict stops the operation before anything is
++  modified (nothing written, nothing applied).
++- **Patch header.** Each patch file begins with `# gitomic-patch 1`, `# base`, `# pick` and `# decision`
++  lines. `git apply` skips text ahead of the first `diff --git` line (checked by test). `Spec::parse` reads the
++  header back, so re-basing an existing patch file is a thin command over existing functions.
++- **Patch code separated.** `src/patch.rs` has no terminal or session dependency: `Job` (replay with pause at a
++  conflict), `Spec` (recipe and header), `build`, `rebuild`, `write`, `check`, `apply`. This is the piece to
++  promote to a stand-alone patch re-write command.
++- **Conflict decisions.** A text conflict is split into hunks (`conflict::parse`) and decided per hunk:
++  `a` tree copy, `b` picked commit, `c` both (tree copy first), `u` undo. The resolved file is written into a
++  throwaway index (`GIT_INDEX_FILE`), never the repository's own; the result tree is `write-tree`. Files that
++  cannot be split (binary, unparseable markers, a modify/delete) are decided whole with `a`/`b`.
++  `merge.conflictStyle` is pinned to `merge` for these calls so a user's `diff3`/`zdiff3` setting cannot change
++  the marker layout; a diff3 base section is still tolerated by the parser.
++- **Unsupported conflicts refused, not guessed.** Anything other than contents, binary, modify/delete and
++  add/add (renames on both sides, file/directory clashes, distinct types) is reported with git's message and the
++  selection is refused before anything is modified.
++- **Screen.** A new module, `src/cherry_ui.rs`, reuses `style_diff`, `DiffView`, `H_STEP`, `RUN_WINDOW` and a
++  terminal-setup helper from `pick.rs` (visibility changes plus one extraction), so both screens share diff
++  styling, the held-`h` rule, kitty-protocol handling and raw-mode cleanup. Keys match the drop picker. Added:
++  `Tab` (branch overlay, from either pane), the decision screen, and `Enter` meaning "prepare" rather than
++  "drop". Switching branch clears the marks, since they belong to the previous list. Only `y`/`n` answer a
++  prompt, as before. After a decision the cursor moves to the next undecided hunk.
++- **Candidates.** `git log --cherry-pick --right-only --no-merges HEAD...<branch>`: commits HEAD lacks, newest
++  first, merges excluded (replay needs a chosen parent), changes already present under another id hidden. The
++  list is capped at 500 and the title says so.
++- **Command line.** `gitomic cherry-pick [--from <branch>] [-n] [-p] [<hash>...]` (alias `pick`). With hashes no
++  terminal is needed, commits replay in the order given, contained/merge/root commits are refused, and any
++  conflict is refused with the files named.
++- **Bug found by testing.** For a binary conflict git reports the type `CONFLICT (binary)` alongside
++  `CONFLICT (contents)`; the first version treated it as unsupported. It is now accepted and decided whole.
++
++## Changes
++
++New files:
++
++- `src/conflict.rs` (333 lines): marker parser and renderer, `Side`, `Hunk`, `Segment`, fingerprint. 11 tests.
++- `src/patch.rs` (999 lines): merge, conflict extraction from `merge-tree -z` output, resolved-tree
++  construction, `Job`, `Spec`/header, `build`/`rebuild`, patch file write/check/apply. 12 tests.
++- `src/cherry.rs` (633 lines): branches, candidates, preview, command entry, session/watcher handling, apply.
++  15 tests against real repositories.
++- `src/cherry_ui.rs` (1589 lines): `Source` trait and git-backed source, `App` state machine, overlay, decision
++  screen, rendering, event loop. 25 tests (fake source, `TestBackend`).
++- `src/testrepo.rs` (81 lines, test builds only): throwaway repository helper.
++
++Modified files (line numbers are in the delivered versions):
++
++- `src/main.rs`: `mod cherry; mod cherry_ui; mod conflict; mod patch;` and `#[cfg(test)] mod testrepo;` (lines
++  14-24); dispatch arm `"cherry-pick" | "pick"` (line 107); `parse_cherry` (lines 178-208); usage entry
++  (lines 306-317).
++- `src/git.rs`: appended at the end (lines 397-488): `cat_blob`, `hash_object_write`, `commit_only`. Nothing
++  existing changed.
++- `src/pick.rs`: `H_STEP`, `RUN_WINDOW`, `DiffView` (and its two fields) and `style_diff` made `pub(crate)`
++  (lines 44, 47, 124-126, 516); `with_terminal` extracted (lines 566-584) and `run` now calls it
++  (line 603) in place of the twelve inline lines it replaces (584-595 originally). Behaviour of `drop` unchanged.
++- `src/commands.rs`: `live_watcher`, `terminate_watcher`, `report_flush`, `short` made `pub(crate)` (lines 24,
++  801, 842, 889). No logic changed.
++- `README.md`: `cherry-pick` in the usage list and a `### cherry-pick` section with the key description.
++
++## Intended outcome
++
++`gitomic cherry-pick`, Tab to a branch, `j`/`k` and `space` to mark commits, `Enter`; conflicts are settled a
++hunk at a time with `a`/`b`; `y` applies the patch. In a session the result is one recorded step; outside one it
++is an uncommitted change with a patch file to undo it. Nothing is modified unless `y` is pressed, and any
++refusal (local edits in the way, unsupported conflict, undecided conflict after HEAD moved) leaves the tree as
++it was.
++
++## Verification
++
++- `cargo test`: 119 passed (56 existing, all unchanged and passing; 63 new). `cargo fmt --check` clean. All
++  added lines are at most 100 columns. `cargo clippy --all-targets`: only lints of the kind already tolerated;
++  no deprecated API used.
++- New tests cover: parser and renderer (diff3 base, CRLF, empty side, longer markers, malformed input);
++  per-hunk decisions, keeping both, undecided hunk blocking, modify/delete both ways, binary conflict,
++  rename/rename reported unsupported, sequential picks, decision reuse on rebuild and its non-reuse when the
++  conflict changed, header round trip with `git apply`, and that building leaves the index, work tree and
++  `.git` untouched; uncommitted result without a session, several commits in order, refusal on conflict with
++  nothing changed, dry-run and patch-only, one atomic commit in a session with an unrelated staged file
++  excluded, local edit blocking, contained/merge/root/unknown refusals, in-progress cherry-pick refusal,
++  already-present change, HEAD moving after selection, candidate filtering and order, branch list, preview;
++  the screen: overlay, source switching, marking order, prompts ignoring Enter/space, cancel keeping marks,
++  decision navigation/undo/both, whole-file "no both", chained conflicts, quit rules, rendering of every
++  screen and tiny terminals.
++- Real terminal (release binary in a pseudo-terminal, screen read with `pyte`), live session with a running
++  watcher, two hunks conflicting on the same lines, plus a clean commit: overlay opens first without `--from`;
++  Enter loads the branch; the preview flags the conflict; Tab reopens the overlay and Esc keeps the marks;
++  Enter is refused while undecided; `b` then `a` decided the hunks; Enter, space and `j` were ignored at the
++  prompt; `y` produced exactly one new commit with an empty message touching `b.txt` and `f.txt`, `f.txt`
++  holding the chosen sides, the watcher stopped and restarted (pid changed, `status` showing 1 pending), no
++  stray changes in `git status`. Second run: the watcher committed an unrelated file while the confirmation
++  was open; after `y` the "HEAD moved ... recomputing" notice was printed, the pick applied and was recorded,
++  both commits present, watcher alive.
++
++## Not done / follow-ups
++
++- **Editing inside a hunk** (neither side, or a mix). Cheapest route is handing the single file to `$EDITOR`
++  from the decision screen: Sonnet, medium. An in-screen text editor is a different size of job: Opus, high.
++- **Renames on both sides and file/directory clashes** are refused, not resolved. Presenting them needs a
++  model of paths that move between sides: Opus, high.
++- **Stand-alone patch re-write command** (`gitomic patch rebase <file>`). The pieces exist (`Spec::parse`,
++  `patch::rebuild`, `write`, `check`, `apply`); the command, its interaction with a live session and the
++  question of editing a patch file by hand are left for a session of their own: Sonnet, medium.
++- **Per-commit granularity in a session** (one atomic commit per picked commit): Sonnet, low.
++- The preview is per commit, so an early conflict that a chosen earlier commit would resolve is still flagged
++  there; the replay is authoritative.
++- A restarted watcher still does not inherit `-v/--verbose` (from part 1 of #12).
++- Delivered as a zip and patch on the issue thread; the patch excludes nothing (`Cargo.toml` and `Cargo.lock`
++  are unchanged).
++
++## Addendum (comment 278): `R`, mark from the highlighted commit down to the oldest
++
++### Context
++
++Requested after testing: select a commit with `R` and have every commit below it marked automatically, so that
++the files reach the state they have on the source branch at the selected commit.
++
++### Design decisions
++
++- **Reading of "recursive".** The list holds exactly the commits the source branch has and HEAD lacks, newest
++  first, so "down to the current HEAD" is the rest of the list below the cursor. `R` marks the highlighted
++  commit and everything below it. Replay order is unchanged (oldest first), so the chain applies as a whole.
++- **Marks above the cursor are left alone**, so `R` composes with `space`. When the whole range is already
++  marked, `R` unmarks it, giving a way back without walking the list. The bottom line reports the count.
++- **Works from both panes.** The key is `R` (capital), leaving `r` free.
++- **Limit, stated in the README.** Merge commits are not in the list, and commits whose change HEAD already
++  holds under another id are hidden. Content that reached the branch only through a merge commit is therefore
++  not part of a marked range. A conflict in the chain opens the decision screen as usual.
++
++### Changes
++
++- `src/cherry_ui.rs`: `mark_through` added before `say`; `R` arm added to `key_list` and `key_diff`; the two
++  bottom-line hints and the header comment mention it; 3 tests.
++- `src/cherry.rs`: 1 test that replays every candidate of a branch and compares the touched files with the
++  branch tip.
++- `src/main.rs`: usage text for `cherry-pick`.
++- `README.md`: `R` described in the interactive screen list.
++
++### Verification
++
++- `cargo test`: 123 passed (119 before; 4 new). `cargo fmt --check` clean; added lines at most 100 columns.
++- Real terminal against a live session: `R` on the middle of three commits marked two ("2 of 3 marked" and the
++  count message); a second `R` unmarked; `R` on the newest marked all three; confirming produced one atomic
++  commit and `f.txt` and `b.txt` were byte-identical to the branch tip's.
++
++## Addendum (comment 280): `R` follows one file's history (supersedes the comment 278 addendum)
++
++### Context
++
++The comment 278 reading of `R` (mark every older commit regardless of file) was not what was meant. The intent
++is the per-file history view: bring one file to its state on the source branch at the selected commit, using
++only the commits that changed that file. gitomic commits normally change one file; a commit made with
++`git add` may change several.
++
++### Design decisions (three were confirmed with the requester)
++
++- **Scope.** `R` marks the highlighted commit and every older commit of the source branch that changes the same
++  file (`git rev-list --cherry-pick --right-only --no-merges --full-history HEAD...<branch> -- :(literal)<path>`,
++  the same range as the list). Commits above the cursor keep their marks; a second `R` on a fully scoped chain
++  clears it.
++- **Multi-file commit in the chain (confirmed: apply only that file's part).** Each scoped commit is replayed
++  as a scratch commit whose tree is its parent's with only that path taken from the commit
++  (`patch::scoped_commit`), so the other files of the commit are left out. The status line counts such commits.
++- **Highlighted commit changes several files (confirmed: ask with a small overlay).** An overlay lists the
++  files; Enter follows the chosen one, Esc marks nothing.
++- **Fallback (confirmed: `X` restores the file whole).** On the decision screen `X` drops the scoped picks of
++  the current file and instead sets the file to its exact content in the newest commit marked for it (or
++  removes it when that commit lacks it), applied after the picks. `X` is refused with a message when the
++  selection was not made with `R`. The confirmation prompt names restored files.
++- **Recording.** The patch header gains `# only <id> <path>` and `# restore <id> <path>` lines, parsed back by
++  `Spec::parse` and preserved by `rebuild`, so a patch recomputed against a moved HEAD keeps its scoping.
++- **Command line.** `--only <path>` applies every named commit for that file only; a commit that does not
++  change the file is refused.
++- **Display.** Scoped marks show `[f]` (cyan); space marks stay `[x]`. The diff title shows `only: <path>` and
++  the preview is the restricted form. The decision screen now names the commit actually being replayed (it
++  previously named the first marked commit).
++
++### Changes
++
++- `src/cherry_ui.rs`: `Sel`, `OverlayKind`, `Entry.only`; `mark_through` replaced by `mark_file_chain` and
++  `mark_chain`; `key_overlay` handles the file overlay; `X` in `key_resolve`; `GitSource` carries picks with
++  scopes and restores; `[f]` rendering, prompt and hints; `Source::replaying`. The old three `R` tests were
++  rewritten; 8 tests added or replaced.
++- `src/patch.rs`: `scoped_commit`, `restored_tree`, `TempIndex::set_from`, `Job::with_scopes`/`current`,
++  `Spec.only`/`restore` with header and parse support; 5 tests.
++- `src/cherry.rs`: `changed_paths`, `touching`, `preview(.., only)`, `spec_from_hashes(.., only)`; 4 tests.
++- `src/main.rs`: `--only` option and usage text. `README.md`: `R`, `X`, `--only`.
++
++### Known limits
++
++- Renames are not followed; a file is tracked under the name it has in each commit.
++- Merge commits are not in the list, so a chain does not include changes that arrived only through a merge.
++- Paths containing a newline are refused for scoping.
++- A conflict with no A/B meaning (rename/rename, file/directory) refuses the selection with the reason;
++  the marks are kept so they can be adjusted.
++
++### Verification
++
++- `cargo test`: 137 passed (123 before). `cargo fmt --check` clean; added lines at most 100 columns.
++- Real terminal against a live session: history with a two-file commit, an unrelated commit and a later edit
++  of the same file, and a conflicting edit on the current branch. `R` on the newest commit marked the two
++  commits touching `f.txt` as `[f]`, reported the multi-file one, Enter opened the decision screen, `X` reached
++  the confirmation naming `f.txt`, `y` applied it: `f.txt` matched the branch tip, the second file of the
++  multi-file commit and the unrelated commit's file were absent, and the watcher was left running.
+diff -ruN cur/src/cherry.rs pd3/src/cherry.rs
+--- cur/src/cherry.rs	2026-09-25 13:23:00.438953965 +0000
++++ pd3/src/cherry.rs	2026-09-25 13:55:14.000000000 +0000
+@@ -34,6 +34,8 @@
+ pub const MAX_CANDIDATES: usize = 500;
+ 
+ pub struct Opts {
++    // Restrict every named commit to this one path (see `patch::Spec::only`).
++    pub only: Option<String>,
+     pub from: Option<String>,
+     pub hashes: Vec<String>,
+     pub dry_run: bool,
+@@ -93,10 +95,54 @@
+         .collect())
+ }
+ 
++// Paths changed by `commit` (against its first parent), sorted as git lists them.
++pub fn changed_paths(root: &Path, commit: &str) -> Res<Vec<String>> {
++    let out = git::run(
++        root,
++        &[
++            "diff-tree",
++            "-r",
++            "--root",
++            "--no-commit-id",
++            "--name-only",
++            "-z",
++            commit,
++        ],
++    )?;
++    Ok(out
++        .split('\0')
++        .filter(|p| !p.is_empty())
++        .map(str::to_string)
++        .collect())
++}
++
++// The commits of `source` that HEAD lacks and that change `path`, as full ids (unordered). The
++// same range as `candidates`, so every id returned is a row of the picker's list. History is not
++// simplified, and renames are not followed: a file is followed under the name it has at each
++// commit.
++pub fn touching(cwd: &Path, source: &str, path: &str) -> Res<Vec<String>> {
++    let root = git::work_tree(cwd)?;
++    let out = git::run(
++        &root,
++        &[
++            "rev-list",
++            "--cherry-pick",
++            "--right-only",
++            "--no-merges",
++            "--full-history",
++            &format!("--max-count={MAX_CANDIDATES}"),
++            &format!("HEAD...{source}"),
++            "--",
++            &format!(":(literal){path}"),
++        ],
++    )?;
++    Ok(out.lines().map(str::to_string).collect())
++}
++
+ // The text the picker shows for one commit: its header and message, then what applying it to `base`
+ // would change. A conflict is announced ahead of the diff, whose conflicted files show the markers
+ // that the decision screen later resolves.
+-pub fn preview(root: &Path, base: &str, pick: &str) -> Res<String> {
++pub fn preview(root: &Path, base: &str, pick: &str, only: Option<&str>) -> Res<String> {
+     let header = git::run(
+         root,
+         &[
+@@ -109,7 +155,17 @@
+     )?;
+     let mut text = header;
+     text.push_str("\n\n");
+-    let tree = match patch::merge(root, base, pick)? {
++    // A pick restricted to one file is previewed as its restricted form, which is what would apply.
++    let effective = match only {
++        Some(path) => {
++            text.push_str(&format!(
++                "Applied for {path} only; other files of this commit are left out.\n\n"
++            ));
++            patch::scoped_commit(root, pick, path)?
++        }
++        None => pick.to_string(),
++    };
++    let tree = match patch::merge(root, base, &effective)? {
+         Merged::Clean(tree) => tree,
+         Merged::Conflicted { tree, files } => {
+             text.push_str("CONFLICT: applying this commit needs a decision in\n");
+@@ -166,14 +222,14 @@
+             }
+         }
+     } else {
+-        spec_from_hashes(&root, &opts.hashes)?
++        spec_from_hashes(&root, &opts.hashes, opts.only.as_deref())?
+     };
+     apply_spec(cwd, spec, opts.dry_run, opts.patch_only)
+ }
+ 
+ // Resolve command-line selectors into a spec against the current HEAD. The order given is the order
+ // of replay. A commit already contained in HEAD, a merge commit, or a root commit is refused.
+-fn spec_from_hashes(root: &Path, hashes: &[String]) -> Res<Spec> {
++fn spec_from_hashes(root: &Path, hashes: &[String], only: Option<&str>) -> Res<Spec> {
+     let base = git::rev_parse(root, "HEAD")?;
+     let mut picks: Vec<(String, String)> = Vec::new();
+     for sel in hashes {
+@@ -194,10 +250,25 @@
+         let subject = git::run(root, &["show", "-s", "--format=%s", &id])?;
+         picks.push((id, subject));
+     }
++    let only = match only {
++        Some(path) => {
++            for (id, _) in &picks {
++                if !changed_paths(root, id)?.iter().any(|p| p == path) {
++                    return Err(format!("cherry-pick: {} does not change {path}", short(id)).into());
++                }
++            }
++            picks
++                .iter()
++                .map(|(id, _)| (id.clone(), path.to_string()))
++                .collect()
++        }
++        None => Vec::new(),
++    };
+     Ok(Spec {
+         base,
+         picks,
+-        decisions: Vec::new(),
++        only,
++        ..Spec::default()
+     })
+ }
+ 
+@@ -292,6 +363,9 @@
+         };
+         println!("gitomic: {verb} {} {subject}", short(id));
+     }
++    for (id, path) in &patch.spec.restore {
++        println!("gitomic: {verb} {path} restored whole from {}", short(id));
++    }
+     if patch.is_empty() {
+         println!("  the change is already present in HEAD; nothing to apply");
+         return Ok(());
+@@ -347,6 +421,7 @@
+ 
+     fn opts(hashes: &[&str]) -> Opts {
+         Opts {
++            only: None,
+             from: None,
+             hashes: hashes.iter().map(|h| h.to_string()).collect(),
+             dry_run: false,
+@@ -519,7 +594,7 @@
+     #[test]
+     fn head_moving_after_the_selection_recomputes_the_patch() {
+         let (r, b, _) = setup();
+-        let spec = spec_from_hashes(&r.0, &[b]).unwrap();
++        let spec = spec_from_hashes(&r.0, &[b], None).unwrap();
+         let old = spec.base.clone();
+         // A commit lands between choosing and applying, as a watcher capture would.
+         r.commit_file("late.txt", "l\n", "late");
+@@ -543,7 +618,7 @@
+     fn decisions_in_a_spec_settle_a_conflict_without_a_terminal() {
+         let (r, _, f) = setup();
+         r.commit_file("f.txt", &Repo::lines_with(&[(3, "MAIN3")]), "main edits f");
+-        let spec = spec_from_hashes(&r.0, &[f.clone()]).unwrap();
++        let spec = spec_from_hashes(&r.0, &[f.clone()], None).unwrap();
+ 
+         // Decide through the engine, as the interactive screen does, then hand the spec over.
+         let mut job = patch::Job::new(&r.0, &spec.base, &spec.ids(), &[]);
+@@ -588,6 +663,44 @@
+     }
+ 
+     #[test]
++    fn picking_every_candidate_reproduces_the_branch_state_of_the_files() {
++        // What `R` in the screen asks for: from the chosen commit down to the oldest the branch
++        // holds that HEAD lacks, replayed in order, leaves the touched files as on the branch.
++        let r = Repo::new();
++        r.commit_file("f.txt", &Repo::lines(), "base");
++        r.git(&["checkout", "-q", "-b", "feat"]);
++        r.commit_file("f.txt", &Repo::lines_with(&[(2, "ONE")]), "one");
++        r.commit_file("g.txt", "g\n", "add g");
++        r.commit_file("f.txt", &Repo::lines_with(&[(2, "ONE"), (7, "TWO")]), "two");
++        let tip = r.head();
++        r.git(&["checkout", "-q", "main"]);
++        r.commit_file("other.txt", "o\n", "unrelated main work");
++
++        let all: Vec<String> = candidates(&r.0, "feat")
++            .unwrap()
++            .into_iter()
++            .rev()
++            .map(|(id, _)| id)
++            .collect();
++        assert_eq!(all.len(), 3);
++        apply_spec(
++            &r.0,
++            spec_from_hashes(&r.0, &all, None).unwrap(),
++            false,
++            false,
++        )
++        .unwrap();
++
++        for file in ["f.txt", "g.txt"] {
++            assert_eq!(
++                r.read(file),
++                r.git(&["show", &format!("{tip}:{file}")]) + "\n"
++            );
++        }
++        assert_eq!(r.read("other.txt"), "o\n");
++    }
++
++    #[test]
+     fn candidates_are_newest_first() {
+         let (r, b, f) = setup();
+         let got: Vec<String> = candidates(&r.0, "feat")
+@@ -620,14 +733,102 @@
+     fn the_preview_shows_the_change_against_the_base_and_flags_conflicts() {
+         let (r, b, f) = setup();
+         let base = r.head();
+-        let clean = preview(&r.0, &base, &b).unwrap();
++        let clean = preview(&r.0, &base, &b, None).unwrap();
+         assert!(clean.contains("add b"), "{clean}");
+         assert!(clean.contains("+++ b/b.txt"), "{clean}");
+         assert!(!clean.contains("CONFLICT"));
+ 
+         r.commit_file("f.txt", &Repo::lines_with(&[(3, "MAIN3")]), "main edits f");
+-        let conflicted = preview(&r.0, &r.head(), &f).unwrap();
++        let conflicted = preview(&r.0, &r.head(), &f, None).unwrap();
+         assert!(conflicted.contains("CONFLICT"), "{conflicted}");
+         assert!(conflicted.contains("f.txt (1 to decide)"), "{conflicted}");
+     }
++
++    // `feat` history (oldest first): m1 edits f.txt line 3 and adds other.txt (two files), g adds
++    // g.txt, m3 edits f.txt line 7. Returns the three commit ids.
++    fn chain() -> (Repo, [String; 3]) {
++        let r = Repo::new();
++        r.write("f.txt", &Repo::lines());
++        r.git(&["add", "."]);
++        r.git(&["commit", "-q", "-m", "base"]);
++        r.git(&["checkout", "-q", "-b", "feat"]);
++        r.write("f.txt", &Repo::lines_with(&[(3, "FEAT3")]));
++        r.write("other.txt", "o\n");
++        r.git(&["add", "."]);
++        r.git(&["commit", "-q", "-m", "f and other"]);
++        let m1 = r.head();
++        let g = r.commit_file("g.txt", "g\n", "add g");
++        let m3 = r.commit_file(
++            "f.txt",
++            &Repo::lines_with(&[(3, "FEAT3"), (7, "FEAT7")]),
++            "f 7",
++        );
++        r.git(&["checkout", "-q", "main"]);
++        r.commit_file("c.txt", "c\n", "add c");
++        (r, [m1, g, m3])
++    }
++
++    #[test]
++    fn changed_paths_and_touching_follow_one_file() {
++        let (r, [m1, g, m3]) = chain();
++        assert_eq!(
++            changed_paths(&r.0, &m1).unwrap(),
++            vec!["f.txt", "other.txt"]
++        );
++        assert_eq!(changed_paths(&r.0, &g).unwrap(), vec!["g.txt"]);
++        let mut got = touching(&r.0, "feat", "f.txt").unwrap();
++        got.sort();
++        let mut want = vec![m1, m3];
++        want.sort();
++        assert_eq!(got, want);
++        assert_eq!(touching(&r.0, "feat", "g.txt").unwrap(), vec![g]);
++        assert!(touching(&r.0, "feat", "nothing.txt").unwrap().is_empty());
++    }
++
++    #[test]
++    fn a_file_chain_brings_the_file_to_the_branch_state_and_leaves_other_files_alone() {
++        let (r, [m1, _, m3]) = chain();
++        let mut o = opts(&[&m1, &m3]);
++        o.only = Some("f.txt".to_string());
++        run(&r.0, o).unwrap();
++        assert_eq!(
++            r.read("f.txt"),
++            r.git(&["show", &format!("{m3}:f.txt")]) + "\n"
++        );
++        assert!(
++            !r.exists("other.txt"),
++            "the second file of m1 is not applied"
++        );
++        assert!(!r.exists("g.txt"));
++    }
++
++    #[test]
++    fn only_names_a_path_the_commits_must_change_or_is_refused() {
++        let (r, [m1, g, _]) = chain();
++        let mut o = opts(&[&m1, &g]);
++        o.only = Some("f.txt".to_string());
++        let err = run(&r.0, o).unwrap_err().to_string();
++        assert!(err.contains("f.txt"), "{err}");
++        assert_eq!(r.git(&["status", "--porcelain"]), "");
++    }
++
++    #[test]
++    fn a_whole_file_restore_replaces_a_history_that_cannot_be_replayed() {
++        let (r, [_, g, m3]) = chain();
++        // main now edits the same line, so replaying m3's history for f.txt would conflict.
++        r.commit_file("f.txt", &Repo::lines_with(&[(3, "MAIN3")]), "main edits f");
++        let base = r.head();
++        let spec = Spec {
++            base,
++            picks: vec![(g.clone(), "add g".to_string())],
++            restore: vec![(m3.clone(), "f.txt".to_string())],
++            ..Spec::default()
++        };
++        apply_spec(&r.0, spec, false, false).unwrap();
++        assert_eq!(
++            r.read("f.txt"),
++            r.git(&["show", &format!("{m3}:f.txt")]) + "\n"
++        );
++        assert_eq!(r.read("g.txt"), "g\n");
++    }
+ }
+diff -ruN cur/src/cherry_ui.rs pd3/src/cherry_ui.rs
+--- cur/src/cherry_ui.rs	2026-09-25 13:23:01.302954016 +0000
++++ pd3/src/cherry_ui.rs	2026-09-25 13:56:29.000000000 +0000
+@@ -14,6 +14,9 @@
+ //
+ // Keys, list pane:
+ //   j/k, arrows  move            g/G  first/last          space  toggle the mark
++//   R            follow one file: mark this commit and every older commit that changes the same
++//                file, each restricted to that file (an overlay asks which file when the commit
++//                changes several; a second press unmarks the chain)
+ //   l, Right     open the diff   Tab  choose the source branch
+ //   Enter        prepare the marked commits (conflicts are decided first), then confirm with y/n
+ //   q, Esc       quit (confirmed first when commits are marked)
+@@ -23,6 +26,7 @@
+ // Keys, decision screen:
+ //   j/k          previous/next conflict     a  keep the tree copy     b  take the picked commit's
+ //   c            keep both (text conflicts)  u  undo the decision      Ctrl-d/u  scroll
++//   X            restore this file whole from the newest commit marked for it with R
+ //   Enter        continue once every conflict is decided               Esc, q  leave
+ 
+ use std::collections::HashMap;
+@@ -55,17 +59,36 @@
+     Refused(String),
+ }
+ 
++// One commit chosen for the patch, optionally restricted to a single file.
++#[derive(Clone, PartialEq, Debug)]
++pub struct Sel {
++    pub id: String,
++    pub subject: String,
++    pub only: Option<String>,
++}
++
+ // What the screen needs from git.
+ pub trait Source {
+     fn branches(&mut self) -> Result<Vec<String>, String>;
+     // Commits on `branch` that HEAD lacks, newest first.
+     fn commits(&mut self, branch: &str) -> Result<Vec<(String, String)>, String>;
+-    // The preview text for one commit.
+-    fn diff(&mut self, commit: &str) -> Result<String, String>;
++    // The preview text for one commit, restricted to one file when `only` is given.
++    fn diff(&mut self, commit: &str, only: Option<&str>) -> Result<String, String>;
++    // Paths a commit changes.
++    fn paths(&mut self, commit: &str) -> Result<Vec<String>, String>;
++    // Commits of `branch` that HEAD lacks and that change `path`.
++    fn touching(&mut self, branch: &str, path: &str) -> Result<Vec<String>, String>;
+     // Begin replaying `picks` (oldest first) and report where it stops.
+-    fn start(&mut self, picks: &[(String, String)]) -> Result<Flow, String>;
++    fn start(&mut self, picks: &[Sel]) -> Result<Flow, String>;
++    // Replace the picks restricted to `path` by one whole-file restore of it from the newest of
++    // them, and replay again. Errors when no pick is restricted to `path`.
++    fn restore(&mut self, path: &str) -> Result<Flow, String>;
+     // Supply decisions for the conflict last reported and continue.
+     fn resolve(&mut self, files: Vec<FileConflict>) -> Result<Flow, String>;
++    // The commit a reported conflict belongs to.
++    fn replaying(&self) -> Option<String> {
++        None
++    }
+     // The recipe for the patch once the replay is `Ready`.
+     fn spec(&mut self) -> Result<Spec, String>;
+ }
+@@ -76,18 +99,44 @@
+     // HEAD when the screen opened; every preview and the replay are relative to it.
+     base: String,
+     job: Option<Job>,
+-    picks: Vec<(String, String)>,
++    picks: Vec<Sel>,
++    // (commit, path) whole-file restores that replaced restricted picks.
++    restores: Vec<(String, String)>,
+     // Decisions carried across restarts of the replay, so a cancelled confirmation does not lose
+     // them.
+     decided: Vec<(String, Side)>,
+ }
+ 
+ impl GitSource {
++    // (id, subject) of every pick, oldest first, as a patch header records them.
++    fn subjects(&self) -> Vec<(String, String)> {
++        self.picks
++            .iter()
++            .map(|p| (p.id.clone(), p.subject.clone()))
++            .collect()
++    }
++
++    // Replay the current picks and restores from the start.
++    fn run_job(&mut self) -> Result<Flow, String> {
++        let ids: Vec<String> = self.picks.iter().map(|p| p.id.clone()).collect();
++        let only: Vec<(String, String)> = self
++            .picks
++            .iter()
++            .filter_map(|p| p.only.clone().map(|path| (p.id.clone(), path)))
++            .collect();
++        let mut job = Job::new(&self.root, &self.base, &ids, &self.decided)
++            .with_scopes(&only, &self.restores);
++        let step = job.advance().map_err(|e| e.to_string())?;
++        self.decided = job.decisions().to_vec();
++        self.job = Some(job);
++        self.flow(step)
++    }
++
+     fn flow(&mut self, step: Step) -> Result<Flow, String> {
+         match step {
+             Step::Done => {
+                 let job = self.job.as_ref().ok_or("no replay in progress")?;
+-                let patch = job.patch(&self.picks).map_err(|e| e.to_string())?;
++                let patch = job.patch(&self.subjects()).map_err(|e| e.to_string())?;
+                 if patch.is_empty() {
+                     return Ok(Flow::Refused(
+                         "the selection changes nothing relative to HEAD".to_string(),
+@@ -113,18 +162,37 @@
+         cherry::candidates(&self.cwd, branch).map_err(|e| e.to_string())
+     }
+ 
+-    fn diff(&mut self, commit: &str) -> Result<String, String> {
+-        cherry::preview(&self.root, &self.base, commit).map_err(|e| e.to_string())
++    fn diff(&mut self, commit: &str, only: Option<&str>) -> Result<String, String> {
++        cherry::preview(&self.root, &self.base, commit, only).map_err(|e| e.to_string())
++    }
++
++    fn paths(&mut self, commit: &str) -> Result<Vec<String>, String> {
++        cherry::changed_paths(&self.root, commit).map_err(|e| e.to_string())
++    }
++
++    fn touching(&mut self, branch: &str, path: &str) -> Result<Vec<String>, String> {
++        cherry::touching(&self.cwd, branch, path).map_err(|e| e.to_string())
+     }
+ 
+-    fn start(&mut self, picks: &[(String, String)]) -> Result<Flow, String> {
++    fn start(&mut self, picks: &[Sel]) -> Result<Flow, String> {
+         self.picks = picks.to_vec();
+-        let ids: Vec<String> = picks.iter().map(|(id, _)| id.clone()).collect();
+-        let mut job = Job::new(&self.root, &self.base, &ids, &self.decided);
+-        let step = job.advance().map_err(|e| e.to_string())?;
+-        self.decided = job.decisions().to_vec();
+-        self.job = Some(job);
+-        self.flow(step)
++        self.restores.clear();
++        self.run_job()
++    }
++
++    fn restore(&mut self, path: &str) -> Result<Flow, String> {
++        let newest = self
++            .picks
++            .iter()
++            .rev()
++            .find(|p| p.only.as_deref() == Some(path))
++            .map(|p| p.id.clone())
++            .ok_or(
++                "whole-file restore is offered for a selection made with R (one file's history)",
++            )?;
++        self.picks.retain(|p| p.only.as_deref() != Some(path));
++        self.restores.push((newest, path.to_string()));
++        self.run_job()
+     }
+ 
+     fn resolve(&mut self, files: Vec<FileConflict>) -> Result<Flow, String> {
+@@ -135,9 +203,16 @@
+         self.flow(step)
+     }
+ 
++    fn replaying(&self) -> Option<String> {
++        self.job
++            .as_ref()
++            .and_then(|j| j.current())
++            .map(str::to_string)
++    }
++
+     fn spec(&mut self) -> Result<Spec, String> {
+         let job = self.job.as_ref().ok_or("no replay in progress")?;
+-        job.patch(&self.picks)
++        job.patch(&self.subjects())
+             .map(|p| p.spec)
+             .map_err(|e| e.to_string())
+     }
+@@ -171,9 +246,20 @@
+     full: String,
+     subject: String,
+     marked: bool,
++    // Set when the mark restricts the commit to one file (made with R).
++    only: Option<String>,
++}
++
++// What the overlay is choosing.
++#[derive(Clone, PartialEq, Debug)]
++enum OverlayKind {
++    Branch,
++    // A file among those the highlighted commit changes; R then follows that file's history.
++    File,
+ }
+ 
+ struct Overlay {
++    kind: OverlayKind,
+     names: Vec<String>,
+     cursor: usize,
+ }
+@@ -434,6 +520,10 @@
+     list_state: ListState,
+     overlay: Option<Overlay>,
+     resolver: Option<Resolver>,
++    // Files restored whole after a decision-screen `X`, named in the confirmation prompt.
++    restored: Vec<String>,
++    // The commit the decision screen is about.
++    replaying: String,
+ }
+ 
+ impl App {
+@@ -456,6 +546,8 @@
+             list_state: ListState::default(),
+             overlay: None,
+             resolver: None,
++            restored: Vec::new(),
++            replaying: String::new(),
+         }
+     }
+ 
+@@ -469,6 +561,7 @@
+                 full,
+                 subject,
+                 marked: false,
++                only: None,
+             })
+             .collect();
+         self.source_label = Some(branch.to_string());
+@@ -481,7 +574,11 @@
+ 
+     // Open the branch overlay on `names`.
+     pub fn open_overlay(&mut self, names: Vec<String>) {
+-        self.overlay = Some(Overlay { names, cursor: 0 });
++        self.overlay = Some(Overlay {
++            kind: OverlayKind::Branch,
++            names,
++            cursor: 0,
++        });
+         self.mode = Mode::Overlay;
+     }
+ 
+@@ -490,34 +587,44 @@
+     }
+ 
+     // The marked commits, oldest first, which is the order they are replayed in.
+-    fn marked_picks(&self) -> Vec<(String, String)> {
++    fn marked_picks(&self) -> Vec<Sel> {
+         self.entries
+             .iter()
+             .rev()
+             .filter(|e| e.marked)
+-            .map(|e| (e.full.clone(), e.subject.clone()))
++            .map(|e| Sel {
++                id: e.full.clone(),
++                subject: e.subject.clone(),
++                only: e.only.clone(),
++            })
+             .collect()
+     }
+ 
++    // Preview cache key: a commit previews differently when it is restricted to one file.
++    fn view_key(e: &Entry) -> String {
++        format!("{}\0{}", e.full, e.only.as_deref().unwrap_or(""))
++    }
++
+     pub fn ensure_diff(&mut self, src: &mut dyn Source) {
+         let Some(entry) = self.entries.get(self.cursor) else {
+             return;
+         };
+-        if self.views.contains_key(&entry.full) {
++        let key = Self::view_key(entry);
++        if self.views.contains_key(&key) {
+             return;
+         }
+-        let full = entry.full.clone();
+-        let view = match src.diff(&full) {
++        let (full, only) = (entry.full.clone(), entry.only.clone());
++        let view = match src.diff(&full, only.as_deref()) {
+             Ok(text) => style_diff(&text),
+             Err(e) => style_diff(&format!("could not show {full}: {e}")),
+         };
+-        self.views.insert(full, view);
++        self.views.insert(key, view);
+     }
+ 
+     fn view(&self) -> Option<&DiffView> {
+         self.entries
+             .get(self.cursor)
+-            .and_then(|e| self.views.get(&e.full))
++            .and_then(|e| self.views.get(&Self::view_key(e)))
+     }
+ 
+     fn max_v(&self) -> usize {
+@@ -552,12 +659,80 @@
+         }
+     }
+ 
++    // Space: mark the highlighted commit whole, or clear its mark (whatever kind it was).
+     fn toggle(&mut self) {
+         if let Some(e) = self.entries.get_mut(self.cursor) {
+             e.marked = !e.marked;
++            e.only = None;
+         }
+     }
+ 
++    // R: follow one file's history. The file is the one the highlighted commit changes; when it
++    // changes several, an overlay asks which. See `mark_chain`.
++    fn mark_file_chain(&mut self, src: &mut dyn Source) {
++        let Some(entry) = self.entries.get(self.cursor) else {
++            return;
++        };
++        let commit = entry.full.clone();
++        match src.paths(&commit) {
++            Err(e) => self.say(e, true),
++            Ok(paths) if paths.is_empty() => self.say("this commit changes no file", true),
++            Ok(paths) if paths.len() == 1 => self.mark_chain(&paths[0], src),
++            Ok(paths) => {
++                self.overlay = Some(Overlay {
++                    kind: OverlayKind::File,
++                    names: paths,
++                    cursor: 0,
++                });
++                self.mode = Mode::Overlay;
++            }
++        }
++    }
++
++    // Mark the highlighted commit and every older commit of the branch that changes `path`, each
++    // restricted to that file. Replayed oldest first they bring the file to its state on the
++    // source branch at the highlighted commit; a commit that also changes other files contributes
++    // only its part for `path`. Commits above the cursor keep their marks. When that whole chain
++    // is already marked for `path`, the same call clears it.
++    fn mark_chain(&mut self, path: &str, src: &mut dyn Source) {
++        let Some(branch) = self.source_label.clone() else {
++            return;
++        };
++        let touching = match src.touching(&branch, path) {
++            Ok(t) => t,
++            Err(e) => {
++                self.say(e, true);
++                return;
++            }
++        };
++        let cursor = self.cursor;
++        let chain: Vec<usize> = (cursor..self.entries.len())
++            .filter(|&i| i == cursor || touching.contains(&self.entries[i].full))
++            .collect();
++        let all = chain
++            .iter()
++            .all(|&i| self.entries[i].marked && self.entries[i].only.as_deref() == Some(path));
++        for &i in &chain {
++            self.entries[i].marked = !all;
++            self.entries[i].only = if all { None } else { Some(path.to_string()) };
++        }
++        let text = if all {
++            format!("unmarked {} commit(s) for {path}", chain.len())
++        } else {
++            let partial = chain
++                .iter()
++                .filter(|&&i| src.paths(&self.entries[i].full).is_ok_and(|p| p.len() > 1))
++                .count();
++            let extra = if partial > 0 {
++                format!("; {partial} also change other files and are applied for it only")
++            } else {
++                String::new()
++            };
++            format!("marked {} commit(s) for {path}{extra}", chain.len())
++        };
++        self.say(text, false);
++    }
++
+     fn say(&mut self, text: impl Into<String>, is_error: bool) {
+         self.status = text.into();
+         self.status_is_error = is_error;
+@@ -607,6 +782,7 @@
+             KeyCode::Char('g') | KeyCode::Home => self.jump(0),
+             KeyCode::Char('G') | KeyCode::End => self.jump(self.entries.len().saturating_sub(1)),
+             KeyCode::Char(' ') => self.toggle(),
++            KeyCode::Char('R') => self.mark_file_chain(src),
+             KeyCode::Char('l') | KeyCode::Right => self.focus = Focus::Diff,
+             KeyCode::Tab => self.open_branches(src),
+             KeyCode::Enter => self.submit(src),
+@@ -639,6 +815,7 @@
+             KeyCode::Enter | KeyCode::Char('n') => self.step(1),
+             KeyCode::Char('N') => self.step(-1),
+             KeyCode::Char(' ') => self.toggle(),
++            KeyCode::Char('R') => self.mark_file_chain(src),
+             KeyCode::Tab => self.open_branches(src),
+             KeyCode::Esc => self.focus = Focus::List,
+             KeyCode::Char('q') => return self.request_quit(),
+@@ -672,6 +849,12 @@
+             KeyCode::Char('k') | KeyCode::Up => ov.cursor = ov.cursor.saturating_sub(1),
+             KeyCode::Char('g') | KeyCode::Home => ov.cursor = 0,
+             KeyCode::Char('G') | KeyCode::End => ov.cursor = last,
++            KeyCode::Enter if ov.kind == OverlayKind::File => {
++                let path = ov.names[ov.cursor].clone();
++                self.overlay = None;
++                self.mode = Mode::Browse;
++                self.mark_chain(&path, src);
++            }
+             KeyCode::Enter => {
+                 let name = ov.names[ov.cursor].clone();
+                 match src.commits(&name) {
+@@ -702,11 +885,13 @@
+             self.say("nothing is marked; press space on a commit first", true);
+             return;
+         }
++        self.restored.clear();
+         let flow = src.start(&picks);
+-        self.after_flow(flow);
++        self.after_flow(flow, &*src);
+     }
+ 
+-    fn after_flow(&mut self, flow: Result<Flow, String>) {
++    fn after_flow(&mut self, flow: Result<Flow, String>, src: &dyn Source) {
++        self.replaying = src.replaying().unwrap_or_default();
+         match flow {
+             Ok(Flow::Ready(summary)) => {
+                 self.resolver = None;
+@@ -756,6 +941,20 @@
+             KeyCode::Char('u') => {
+                 res.decide(None);
+             }
++            KeyCode::Char('X') => {
++                let Some(&(f, _)) = res.units.get(res.cursor) else {
++                    return;
++                };
++                let path = res.files[f].path.clone();
++                match src.restore(&path) {
++                    Ok(flow) => {
++                        self.restored.push(path);
++                        self.resolver = None;
++                        self.after_flow(Ok(flow), &*src);
++                    }
++                    Err(e) => self.say(e, true),
++                }
++            }
+             KeyCode::Enter => {
+                 let left = res.undecided();
+                 if left > 0 {
+@@ -765,7 +964,7 @@
+                 let files = std::mem::take(&mut res.files);
+                 self.resolver = None;
+                 let flow = src.resolve(files);
+-                self.after_flow(flow);
++                self.after_flow(flow, &*src);
+             }
+             KeyCode::Esc | KeyCode::Char('q') => {
+                 self.resolver = None;
+@@ -853,9 +1052,15 @@
+                 } else {
+                     &e.subject
+                 };
+-                let mark = if e.marked { 'x' } else { ' ' };
++                let mark = match (e.marked, &e.only) {
++                    (false, _) => ' ',
++                    (true, None) => 'x',
++                    (true, Some(_)) => 'f',
++                };
+                 let text = format!("[{mark}] {} {subject}", &e.full[..e.full.len().min(8)]);
+-                let style = if e.marked {
++                let style = if e.marked && e.only.is_some() {
++                    Style::new().fg(Color::Cyan)
++                } else if e.marked {
+                     Style::new().fg(Color::Green)
+                 } else {
+                     Style::new()
+@@ -915,8 +1120,11 @@
+         };
+         let heading = match self.entries.get(self.cursor) {
+             Some(e) => format!(
+-                " {}  line {}/{}  col {} ",
++                " {}{}  line {}/{}  col {} ",
+                 &e.full[..e.full.len().min(8)],
++                e.only
++                    .as_ref()
++                    .map_or(String::new(), |p| format!("  only: {p}")),
+                 (self.vscroll + 1).min(total.max(1)),
+                 total,
+                 self.hscroll + 1
+@@ -954,11 +1162,7 @@
+         state.select(Some(res.cursor));
+         frame.render_stateful_widget(list, left, &mut state);
+ 
+-        let pick = self
+-            .entries
+-            .iter()
+-            .find(|e| e.marked)
+-            .map_or(String::new(), |e| e.full[..e.full.len().min(8)].to_string());
++        let pick = self.replaying[..self.replaying.len().min(8)].to_string();
+         let lines = res.detail(&pick);
+         let inner_h = right.height.saturating_sub(2) as usize;
+         self.view_h = inner_h.max(1);
+@@ -985,10 +1189,14 @@
+             height: h,
+         };
+         let items: Vec<ListItem> = ov.names.iter().map(|n| ListItem::new(n.as_str())).collect();
++        let title = match ov.kind {
++            OverlayKind::Branch => " Pick from which branch?  (Enter use, Esc close) ",
++            OverlayKind::File => " Follow which file?  (Enter use, Esc close) ",
++        };
+         let list = List::new(items)
+             .block(
+                 Block::bordered()
+-                    .title(" Pick from which branch?  (Enter use, Esc close) ")
++                    .title(title)
+                     .border_style(Style::new().fg(Color::Yellow)),
+             )
+             .highlight_style(Style::new().add_modifier(Modifier::REVERSED));
+@@ -1003,9 +1211,14 @@
+         let bar = match &self.mode {
+             Mode::ConfirmApply { summary } => {
+                 let last = summary.lines().last().unwrap_or("").trim();
++                let whole = if self.restored.is_empty() {
++                    String::new()
++                } else {
++                    format!(" (restored whole: {})", self.restored.join(", "))
++                };
+                 Line::from(Span::styled(
+                     format!(
+-                        " Apply {} commit(s) as a patch? {last} [y/n] ",
++                        " Apply {} commit(s) as a patch? {last}{whole} [y/n] ",
+                         self.marked_count()
+                     ),
+                     prompt,
+@@ -1026,14 +1239,14 @@
+                     Style::new().fg(color).add_modifier(Modifier::BOLD),
+                 ))
+             }
+-            Mode::Overlay => hint(" j/k move  Enter use branch  Esc close "),
++            Mode::Overlay => hint(" j/k move  Enter use  Esc close "),
+             Mode::Resolve => hint(
+-                " j/k conflict  a tree copy  b picked  c both  u undo  Enter continue  Esc leave ",
++                " j/k conflict  a tree  b picked  c both  u undo  X restore file  Enter go  Esc leave ",
+             ),
+             Mode::Browse => match self.focus {
+-                Focus::List => {
+-                    hint(" j/k move  space mark  l diff  Tab branch  Enter pick marked  q quit ")
+-                }
++                Focus::List => hint(
++                    " j/k move  space mark  R file history  l diff  Tab branch  Enter pick  q quit",
++                ),
+                 Focus::Diff => {
+                     hint(" j/k h/l scroll  Enter/n next  N prev  space mark  Tab branch  q quit")
+                 }
+@@ -1064,6 +1277,7 @@
+         base,
+         job: None,
+         picks: Vec::new(),
++        restores: Vec::new(),
+         decided: Vec::new(),
+     };
+     let mut app = App::new();
+@@ -1119,8 +1333,15 @@
+         branches: Vec<String>,
+         commits: Vec<(String, String)>,
+         flows: VecDeque<Result<Flow, String>>,
+-        started: Vec<Vec<(String, String)>>,
++        started: Vec<Vec<Sel>>,
+         resolved: Vec<Vec<FileConflict>>,
++        // Paths changed by a commit; a commit not listed changes only a.txt.
++        paths: HashMap<String, Vec<String>>,
++        // Commits that `touching` reports.
++        touching: Vec<String>,
++        // (commit, only) of every preview requested.
++        diffs: Vec<(String, Option<String>)>,
++        restored: Vec<String>,
+     }
+ 
+     impl Fake {
+@@ -1135,6 +1356,10 @@
+                 flows: VecDeque::new(),
+                 started: Vec::new(),
+                 resolved: Vec::new(),
++                paths: HashMap::new(),
++                touching: vec![id('a'), id('c')],
++                diffs: Vec::new(),
++                restored: Vec::new(),
+             }
+         }
+     }
+@@ -1152,7 +1377,9 @@
+             }
+         }
+ 
+-        fn diff(&mut self, commit: &str) -> Result<String, String> {
++        fn diff(&mut self, commit: &str, only: Option<&str>) -> Result<String, String> {
++            self.diffs
++                .push((commit.to_string(), only.map(str::to_string)));
+             Ok(format!(
+                 "commit {commit}\nAuthor: T <t@e.invalid>\nDate:   now\n\n    msg\n\n \
+                  a.txt | 1 +\n\ndiff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n\
+@@ -1160,7 +1387,33 @@
+             ))
+         }
+ 
+-        fn start(&mut self, picks: &[(String, String)]) -> Result<Flow, String> {
++        fn paths(&mut self, commit: &str) -> Result<Vec<String>, String> {
++            Ok(self
++                .paths
++                .get(commit)
++                .cloned()
++                .unwrap_or_else(|| vec!["a.txt".to_string()]))
++        }
++
++        fn touching(&mut self, _branch: &str, _path: &str) -> Result<Vec<String>, String> {
++            Ok(self.touching.clone())
++        }
++
++        fn restore(&mut self, path: &str) -> Result<Flow, String> {
++            let scoped = self
++                .started
++                .last()
++                .is_some_and(|p| p.iter().any(|s| s.only.as_deref() == Some(path)));
++            if !scoped {
++                return Err("whole-file restore is offered for a selection made with R".into());
++            }
++            self.restored.push(path.to_string());
++            self.flows
++                .pop_front()
++                .unwrap_or(Ok(Flow::Ready("1 file changed".into())))
++        }
++
++        fn start(&mut self, picks: &[Sel]) -> Result<Flow, String> {
+             self.started.push(picks.to_vec());
+             self.flows
+                 .pop_front()
+@@ -1174,11 +1427,27 @@
+                 .unwrap_or(Ok(Flow::Ready("1 file changed".into())))
+         }
+ 
++        fn replaying(&self) -> Option<String> {
++            self.started
++                .last()
++                .and_then(|p| p.first())
++                .map(|s| s.id.clone())
++        }
++
+         fn spec(&mut self) -> Result<Spec, String> {
+             Ok(Spec {
+                 base: id('0'),
+-                picks: self.started.last().cloned().unwrap_or_default(),
++                picks: self
++                    .started
++                    .last()
++                    .map(|p| {
++                        p.iter()
++                            .map(|s| (s.id.clone(), s.subject.clone()))
++                            .collect()
++                    })
++                    .unwrap_or_default(),
+                 decisions: Vec::new(),
++                ..Spec::default()
+             })
+         }
+     }
+@@ -1321,11 +1590,165 @@
+         press(&mut a, &mut f, ch('G'));
+         press(&mut a, &mut f, ch(' '));
+         press(&mut a, &mut f, KeyCode::Enter);
+-        let picks: Vec<String> = f.started[0].iter().map(|(i, _)| i.clone()).collect();
++        let picks: Vec<String> = f.started[0].iter().map(|s| s.id.clone()).collect();
+         assert_eq!(picks, vec![id('c'), id('a')]);
+     }
+ 
+     #[test]
++    fn r_marks_the_file_chain_older_only_restricted_and_leaves_newer_marks_alone() {
++        // Commit b does not touch the file; a (newer) and c (older) do. The cursor is on c.
++        let (mut a, mut f) = app();
++        press(&mut a, &mut f, ch('G'));
++        press(&mut a, &mut f, ch('R'));
++        let marks: Vec<(bool, Option<&str>)> = a
++            .entries
++            .iter()
++            .map(|e| (e.marked, e.only.as_deref()))
++            .collect();
++        assert_eq!(marks, [(false, None), (false, None), (true, Some("a.txt"))]);
++        assert!(
++            a.status.contains("marked 1 commit(s) for a.txt"),
++            "{}",
++            a.status
++        );
++
++        // From the newest commit the chain is a and c; b does not touch the file and is skipped.
++        press(&mut a, &mut f, ch('g'));
++        press(&mut a, &mut f, ch('R'));
++        let marked: Vec<bool> = a.entries.iter().map(|e| e.marked).collect();
++        assert_eq!(marked, [true, false, true]);
++        press(&mut a, &mut f, KeyCode::Enter);
++        let picks: Vec<(String, Option<String>)> = f.started[0]
++            .iter()
++            .map(|s| (s.id.clone(), s.only.clone()))
++            .collect();
++        assert_eq!(
++            picks,
++            vec![
++                (id('c'), Some("a.txt".to_string())),
++                (id('a'), Some("a.txt".to_string()))
++            ]
++        );
++    }
++
++    #[test]
++    fn r_keeps_a_whole_mark_above_the_cursor_and_a_second_r_clears_the_chain() {
++        let (mut a, mut f) = app();
++        press(&mut a, &mut f, ch(' '));
++        press(&mut a, &mut f, ch('j'));
++        press(&mut a, &mut f, ch('j'));
++        press(&mut a, &mut f, ch('l'));
++        press(&mut a, &mut f, ch('R'));
++        assert_eq!(a.focus, Focus::Diff, "R works from the diff pane");
++        assert_eq!(a.marked_count(), 2);
++        press(&mut a, &mut f, ch('R'));
++        assert_eq!(
++            a.marked_count(),
++            1,
++            "the chain is cleared, the newer mark stays"
++        );
++        assert!(a.status.contains("unmarked 1"), "{}", a.status);
++        assert_eq!(a.entries[0].only, None);
++    }
++
++    #[test]
++    fn a_commit_with_several_files_asks_which_one_to_follow() {
++        let (mut a, mut f) = app();
++        f.paths
++            .insert(id('a'), vec!["x.txt".into(), "y.txt".into()]);
++        press(&mut a, &mut f, ch('R'));
++        assert_eq!(a.mode, Mode::Overlay);
++        assert_eq!(a.overlay.as_ref().unwrap().kind, OverlayKind::File);
++        assert_eq!(a.marked_count(), 0);
++        press(&mut a, &mut f, ch('j'));
++        press(&mut a, &mut f, KeyCode::Enter);
++        assert_eq!(a.mode, Mode::Browse);
++        assert_eq!(a.entries[0].only.as_deref(), Some("y.txt"));
++        assert!(a.status.contains("y.txt"), "{}", a.status);
++        // The overlay can be dismissed without marking anything.
++        let (mut b, mut g) = app();
++        g.paths
++            .insert(id('a'), vec!["x.txt".into(), "y.txt".into()]);
++        press(&mut b, &mut g, ch('R'));
++        press(&mut b, &mut g, KeyCode::Esc);
++        assert_eq!(b.mode, Mode::Browse);
++        assert_eq!(b.marked_count(), 0);
++    }
++
++    #[test]
++    fn a_chain_member_that_also_changes_other_files_is_reported() {
++        let (mut a, mut f) = app();
++        f.paths
++            .insert(id('c'), vec!["a.txt".into(), "z.txt".into()]);
++        press(&mut a, &mut f, ch('R'));
++        assert!(
++            a.status.contains("1 also change other files"),
++            "{}",
++            a.status
++        );
++    }
++
++    #[test]
++    fn a_scoped_mark_renders_as_f_and_titles_its_preview_with_the_file() {
++        let (mut a, mut f) = app();
++        press(&mut a, &mut f, ch('R'));
++        assert!(f
++            .diffs
++            .iter()
++            .any(|(c, o)| *c == id('a') && o.as_deref() == Some("a.txt")));
++        let screen = render_text(&mut a, 100, 12);
++        assert!(screen.contains("[f] aaaaaaaa newest"), "{screen}");
++        assert!(screen.contains("[f] cccccccc oldest"), "{screen}");
++        assert!(screen.contains("only: a.txt"), "{screen}");
++        // A plain space mark is whole again, and its preview is not restricted.
++        press(&mut a, &mut f, ch(' '));
++        press(&mut a, &mut f, ch(' '));
++        assert_eq!(a.entries[0].only, None);
++    }
++
++    #[test]
++    fn r_with_no_list_is_harmless() {
++        let mut f = Fake::new();
++        let mut empty = App::new();
++        press(&mut empty, &mut f, ch('R'));
++        assert_eq!(empty.marked_count(), 0);
++    }
++
++    #[test]
++    fn x_restores_the_file_whole_from_the_decision_screen() {
++        let conflict_flow = Ok(Flow::Conflicts(vec![text_conflict("a.txt", TWO_HUNKS)]));
++        let (mut a, mut f) = app();
++        f.flows = vec![conflict_flow, Ok(Flow::Ready("1 file changed".into()))].into();
++        press(&mut a, &mut f, ch('R'));
++        press(&mut a, &mut f, KeyCode::Enter);
++        assert_eq!(a.mode, Mode::Resolve);
++        press(&mut a, &mut f, ch('X'));
++        assert_eq!(f.restored, vec!["a.txt".to_string()]);
++        assert!(matches!(a.mode, Mode::ConfirmApply { .. }));
++        assert!(a.resolver.is_none());
++        let screen = render_text(&mut a, 120, 10);
++        assert!(screen.contains("restored whole: a.txt"), "{screen}");
++        // Starting over clears the note.
++        press(&mut a, &mut f, ch('n'));
++        press(&mut a, &mut f, KeyCode::Enter);
++        assert!(a.restored.is_empty());
++    }
++
++    #[test]
++    fn x_is_refused_for_a_selection_not_made_with_r() {
++        let conflict_flow = Ok(Flow::Conflicts(vec![text_conflict("a.txt", TWO_HUNKS)]));
++        let (mut a, mut f) = app();
++        f.flows = vec![conflict_flow].into();
++        press(&mut a, &mut f, ch(' '));
++        press(&mut a, &mut f, KeyCode::Enter);
++        press(&mut a, &mut f, ch('X'));
++        assert_eq!(a.mode, Mode::Resolve, "stays on the decision screen");
++        assert!(a.status_is_error);
++        assert!(a.status.contains("selection made with R"), "{}", a.status);
++        assert!(f.restored.is_empty());
++    }
++
++    #[test]
+     fn a_clean_selection_asks_for_confirmation_that_only_y_can_give() {
+         let (mut a, mut f) = submit_with(vec![Ok(Flow::Ready("2 files changed".into()))]);
+         assert!(matches!(a.mode, Mode::ConfirmApply { .. }));
+diff -ruN cur/src/main.rs pd3/src/main.rs
+--- cur/src/main.rs	2026-09-25 13:23:05.882954288 +0000
++++ pd3/src/main.rs	2026-09-25 13:54:52.000000000 +0000
+@@ -181,6 +181,7 @@
+ // `-p/--patch-only` writes the patch file and stops.
+ fn parse_cherry(rest: &[String]) -> Res<cherry::Opts> {
+     let mut opts = cherry::Opts {
++        only: None,
+         from: None,
+         hashes: Vec::new(),
+         dry_run: false,
+@@ -191,6 +192,10 @@
+         match arg.as_str() {
+             "-n" | "--dry-run" => opts.dry_run = true,
+             "-p" | "--patch-only" => opts.patch_only = true,
++            "--only" => {
++                let value = it.next().ok_or("expected a path after --only")?;
++                opts.only = Some(value.clone());
++            }
+             "--from" => {
+                 let value = it.next().ok_or("expected a branch after --from")?;
+                 opts.from = Some(value.clone());
+@@ -310,11 +315,15 @@
+                        open it is recorded as one atomic commit (a live watcher is paused
+                        meanwhile), otherwise it is left uncommitted. With no hash, opens an
+                        interactive screen: commits on the left, what each would change on the
+-                       right, space to mark, Tab to choose the branch, Enter to prepare. A
+-                       conflict opens a decision screen: a keeps the tree copy, b takes the picked
+-                       commit's, c keeps both, per conflict hunk. Options: --from <branch>,
+-                       -n/--dry-run (report only), -p/--patch-only (write the patch file, apply
+-                       nothing). With hashes, conflicts are refused. Aliases: pick.
++                       right, space to mark, R to follow one file (marks the commit and every older
++                       commit that changes the same file, each applied for that file only), Tab to
++                       choose the branch, Enter to prepare. A conflict opens a decision screen: a
++                       keeps the tree copy, b takes the picked commit's, c keeps both, per conflict
++                       hunk; X restores the whole file from the newest R-marked commit instead.
++                       Options: --from <branch>, --only <path> (apply each named commit for that
++                       file only), -n/--dry-run (report only), -p/--patch-only (write the patch
++                       file, apply nothing). With hashes, conflicts are refused.
++                       Aliases: pick.
+   stop                 Stop the watcher but keep the base and recorded commits for later finish/resume.
+   abort [--force]      Discard the session: reset the branch to the base and drop the atomic commits.
+   help, --version
+diff -ruN cur/src/patch.rs pd3/src/patch.rs
+--- cur/src/patch.rs	2026-09-25 13:23:06.886954348 +0000
++++ pd3/src/patch.rs	2026-09-25 13:56:14.000000000 +0000
+@@ -304,72 +304,150 @@
+ 
+ static NEXT_INDEX: AtomicUsize = AtomicUsize::new(0);
+ 
+-// Turn a conflicted tree and a full set of decisions into a clean tree. A throwaway index file is
+-// seeded from the conflicted tree, the decided files are written into it, and `write-tree` reads it
+-// back, so the repository's own index and work tree are never involved.
++// A throwaway index file, removed when dropped. Trees are assembled in it with plumbing commands
++// (`GIT_INDEX_FILE` points git at it), so the repository's own index and work tree are never
++// involved.
++struct TempIndex<'a> {
++    root: &'a Path,
++    path: PathBuf,
++}
++
++impl<'a> TempIndex<'a> {
++    fn new(root: &'a Path) -> Res<TempIndex<'a>> {
++        let git_dir = git::git_dir(root)?;
++        let n = NEXT_INDEX.fetch_add(1, Ordering::SeqCst);
++        let path = git_dir.join(format!("gitomic-pick-{}-{n}.idx", std::process::id()));
++        let _ = std::fs::remove_file(&path);
++        Ok(TempIndex { root, path })
++    }
++
++    fn run(&self, args: &[&str]) -> Res<String> {
++        let out = Command::new("git")
++            .arg("-C")
++            .arg(self.root)
++            .args(args)
++            .env("GIT_INDEX_FILE", &self.path)
++            .output()?;
++        if !out.status.success() {
++            let msg = String::from_utf8_lossy(&out.stderr);
++            return Err(format!("git {}: {}", args.join(" "), msg.trim()).into());
++        }
++        Ok(String::from_utf8(out.stdout)?.trim().to_string())
++    }
++
++    // Make `path` in the index match `path` in the commit `source`: the same mode and blob, or
++    // absent when `source` has no such file.
++    fn set_from(&self, source: &str, path: &str) -> Res<()> {
++        let listing = git::run(
++            self.root,
++            &["ls-tree", "-z", "--full-tree", source, "--", path],
++        )?;
++        match listing.split('\t').next().filter(|m| !m.is_empty()) {
++            Some(meta) => {
++                let mut parts = meta.split(' ');
++                let (Some(mode), Some(_), Some(oid)) = (parts.next(), parts.next(), parts.next())
++                else {
++                    return Err(format!("git ls-tree: unexpected output for {path}").into());
++                };
++                self.run(&["update-index", "--add", "--cacheinfo", mode, oid, path])?;
++            }
++            None => {
++                self.run(&["update-index", "--force-remove", "--", path])?;
++            }
++        }
++        Ok(())
++    }
++}
++
++impl Drop for TempIndex<'_> {
++    fn drop(&mut self) {
++        let _ = std::fs::remove_file(&self.path);
++    }
++}
++
++// Turn a conflicted tree and a full set of decisions into a clean tree.
+ fn resolved_tree(root: &Path, tree: &str, files: &[FileConflict]) -> Res<String> {
+-    let git_dir = git::git_dir(root)?;
+-    let n = NEXT_INDEX.fetch_add(1, Ordering::SeqCst);
+-    let index = git_dir.join(format!("gitomic-pick-{}-{n}.idx", std::process::id()));
+-    let _ = std::fs::remove_file(&index);
+-    let result = (|| -> Res<String> {
+-        let run = |args: &[&str]| -> Res<String> {
+-            let out = Command::new("git")
+-                .arg("-C")
+-                .arg(root)
+-                .args(args)
+-                .env("GIT_INDEX_FILE", &index)
+-                .output()?;
+-            if !out.status.success() {
+-                let msg = String::from_utf8_lossy(&out.stderr);
+-                return Err(format!("git {}: {}", args.join(" "), msg.trim()).into());
++    let idx = TempIndex::new(root)?;
++    idx.run(&["read-tree", tree])?;
++    for file in files {
++        match &file.body {
++            Body::Hunks(segs) => {
++                let bytes = conflict::render(segs)
++                    .ok_or_else(|| format!("{}: a hunk is still undecided", file.path))?;
++                let oid = git::hash_object_write(root, &bytes)?;
++                let args = [
++                    "update-index",
++                    "--add",
++                    "--cacheinfo",
++                    &file.mode,
++                    &oid,
++                    &file.path,
++                ];
++                idx.run(&args)?;
+             }
+-            Ok(String::from_utf8(out.stdout)?.trim().to_string())
+-        };
+-        run(&["read-tree", tree])?;
+-        for file in files {
+-            match &file.body {
+-                Body::Hunks(segs) => {
+-                    let bytes = conflict::render(segs)
+-                        .ok_or_else(|| format!("{}: a hunk is still undecided", file.path))?;
+-                    let oid = git::hash_object_write(root, &bytes)?;
+-                    run(&[
+-                        "update-index",
+-                        "--add",
+-                        "--cacheinfo",
+-                        &file.mode,
+-                        &oid,
+-                        &file.path,
+-                    ])?;
+-                }
+-                Body::Whole {
+-                    ours,
+-                    theirs,
+-                    choice,
+-                } => {
+-                    let picked = match choice {
+-                        Some(Side::A) => ours,
+-                        Some(Side::B) => theirs,
+-                        _ => return Err(format!("{}: not decided", file.path).into()),
+-                    };
+-                    match picked {
+-                        Some(b) => run(&[
++            Body::Whole {
++                ours,
++                theirs,
++                choice,
++            } => {
++                let picked = match choice {
++                    Some(Side::A) => ours,
++                    Some(Side::B) => theirs,
++                    _ => return Err(format!("{}: not decided", file.path).into()),
++                };
++                match picked {
++                    Some(b) => {
++                        let args = [
+                             "update-index",
+                             "--add",
+                             "--cacheinfo",
+                             &b.mode,
+                             &b.oid,
+                             &file.path,
+-                        ])?,
+-                        None => run(&["update-index", "--force-remove", "--", &file.path])?,
+-                    };
++                        ];
++                        idx.run(&args)?;
++                    }
++                    None => {
++                        idx.run(&["update-index", "--force-remove", "--", &file.path])?;
++                    }
+                 }
+             }
+         }
+-        run(&["write-tree"])
+-    })();
+-    let _ = std::fs::remove_file(&index);
+-    result
++    }
++    idx.run(&["write-tree"])
++}
++
++// A commit carrying only `path`'s part of `pick`'s change: its parent is `pick`'s parent, and its
++// tree is that parent's tree with `path` set to what it is in `pick` (or removed, if `pick` deleted
++// it). Replaying it applies the one file's change and leaves every other file of a multi-file
++// commit out. Merge and root commits have no single parent to diff against and are refused.
++pub fn scoped_commit(root: &Path, pick: &str, path: &str) -> Res<String> {
++    if path.contains('\n') {
++        return Err(
++            format!("cannot restrict a pick to a path containing a newline: {path:?}").into(),
++        );
++    }
++    let parents = git::run(root, &["show", "-s", "--format=%P", pick])?;
++    let parent = match parents.split_whitespace().collect::<Vec<_>>()[..] {
++        [p] => p.to_string(),
++        [] => return Err(format!("{pick} is a root commit").into()),
++        _ => return Err(format!("{pick} is a merge commit").into()),
++    };
++    let idx = TempIndex::new(root)?;
++    idx.run(&["read-tree", &parent])?;
++    idx.set_from(pick, path)?;
++    let tree = idx.run(&["write-tree"])?;
++    let message = git::commit_message(root, pick)?;
++    let (name, email, date) = git::author_of(root, pick)?;
++    git::commit_tree(root, &tree, &parent, &message, &name, &email, &date)
++}
++
++// The tree of the commit `onto` with `path` replaced by its content in the commit `source`.
++fn restored_tree(root: &Path, onto: &str, source: &str, path: &str) -> Res<String> {
++    let idx = TempIndex::new(root)?;
++    idx.run(&["read-tree", onto])?;
++    idx.set_from(source, path)?;
++    idx.run(&["write-tree"])
+ }
+ 
+ // Progress of a replay: what remains to be merged and the running result.
+@@ -383,6 +461,11 @@
+     done: usize,
+     pending_tree: Option<String>,
+     decided: Vec<(String, Side)>,
++    // (pick id, path): the pick is replayed restricted to that path.
++    only: Vec<(String, String)>,
++    // (commit, path): after the picks, `path` is set to its content in `commit`.
++    restores: Vec<(String, String)>,
++    restored: usize,
+ }
+ 
+ // Where a replay stopped.
+@@ -405,36 +488,65 @@
+             done: 0,
+             pending_tree: None,
+             decided: decided.to_vec(),
++            only: Vec::new(),
++            restores: Vec::new(),
++            restored: 0,
+         }
+     }
+ 
++    // Restrict the listed picks to one path each, and add whole-file restores that run after the
++    // picks. See `Spec::only` and `Spec::restore`.
++    pub fn with_scopes(mut self, only: &[(String, String)], restores: &[(String, String)]) -> Job {
++        self.only = only.to_vec();
++        self.restores = restores.to_vec();
++        self
++    }
++
+     // Merge picks until one needs a decision or all are merged. A conflict whose every unit already
+     // has a remembered decision is resolved without stopping.
+     pub fn advance(&mut self) -> Res<Step> {
+         loop {
+-            if self.done == self.picks.len() {
+-                return Ok(Step::Done);
+-            }
+-            let pick = self.picks[self.done].clone();
+-            match merge(&self.root, &self.tip, &pick)? {
+-                Merged::Clean(tree) => self.take(&tree)?,
+-                Merged::Unsupported(list) => return Ok(Step::Unsupported(list)),
+-                Merged::Conflicted { tree, mut files } => {
+-                    for f in &mut files {
+-                        f.apply_saved(&self.decided);
++            if self.done < self.picks.len() {
++                let pick = self.effective(&self.picks[self.done])?;
++                match merge(&self.root, &self.tip, &pick)? {
++                    Merged::Clean(tree) => {
++                        self.take(&tree)?;
++                        self.done += 1;
+                     }
+-                    if files.iter().all(|f| f.unresolved() == 0) {
+-                        let clean = resolved_tree(&self.root, &tree, &files)?;
+-                        self.take(&clean)?;
+-                    } else {
+-                        self.pending_tree = Some(tree);
+-                        return Ok(Step::Conflicts(files));
++                    Merged::Unsupported(list) => return Ok(Step::Unsupported(list)),
++                    Merged::Conflicted { tree, mut files } => {
++                        for f in &mut files {
++                            f.apply_saved(&self.decided);
++                        }
++                        if files.iter().all(|f| f.unresolved() == 0) {
++                            let clean = resolved_tree(&self.root, &tree, &files)?;
++                            self.take(&clean)?;
++                            self.done += 1;
++                        } else {
++                            self.pending_tree = Some(tree);
++                            return Ok(Step::Conflicts(files));
++                        }
+                     }
+                 }
++            } else if self.restored < self.restores.len() {
++                let (source, path) = self.restores[self.restored].clone();
++                let tree = restored_tree(&self.root, &self.tip, &source, &path)?;
++                self.take(&tree)?;
++                self.restored += 1;
++            } else {
++                return Ok(Step::Done);
+             }
+         }
+     }
+ 
++    // The commit to merge for a pick: the pick itself, or its restricted form when scoped.
++    fn effective(&self, id: &str) -> Res<String> {
++        match self.only.iter().find(|(k, _)| k == id) {
++            Some((_, path)) => scoped_commit(&self.root, id, path),
++            None => Ok(id.to_string()),
++        }
++    }
++
+     // Supply the decisions for the conflict `advance` reported, then continue with `advance`.
+     pub fn resolve(&mut self, files: &[FileConflict]) -> Res<()> {
+         let tree = self
+@@ -455,10 +567,12 @@
+                 }
+             }
+         }
+-        self.take(&clean)
++        self.take(&clean)?;
++        self.done += 1;
++        Ok(())
+     }
+ 
+-    // Adopt `tree` as the result of the pick being merged.
++    // Adopt `tree` as the running result.
+     fn take(&mut self, tree: &str) -> Res<()> {
+         self.tip = git::commit_tree(
+             &self.root,
+@@ -469,11 +583,15 @@
+             "gitomic@localhost",
+             "1970-01-01T00:00:00+00:00",
+         )?;
+-        self.done += 1;
+         Ok(())
+     }
+ 
+     // Every decision known to this job, taken now or seeded, for recording in a patch header.
++    // The pick whose merge the replay stopped at, while there is one.
++    pub fn current(&self) -> Option<&str> {
++        self.picks.get(self.done).map(String::as_str)
++    }
++
+     pub fn decisions(&self) -> &[(String, Side)] {
+         &self.decided
+     }
+@@ -513,6 +631,8 @@
+                 base: self.base.clone(),
+                 picks: subjects.to_vec(),
+                 decisions: self.decided.clone(),
++                only: self.only.clone(),
++                restore: self.restores.clone(),
+             },
+             body,
+             paths,
+@@ -535,7 +655,7 @@
+ }
+ 
+ // What a patch was built from; enough to build it again.
+-#[derive(Clone, Debug, PartialEq)]
++#[derive(Clone, Debug, Default, PartialEq)]
+ pub struct Spec {
+     // The commit the patch applies to.
+     pub base: String,
+@@ -543,6 +663,12 @@
+     pub picks: Vec<(String, String)>,
+     // (fingerprint, side) of every conflict decision.
+     pub decisions: Vec<(String, Side)>,
++    // (pick id, path): that pick contributes only its change to that path. This is how a multi-file
++    // commit is applied for one file.
++    pub only: Vec<(String, String)>,
++    // (commit, path): after the picks, the file is set to its exact content in that commit, or
++    // removed if the commit lacks it. A whole-file alternative to replaying a conflicting history.
++    pub restore: Vec<(String, String)>,
+ }
+ 
+ const HEADER_TAG: &str = "# gitomic-patch 1";
+@@ -560,6 +686,12 @@
+             let subject = subject.replace(['\n', '\r'], " ");
+             out.push_str(&format!("# pick {id} {subject}\n"));
+         }
++        for (id, path) in &self.only {
++            out.push_str(&format!("# only {id} {path}\n"));
++        }
++        for (id, path) in &self.restore {
++            out.push_str(&format!("# restore {id} {path}\n"));
++        }
+         for (fp, side) in &self.decisions {
+             out.push_str(&format!("# decision {fp} {}\n", side.letter()));
+         }
+@@ -580,6 +712,8 @@
+         let mut base = None;
+         let mut picks = Vec::new();
+         let mut decisions = Vec::new();
++        let mut only = Vec::new();
++        let mut restore = Vec::new();
+         for line in lines {
+             let Some(rest) = line.strip_prefix("# ") else {
+                 break;
+@@ -589,6 +723,12 @@
+             } else if let Some(p) = rest.strip_prefix("pick ") {
+                 let (id, subject) = p.split_once(' ').unwrap_or((p, ""));
+                 picks.push((id.to_string(), subject.to_string()));
++            } else if let Some(o) = rest.strip_prefix("only ") {
++                let (id, path) = o.split_once(' ')?;
++                only.push((id.to_string(), path.to_string()));
++            } else if let Some(r) = rest.strip_prefix("restore ") {
++                let (id, path) = r.split_once(' ')?;
++                restore.push((id.to_string(), path.to_string()));
+             } else if let Some(d) = rest.strip_prefix("decision ") {
+                 let (fp, side) = d.split_once(' ')?;
+                 let side = Side::from_letter(side.trim().chars().next()?)?;
+@@ -599,6 +739,8 @@
+             base: base?,
+             picks,
+             decisions,
++            only,
++            restore,
+         })
+     }
+ }
+@@ -637,7 +779,8 @@
+ 
+ // Replay `spec` against its own base. Decisions in the spec are reused where their conflicts recur.
+ pub fn build(root: &Path, spec: &Spec) -> Res<Built> {
+-    let mut job = Job::new(root, &spec.base, &spec.ids(), &spec.decisions);
++    let mut job = Job::new(root, &spec.base, &spec.ids(), &spec.decisions)
++        .with_scopes(&spec.only, &spec.restore);
+     match job.advance()? {
+         Step::Done => Ok(Built::Ready(Box::new(job.patch(&spec.picks)?))),
+         Step::Conflicts(files) => Ok(Built::Conflicts(files)),
+@@ -996,4 +1139,112 @@
+             .count();
+         assert_eq!(leftovers, 0);
+     }
++
++    // main: f.txt untouched. feat: one commit changes f.txt, o.txt (edited) and d.txt (deleted).
++    fn multi(r: &Repo) -> String {
++        r.write("f.txt", &Repo::lines());
++        r.write("o.txt", "o\n");
++        r.write("d.txt", "d\n");
++        r.git(&["add", "."]);
++        r.git(&["commit", "-q", "-m", "base"]);
++        r.git(&["checkout", "-q", "-b", "feat"]);
++        r.write("f.txt", &Repo::lines_with(&[(2, "F2")]));
++        r.write("o.txt", "o2\n");
++        r.git(&["rm", "-q", "d.txt"]);
++        r.git(&["add", "."]);
++        r.git(&["commit", "-q", "-m", "three files"]);
++        let id = r.head();
++        r.git(&["checkout", "-q", "main"]);
++        id
++    }
++
++    #[test]
++    fn a_scoped_commit_carries_one_files_part_of_a_multi_file_commit() {
++        let r = Repo::new();
++        let pick = multi(&r);
++        let parent = r.git(&["rev-parse", &format!("{pick}^")]);
++
++        let only_f = scoped_commit(&r.0, &pick, "f.txt").unwrap();
++        assert_eq!(r.git(&["rev-parse", &format!("{only_f}^")]), parent);
++        let names = r.git(&["diff", "--name-only", &parent, &only_f]);
++        assert_eq!(names, "f.txt");
++        assert_eq!(r.git(&["log", "-1", "--format=%s", &only_f]), "three files");
++
++        // A deletion is carried as a deletion.
++        let only_d = scoped_commit(&r.0, &pick, "d.txt").unwrap();
++        assert_eq!(
++            r.git(&["diff", "--name-status", &parent, &only_d]),
++            "D\td.txt"
++        );
++    }
++
++    #[test]
++    fn scoped_commits_refuse_root_merge_and_newline_paths() {
++        let r = Repo::new();
++        let root = r.commit_file("a.txt", "a\n", "root");
++        assert!(scoped_commit(&r.0, &root, "a.txt").is_err());
++        assert!(scoped_commit(&r.0, &root, "a\nb").is_err());
++    }
++
++    #[test]
++    fn a_replay_restricted_to_one_file_leaves_the_others_out() {
++        let r = Repo::new();
++        let pick = multi(&r);
++        let mut job = Job::new(&r.0, &r.head(), std::slice::from_ref(&pick), &[])
++            .with_scopes(&[(pick.clone(), "o.txt".to_string())], &[]);
++        assert!(matches!(job.advance().unwrap(), Step::Done));
++        let patch = job.patch(&[]).unwrap();
++        assert_eq!(patch.paths, vec!["o.txt".to_string()]);
++    }
++
++    #[test]
++    fn a_restore_sets_the_file_to_its_content_at_the_source_or_removes_it() {
++        let r = Repo::new();
++        let pick = multi(&r);
++        // Restore f.txt to the branch's copy; d.txt does not exist in the source, so it is removed.
++        let mut job = Job::new(&r.0, &r.head(), &[], &[]).with_scopes(
++            &[],
++            &[
++                (pick.clone(), "f.txt".to_string()),
++                (pick.clone(), "d.txt".to_string()),
++            ],
++        );
++        assert!(matches!(job.advance().unwrap(), Step::Done));
++        let patch = job.patch(&[]).unwrap();
++        let mut paths = patch.paths.clone();
++        paths.sort();
++        assert_eq!(paths, vec!["d.txt".to_string(), "f.txt".to_string()]);
++        assert_eq!(applied(&r, &job, "f.txt"), Repo::lines_with(&[(2, "F2")]));
++        assert!(!r.exists("d.txt"));
++    }
++
++    #[test]
++    fn only_and_restore_survive_the_header_round_trip_and_a_rebuild() {
++        let r = Repo::new();
++        let pick = multi(&r);
++        let spec = Spec {
++            base: r.head(),
++            picks: vec![(pick.clone(), "three files".to_string())],
++            only: vec![(pick.clone(), "o.txt".to_string())],
++            restore: vec![(pick.clone(), "f.txt".to_string())],
++            ..Spec::default()
++        };
++        let Built::Ready(patch) = build(&r.0, &spec).unwrap() else {
++            panic!("expected a clean build");
++        };
++        let parsed = Spec::parse(&patch.bytes()).unwrap();
++        assert_eq!(parsed.only, spec.only);
++        assert_eq!(parsed.restore, spec.restore);
++
++        // HEAD moves; the rebuilt patch keeps the scoping.
++        r.commit_file("c.txt", "c\n", "add c");
++        let Built::Ready(again) = rebuild(&r.0, &parsed, &r.head()).unwrap() else {
++            panic!("expected a clean rebuild");
++        };
++        assert_eq!(again.spec.only, spec.only);
++        assert_eq!(again.spec.restore, spec.restore);
++        let mut paths = again.paths.clone();
++        paths.sort();
++        assert_eq!(paths, vec!["f.txt".to_string(), "o.txt".to_string()]);
++    }
+ }

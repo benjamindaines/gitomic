@@ -1,0 +1,4202 @@
+diff --git a/README.md b/README.md
+index ea4bdb6..83bb6e7 100644
+--- a/README.md
++++ b/README.md
+@@ -38,6 +38,7 @@ gitomic finish               # same, but open $GIT_EDITOR for the message
+ gitomic stop                 # stop watching, keep the base and commits for later finish/resume
+ gitomic abort --force        # discard the session: reset the branch to the base
+ gitomic drop <hash>...       # delete individual unpublished commits (alias: rm)
++gitomic cherry-pick [<hash>...]  # bring commits from another branch, via a patch file (alias: pick)
+ ```
+ 
+ Running `init` again when a base already exists but no watcher is live **resumes** that session rather than
+@@ -108,6 +109,52 @@ commits are shown in red with `[x]`.
+ - `-n/--dry-run` applies to the picker as well: the confirmation is shown, then nothing is modified.
+ - Needs a terminal on stdin and stdout; otherwise the command stops with an error rather than waiting.
+ 
++### cherry-pick
++
++`gitomic cherry-pick` brings commits from another branch onto the checked-out one. The chosen commits are
++replayed onto the current `HEAD` in the object database, the result is written as a patch file, and the patch
++is applied to the work tree. History is not rewritten, so the operation is safe with unpushed commits and with
++a live session.
++
++- **Without a session** the change is left in the work tree, uncommitted (the effect of `git cherry-pick -n`).
++- **With a session** (live or stopped) it is recorded as one atomic commit with the usual empty placeholder
++  message, which `finish` stamps like any other step. Only the patch's own paths are committed; other staged
++  changes stay out. A live watcher is stopped for the duration, as for `drop`, and restarted afterwards.
++- **`HEAD` moved after the selection** (the watcher committed, or a commit was made by hand): the patch is
++  recomputed against the new `HEAD` before it is applied, reusing every conflict decision whose conflict
++  recurs unchanged. A conflict that was not decided stops the operation before anything is modified.
++- **Local edits**: the patch is checked against the work tree first. An uncommitted edit that overlaps a file
++  the patch touches refuses the pick with nothing modified.
++- **Patch files** are kept in `.git/gitomic-picks/`. Each starts with a `# gitomic-patch 1` header naming its
++  base, its source commits and the conflict decisions taken; `git apply` ignores it, and it is what allows the
++  patch to be recomputed against another base. A pick is undone with `git apply -R <patch file>` (or
++  `gitomic drop` once recorded).
++- Merge commits are not offered, and commits whose change `HEAD` already holds under another id are hidden.
++- Options: `--from <branch>` lists that branch first; `-n/--dry-run` reports the patch and applies nothing;
++  `-p/--patch-only` writes the patch file and stops. With commits named on the command line (replayed in the
++  order given) no terminal is needed, and any conflict is refused.
++
++#### Interactive screen
++
++`gitomic cherry-pick` with no commit opens the same two-pane screen as the `drop` picker, with the same
++vim-style keys, `space` to mark and the same rule that only `y`/`n` answer a prompt. What differs:
++
++- `Tab` opens an overlay listing the other local and remote-tracking branches, most recently updated first.
++  `j`/`k` move, `Enter` uses the branch (marks are cleared), `Esc` closes it. Without `--from` the overlay is
++  the first thing shown.
++- The right pane shows what each commit would change relative to the `HEAD` that was current when the screen
++  opened, not the commit's own diff. A commit that would conflict is announced above its diff.
++- `Enter` on the list replays the marked commits, oldest first. A clean result goes straight to the `y`/`n`
++  prompt, which names the number of commits and the size of the change.
++- **Conflicts** open a decision screen: the conflicted files on the left, one entry per conflict hunk, and the
++  hunk on the right with a few lines of context and both sides one above the other. `a` keeps the tree copy,
++  `b` takes the picked commit's version, `c` keeps both (tree copy first), `u` undoes, `j`/`k` move between
++  conflicts and `Enter` continues once every one is decided. A file that cannot be split into hunks (binary
++  content, or one side deleted the file) is decided as a whole with `a`/`b`. A later commit in the selection
++  that conflicts opens the screen again.
++- Conflicts with no A/B meaning (a file renamed differently on both sides, a file/directory clash) are
++  reported and the selection is refused; `git cherry-pick` handles those.
++
+ ## Configuration
+ 
+ `${XDG_CONFIG_HOME:-~/.config}/gitomic/gitomic.cfg`, a flat `key = value` file. Every key has a compiled-in
+diff --git a/_Claude/ref_forgejo_issue#13/RECEIPT_issue13_cherry-pick.md b/_Claude/ref_forgejo_issue#13/RECEIPT_issue13_cherry-pick.md
+new file mode 100644
+index 0000000..d35df47
+--- /dev/null
++++ b/_Claude/ref_forgejo_issue#13/RECEIPT_issue13_cherry-pick.md
+@@ -0,0 +1,153 @@
++# Receipt — issue #13: `gitomic cherry-pick` with the picker UI and in-screen conflict resolution
++
++## Context
++
++Issue #13 asks for the `drop` picker's interface to exist for cherry-picking: same layout and vim keys, Tab
++to choose the source branch, multi-select, a diff pane computed against the HEAD current when the screen
++opened, application through a patch file, a patch that can be recomputed when HEAD has moved, and conflict
++resolution that opens at the conflict and is settled with A or B per hunk. The issue also asks whether a pick
++can work cleanly inside a live session, and to flag (and skip) anything needing a stronger model. Built on the
++`exitScopeFullSpeed` branch tip; not merged and not committed to the tree.
++
++## Answers to the questions in the issue
++
++- **Live session pick: clean, so implemented.** The operation never rewrites history. The patch is computed
++  against HEAD (unpushed commits included) and applied to the work tree; HEAD only moves forward through
++  gitomic's own capture. Uncommitted work and unpushed commits therefore need no special handling, and
++  refusing until everything is committed and pushed is unnecessary. The one real hazard, HEAD moving while
++  the screen is open, is handled by recomputing the patch (below).
++- **Model recommendation:** nothing requested was skipped for capability reasons. Items that were left out,
++  with a recommendation for each, are under "Not done".
++- **Diffuse / external source:** not needed. Per-hunk A/B/both is a small module of its own
++  (`src/conflict.rs`); nothing was pulled in and `Cargo.toml` and `Cargo.lock` are unchanged.
++
++## Design decisions
++
++- **Pipeline.** Chosen commits are replayed oldest first onto HEAD with
++  `git merge-tree --write-tree` (merge base `<commit>^`), entirely in the object database; the patch is
++  `git diff --binary --full-index --no-renames <HEAD> <result>`; it is written to `.git/gitomic-picks/` and
++  applied with `git apply` (work tree only, index untouched) after a `git apply --check`. Merge inputs must be
++  commits, so each intermediate result is wrapped in an unreferenced scratch commit (collected at gc).
++- **Outcome by situation.** No session on the branch: change left in the work tree, uncommitted (as
++  `git cherry-pick -n`). Session present (live or stopped): recorded as one atomic commit with the empty
++  placeholder message, restricted to the patch's own paths (`commit --only`), so other staged changes stay out
++  and `finish` stamps it like any other step. A live watcher is stopped, its final capture flushed, and then
++  restarted, using the same helpers as `drop`.
++- **One patch, one atomic commit** for a multi-commit selection. Per-commit granularity inside a session would
++  need one apply/commit per pick; the intermediate trees already exist, so it is a contained follow-up.
++- **Diff pane reading.** "Diff between the current HEAD established when the UI opened" is implemented as:
++  what applying the highlighted commit to that HEAD would change (`git diff <HEAD> <merge result>`), not the
++  commit's own diff. A conflicting commit is announced above its diff; the conflicted files show their markers.
++  Each preview is for the commit alone. A commit that depends on an earlier one in the selection therefore
++  previews as conflicting yet replays cleanly in sequence.
++- **Rebuild on HEAD movement.** After the watcher is quiet, HEAD is compared with the base the selection was
++  made against. If they differ the patch is rebuilt on the new HEAD (`patch::rebuild`). Each conflict decision
++  is keyed by a fingerprint of (path, tree side, picked side); a conflict that recurs identically reuses its
++  decision, a changed one is undecided, and an undecided conflict stops the operation before anything is
++  modified (nothing written, nothing applied).
++- **Patch header.** Each patch file begins with `# gitomic-patch 1`, `# base`, `# pick` and `# decision`
++  lines. `git apply` skips text ahead of the first `diff --git` line (checked by test). `Spec::parse` reads the
++  header back, so re-basing an existing patch file is a thin command over existing functions.
++- **Patch code separated.** `src/patch.rs` has no terminal or session dependency: `Job` (replay with pause at a
++  conflict), `Spec` (recipe and header), `build`, `rebuild`, `write`, `check`, `apply`. This is the piece to
++  promote to a stand-alone patch re-write command.
++- **Conflict decisions.** A text conflict is split into hunks (`conflict::parse`) and decided per hunk:
++  `a` tree copy, `b` picked commit, `c` both (tree copy first), `u` undo. The resolved file is written into a
++  throwaway index (`GIT_INDEX_FILE`), never the repository's own; the result tree is `write-tree`. Files that
++  cannot be split (binary, unparseable markers, a modify/delete) are decided whole with `a`/`b`.
++  `merge.conflictStyle` is pinned to `merge` for these calls so a user's `diff3`/`zdiff3` setting cannot change
++  the marker layout; a diff3 base section is still tolerated by the parser.
++- **Unsupported conflicts refused, not guessed.** Anything other than contents, binary, modify/delete and
++  add/add (renames on both sides, file/directory clashes, distinct types) is reported with git's message and the
++  selection is refused before anything is modified.
++- **Screen.** A new module, `src/cherry_ui.rs`, reuses `style_diff`, `DiffView`, `H_STEP`, `RUN_WINDOW` and a
++  terminal-setup helper from `pick.rs` (visibility changes plus one extraction), so both screens share diff
++  styling, the held-`h` rule, kitty-protocol handling and raw-mode cleanup. Keys match the drop picker. Added:
++  `Tab` (branch overlay, from either pane), the decision screen, and `Enter` meaning "prepare" rather than
++  "drop". Switching branch clears the marks, since they belong to the previous list. Only `y`/`n` answer a
++  prompt, as before. After a decision the cursor moves to the next undecided hunk.
++- **Candidates.** `git log --cherry-pick --right-only --no-merges HEAD...<branch>`: commits HEAD lacks, newest
++  first, merges excluded (replay needs a chosen parent), changes already present under another id hidden. The
++  list is capped at 500 and the title says so.
++- **Command line.** `gitomic cherry-pick [--from <branch>] [-n] [-p] [<hash>...]` (alias `pick`). With hashes no
++  terminal is needed, commits replay in the order given, contained/merge/root commits are refused, and any
++  conflict is refused with the files named.
++- **Bug found by testing.** For a binary conflict git reports the type `CONFLICT (binary)` alongside
++  `CONFLICT (contents)`; the first version treated it as unsupported. It is now accepted and decided whole.
++
++## Changes
++
++New files:
++
++- `src/conflict.rs` (333 lines): marker parser and renderer, `Side`, `Hunk`, `Segment`, fingerprint. 11 tests.
++- `src/patch.rs` (999 lines): merge, conflict extraction from `merge-tree -z` output, resolved-tree
++  construction, `Job`, `Spec`/header, `build`/`rebuild`, patch file write/check/apply. 12 tests.
++- `src/cherry.rs` (633 lines): branches, candidates, preview, command entry, session/watcher handling, apply.
++  15 tests against real repositories.
++- `src/cherry_ui.rs` (1589 lines): `Source` trait and git-backed source, `App` state machine, overlay, decision
++  screen, rendering, event loop. 25 tests (fake source, `TestBackend`).
++- `src/testrepo.rs` (81 lines, test builds only): throwaway repository helper.
++
++Modified files (line numbers are in the delivered versions):
++
++- `src/main.rs`: `mod cherry; mod cherry_ui; mod conflict; mod patch;` and `#[cfg(test)] mod testrepo;` (lines
++  14-24); dispatch arm `"cherry-pick" | "pick"` (line 107); `parse_cherry` (lines 178-208); usage entry
++  (lines 306-317).
++- `src/git.rs`: appended at the end (lines 397-488): `cat_blob`, `hash_object_write`, `commit_only`. Nothing
++  existing changed.
++- `src/pick.rs`: `H_STEP`, `RUN_WINDOW`, `DiffView` (and its two fields) and `style_diff` made `pub(crate)`
++  (lines 44, 47, 124-126, 516); `with_terminal` extracted (lines 566-584) and `run` now calls it
++  (line 603) in place of the twelve inline lines it replaces (584-595 originally). Behaviour of `drop` unchanged.
++- `src/commands.rs`: `live_watcher`, `terminate_watcher`, `report_flush`, `short` made `pub(crate)` (lines 24,
++  801, 842, 889). No logic changed.
++- `README.md`: `cherry-pick` in the usage list and a `### cherry-pick` section with the key description.
++
++## Intended outcome
++
++`gitomic cherry-pick`, Tab to a branch, `j`/`k` and `space` to mark commits, `Enter`; conflicts are settled a
++hunk at a time with `a`/`b`; `y` applies the patch. In a session the result is one recorded step; outside one it
++is an uncommitted change with a patch file to undo it. Nothing is modified unless `y` is pressed, and any
++refusal (local edits in the way, unsupported conflict, undecided conflict after HEAD moved) leaves the tree as
++it was.
++
++## Verification
++
++- `cargo test`: 119 passed (56 existing, all unchanged and passing; 63 new). `cargo fmt --check` clean. All
++  added lines are at most 100 columns. `cargo clippy --all-targets`: only lints of the kind already tolerated;
++  no deprecated API used.
++- New tests cover: parser and renderer (diff3 base, CRLF, empty side, longer markers, malformed input);
++  per-hunk decisions, keeping both, undecided hunk blocking, modify/delete both ways, binary conflict,
++  rename/rename reported unsupported, sequential picks, decision reuse on rebuild and its non-reuse when the
++  conflict changed, header round trip with `git apply`, and that building leaves the index, work tree and
++  `.git` untouched; uncommitted result without a session, several commits in order, refusal on conflict with
++  nothing changed, dry-run and patch-only, one atomic commit in a session with an unrelated staged file
++  excluded, local edit blocking, contained/merge/root/unknown refusals, in-progress cherry-pick refusal,
++  already-present change, HEAD moving after selection, candidate filtering and order, branch list, preview;
++  the screen: overlay, source switching, marking order, prompts ignoring Enter/space, cancel keeping marks,
++  decision navigation/undo/both, whole-file "no both", chained conflicts, quit rules, rendering of every
++  screen and tiny terminals.
++- Real terminal (release binary in a pseudo-terminal, screen read with `pyte`), live session with a running
++  watcher, two hunks conflicting on the same lines, plus a clean commit: overlay opens first without `--from`;
++  Enter loads the branch; the preview flags the conflict; Tab reopens the overlay and Esc keeps the marks;
++  Enter is refused while undecided; `b` then `a` decided the hunks; Enter, space and `j` were ignored at the
++  prompt; `y` produced exactly one new commit with an empty message touching `b.txt` and `f.txt`, `f.txt`
++  holding the chosen sides, the watcher stopped and restarted (pid changed, `status` showing 1 pending), no
++  stray changes in `git status`. Second run: the watcher committed an unrelated file while the confirmation
++  was open; after `y` the "HEAD moved ... recomputing" notice was printed, the pick applied and was recorded,
++  both commits present, watcher alive.
++
++## Not done / follow-ups
++
++- **Editing inside a hunk** (neither side, or a mix). Cheapest route is handing the single file to `$EDITOR`
++  from the decision screen: Sonnet, medium. An in-screen text editor is a different size of job: Opus, high.
++- **Renames on both sides and file/directory clashes** are refused, not resolved. Presenting them needs a
++  model of paths that move between sides: Opus, high.
++- **Stand-alone patch re-write command** (`gitomic patch rebase <file>`). The pieces exist (`Spec::parse`,
++  `patch::rebuild`, `write`, `check`, `apply`); the command, its interaction with a live session and the
++  question of editing a patch file by hand are left for a session of their own: Sonnet, medium.
++- **Per-commit granularity in a session** (one atomic commit per picked commit): Sonnet, low.
++- The preview is per commit, so an early conflict that a chosen earlier commit would resolve is still flagged
++  there; the replay is authoritative.
++- A restarted watcher still does not inherit `-v/--verbose` (from part 1 of #12).
++- Delivered as a zip and patch on the issue thread; the patch excludes nothing (`Cargo.toml` and `Cargo.lock`
++  are unchanged).
+diff --git a/src/cherry.rs b/src/cherry.rs
+new file mode 100644
+index 0000000..4618250
+--- /dev/null
++++ b/src/cherry.rs
+@@ -0,0 +1,633 @@
++// `gitomic cherry-pick` (issue #13): bring commits from another branch onto the checked-out branch
++// by way of a patch file.
++//
++// The chosen commits are replayed onto the current HEAD in the object database (see patch.rs), the
++// result is written as a patch file, and that file is applied to the work tree. History is never
++// rewritten, which is what keeps the operation compatible with a live session and with commits that
++// are not yet pushed: HEAD only ever moves forward, and only through gitomic's own capture.
++//
++// Outcome by situation:
++//   - No session on the branch: the change is left in the work tree, uncommitted (the effect of
++//     `git cherry-pick -n`). `gitomic init` afterwards, or an ordinary commit, records it.
++//   - A session (live or stopped): the change is recorded as one atomic commit with the usual empty
++//     placeholder message, so it is stamped by `finish` like any other step. A live watcher is
++// stopped
++//     for the duration, exactly as `drop` does, and restarted afterwards.
++//
++// If HEAD moved between choosing the commits and applying them (the watcher committing in the
++// meantime, or a commit made by hand), the patch is recomputed against the new HEAD with the
++// decisions already taken; a conflict that has not been decided stops the operation before anything
++// is changed.
++//
++// Interactive use is `gitomic cherry-pick` with no commit (cherry_ui.rs). With commits named, the
++// same pipeline runs without a terminal and refuses any conflict.
++
++use std::path::Path;
++
++use crate::commands::{live_watcher, report_flush, short, terminate_watcher};
++use crate::config::Config;
++use crate::patch::{self, Built, Merged, Spec};
++use crate::{commands, git, Res};
++
++// Cap on the commits offered from one branch, so a branch with a long history does not make the
++// listing slow. The picker states when the cap was reached.
++pub const MAX_CANDIDATES: usize = 500;
++
++pub struct Opts {
++    pub from: Option<String>,
++    pub hashes: Vec<String>,
++    pub dry_run: bool,
++    pub patch_only: bool,
++}
++
++// Branches a commit can be picked from: local branches, then remote-tracking ones, most recently
++// updated first, without the checked-out branch and without remote HEAD aliases.
++pub fn branches(cwd: &Path) -> Res<Vec<String>> {
++    let root = git::work_tree(cwd)?;
++    let current = git::current_branch(&root).ok();
++    let mut out = Vec::new();
++    for (prefix, strip) in [("refs/heads", 2), ("refs/remotes", 2)] {
++        let list = git::run(
++            &root,
++            &[
++                "for-each-ref",
++                "--sort=-committerdate",
++                &format!("--format=%(refname:lstrip={strip})"),
++                prefix,
++            ],
++        )?;
++        for name in list.lines().filter(|l| !l.is_empty()) {
++            if name.ends_with("/HEAD") || Some(name) == current.as_deref() {
++                continue;
++            }
++            out.push(name.to_string());
++        }
++    }
++    Ok(out)
++}
++
++// Commits on `source` that HEAD lacks, newest first, as (full id, subject). Merge commits are left
++// out, since replaying one needs a chosen parent, and so are commits whose change HEAD already
++// holds under another id (`--cherry-pick`), which is what a repeated pick would otherwise offer
++// again.
++pub fn candidates(cwd: &Path, source: &str) -> Res<Vec<(String, String)>> {
++    let root = git::work_tree(cwd)?;
++    let source = git::rev_parse(&root, &format!("{source}^{{commit}}"))
++        .map_err(|_| format!("cherry-pick: '{source}' does not name a commit"))?;
++    let out = git::run(
++        &root,
++        &[
++            "log",
++            "--cherry-pick",
++            "--right-only",
++            "--no-merges",
++            &format!("--max-count={MAX_CANDIDATES}"),
++            "--format=%H%x00%s",
++            &format!("HEAD...{source}"),
++        ],
++    )?;
++    Ok(out
++        .lines()
++        .filter_map(|l| l.split_once('\0'))
++        .map(|(id, subject)| (id.to_string(), subject.trim().to_string()))
++        .collect())
++}
++
++// The text the picker shows for one commit: its header and message, then what applying it to `base`
++// would change. A conflict is announced ahead of the diff, whose conflicted files show the markers
++// that the decision screen later resolves.
++pub fn preview(root: &Path, base: &str, pick: &str) -> Res<String> {
++    let header = git::run(
++        root,
++        &[
++            "show",
++            "-s",
++            "--no-color",
++            "--format=commit %H%nAuthor: %an <%ae>%nDate:   %ad%n%n%B",
++            pick,
++        ],
++    )?;
++    let mut text = header;
++    text.push_str("\n\n");
++    let tree = match patch::merge(root, base, pick)? {
++        Merged::Clean(tree) => tree,
++        Merged::Conflicted { tree, files } => {
++            text.push_str("CONFLICT: applying this commit needs a decision in\n");
++            for f in &files {
++                text.push_str(&format!("  {} ({} to decide)\n", f.path, f.units()));
++            }
++            text.push_str("Enter on a marked selection opens the decision screen for each.\n\n");
++            tree
++        }
++        Merged::Unsupported(list) => {
++            text.push_str("CANNOT BE PICKED here: the conflict has no A/B decision.\n");
++            for l in list {
++                text.push_str(&format!("  {l}\n"));
++            }
++            return Ok(text);
++        }
++    };
++    let diff = git::run(
++        root,
++        &[
++            "diff",
++            "--stat",
++            "--patch",
++            "--no-color",
++            "--no-renames",
++            base,
++            &tree,
++        ],
++    )?;
++    if diff.is_empty() {
++        text.push_str("(this commit changes nothing relative to the current HEAD)\n");
++    } else {
++        text.push_str(&diff);
++        text.push('\n');
++    }
++    Ok(text)
++}
++
++// Entry point for the command.
++pub fn run(cwd: &Path, opts: Opts) -> Res<()> {
++    let root = git::work_tree(cwd)?;
++    let git_dir = git::git_dir(cwd)?;
++    if git::operation_in_progress(&git_dir) {
++        return Err(
++            "cherry-pick: a merge, rebase, cherry-pick, revert, or bisect is in progress".into(),
++        );
++    }
++    let spec = if opts.hashes.is_empty() {
++        match crate::cherry_ui::run(cwd, opts.from.as_deref())? {
++            Some(spec) => spec,
++            None => {
++                println!("gitomic: nothing picked");
++                return Ok(());
++            }
++        }
++    } else {
++        spec_from_hashes(&root, &opts.hashes)?
++    };
++    apply_spec(cwd, spec, opts.dry_run, opts.patch_only)
++}
++
++// Resolve command-line selectors into a spec against the current HEAD. The order given is the order
++// of replay. A commit already contained in HEAD, a merge commit, or a root commit is refused.
++fn spec_from_hashes(root: &Path, hashes: &[String]) -> Res<Spec> {
++    let base = git::rev_parse(root, "HEAD")?;
++    let mut picks: Vec<(String, String)> = Vec::new();
++    for sel in hashes {
++        let id = git::rev_parse(root, &format!("{sel}^{{commit}}"))
++            .map_err(|_| format!("cherry-pick: '{sel}' does not name a single commit"))?;
++        if picks.iter().any(|(p, _)| *p == id) {
++            continue;
++        }
++        if git::succeeds(root, &["merge-base", "--is-ancestor", &id, "HEAD"])? {
++            return Err(format!("cherry-pick: {} is already contained in HEAD", short(&id)).into());
++        }
++        let parents = git::run(root, &["show", "-s", "--format=%P", &id])?;
++        match parents.split_whitespace().count() {
++            0 => return Err(format!("cherry-pick: {} is a root commit", short(&id)).into()),
++            1 => {}
++            _ => return Err(format!("cherry-pick: {} is a merge commit", short(&id)).into()),
++        }
++        let subject = git::run(root, &["show", "-s", "--format=%s", &id])?;
++        picks.push((id, subject));
++    }
++    Ok(Spec {
++        base,
++        picks,
++        decisions: Vec::new(),
++    })
++}
++
++// Apply `spec` to the checked-out branch: stop a live watcher, build (or rebuild) the patch against
++// the HEAD that exists once the watcher is quiet, write and apply it, record it when a session is
++// open, and restart the watcher.
++pub fn apply_spec(cwd: &Path, spec: Spec, dry_run: bool, patch_only: bool) -> Res<()> {
++    let root = git::work_tree(cwd)?;
++    let git_dir = git::git_dir(cwd)?;
++    let branch = git::current_branch(&root).ok();
++    if git::operation_in_progress(&git_dir) {
++        return Err(
++            "cherry-pick: a merge, rebase, cherry-pick, revert, or bisect is in progress".into(),
++        );
++    }
++
++    let writes = !dry_run && !patch_only;
++    let was_live = writes
++        && branch
++            .as_deref()
++            .is_some_and(|b| live_watcher(&git_dir, b).is_some());
++    if was_live {
++        let branch = branch.as_deref().unwrap_or_default();
++        let cfg = Config::load()?;
++        terminate_watcher(&git_dir, branch)?;
++        report_flush(&root, &git_dir, branch, &cfg);
++    }
++
++    let result = apply_locked(
++        &root,
++        &git_dir,
++        branch.as_deref(),
++        spec,
++        dry_run,
++        patch_only,
++    );
++
++    if was_live {
++        if let Err(e) = commands::init(cwd, false, false) {
++            eprintln!("gitomic: cherry-pick: watcher could not be restarted: {e}");
++        }
++    }
++    result
++}
++
++fn apply_locked(
++    root: &Path,
++    git_dir: &Path,
++    branch: Option<&str>,
++    spec: Spec,
++    dry_run: bool,
++    patch_only: bool,
++) -> Res<()> {
++    let head = git::rev_parse(root, "HEAD")?;
++    let built = if head == spec.base {
++        patch::build(root, &spec)?
++    } else {
++        println!(
++            "gitomic: HEAD moved from {} to {} since the selection; recomputing the patch",
++            short(&spec.base),
++            short(&head)
++        );
++        patch::rebuild(root, &spec, &head)?
++    };
++    let patch = match built {
++        Built::Ready(p) => *p,
++        Built::Conflicts(files) => {
++            let names: Vec<String> = files.iter().map(|f| f.path.clone()).collect();
++            return Err(format!(
++                "cherry-pick: conflicts need a decision in {}; run 'gitomic cherry-pick' without \
++                 commit ids to resolve them interactively. Nothing was modified.",
++                names.join(", ")
++            )
++            .into());
++        }
++        Built::Unsupported(list) => {
++            return Err(format!(
++                "cherry-pick: a conflict without an A/B decision was found ({}); nothing was \
++                 modified. Use 'git cherry-pick' for this one.",
++                list.join("; ")
++            )
++            .into());
++        }
++    };
++
++    let verb = if dry_run { "would pick" } else { "picking" };
++    for (id, subject) in &patch.spec.picks {
++        let subject = if subject.is_empty() {
++            "(no message)"
++        } else {
++            subject
++        };
++        println!("gitomic: {verb} {} {subject}", short(id));
++    }
++    if patch.is_empty() {
++        println!("  the change is already present in HEAD; nothing to apply");
++        return Ok(());
++    }
++    if dry_run {
++        println!("gitomic: dry run; nothing was modified");
++        print!("{}", patch.stat);
++        return Ok(());
++    }
++
++    let file = patch::write(&patch::patch_dir(git_dir), &patch)?;
++    if patch_only {
++        println!("gitomic: patch written to {}", file.display());
++        println!("  apply it with: git apply {}", file.display());
++        return Ok(());
++    }
++    patch::check(root, &file).map_err(|e| {
++        format!(
++            "cherry-pick: the patch does not apply to the work tree ({e}); commit or stash local \
++             edits to the files involved. Nothing was modified. The patch is kept at {}",
++            file.display()
++        )
++    })?;
++    patch::apply(root, &file)?;
++    print!("{}", patch.stat);
++
++    let in_session = match branch {
++        Some(b) => git::rev_exists(root, &git::base_ref(b))?,
++        None => false,
++    };
++    if in_session {
++        let paths: Vec<&str> = patch.paths.iter().map(String::as_str).collect();
++        match git::commit_only(root, &paths)? {
++            Some(sha) => println!("gitomic: recorded as {}", short(&sha)),
++            None => println!("gitomic: the patch left no change to record"),
++        }
++        println!(
++            "  undo with: gitomic drop {}",
++            short(&git::rev_parse(root, "HEAD")?)
++        );
++    } else {
++        println!("gitomic: applied to the work tree; the change is not committed");
++        println!("  undo with: git apply -R {}", file.display());
++    }
++    println!("  patch file: {}", file.display());
++    Ok(())
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::testrepo::Repo;
++
++    fn opts(hashes: &[&str]) -> Opts {
++        Opts {
++            from: None,
++            hashes: hashes.iter().map(|h| h.to_string()).collect(),
++            dry_run: false,
++            patch_only: false,
++        }
++    }
++
++    // `main` holds a.txt and c.txt; `feat` (branched earlier) adds b.txt in one commit and edits
++    // f.txt in another. Returns (b.txt commit, f.txt commit). HEAD ends on `main`.
++    fn setup() -> (Repo, String, String) {
++        let r = Repo::new();
++        r.write("a.txt", "a\n");
++        r.write("f.txt", &Repo::lines());
++        r.git(&["add", "."]);
++        r.git(&["commit", "-q", "-m", "base"]);
++        r.git(&["checkout", "-q", "-b", "feat"]);
++        let b = r.commit_file("b.txt", "b\n", "add b");
++        let f = r.commit_file("f.txt", &Repo::lines_with(&[(3, "FEAT3")]), "edit f");
++        r.git(&["checkout", "-q", "main"]);
++        r.commit_file("c.txt", "c\n", "add c");
++        (r, b, f)
++    }
++
++    fn patch_files(r: &Repo) -> Vec<String> {
++        std::fs::read_dir(patch::patch_dir(&r.0.join(".git")))
++            .map(|d| {
++                d.filter_map(|e| e.ok())
++                    .map(|e| e.file_name().to_string_lossy().into_owned())
++                    .collect()
++            })
++            .unwrap_or_default()
++    }
++
++    #[test]
++    fn without_a_session_the_change_is_left_uncommitted() {
++        let (r, b, _) = setup();
++        let head = r.head();
++
++        run(&r.0, opts(&[&b[..10]])).unwrap();
++
++        assert_eq!(r.head(), head, "history is not rewritten or extended");
++        assert_eq!(r.read("b.txt"), "b\n");
++        assert_eq!(r.git(&["status", "--porcelain"]), "?? b.txt");
++        assert_eq!(patch_files(&r).len(), 1);
++    }
++
++    #[test]
++    fn several_commits_apply_in_the_order_given() {
++        let (r, b, f) = setup();
++        run(&r.0, opts(&[&b, &f])).unwrap();
++        assert_eq!(r.read("b.txt"), "b\n");
++        assert_eq!(r.read("f.txt"), Repo::lines_with(&[(3, "FEAT3")]));
++        // One patch for the whole selection.
++        assert_eq!(patch_files(&r).len(), 1);
++    }
++
++    #[test]
++    fn a_conflict_is_refused_on_the_command_line_and_nothing_changes() {
++        let (r, _, f) = setup();
++        r.commit_file("f.txt", &Repo::lines_with(&[(3, "MAIN3")]), "main edits f");
++        let head = r.head();
++
++        let err = run(&r.0, opts(&[&f])).unwrap_err().to_string();
++
++        assert!(err.contains("f.txt"), "{err}");
++        assert!(err.contains("decision"), "{err}");
++        assert_eq!(r.head(), head);
++        assert_eq!(r.read("f.txt"), Repo::lines_with(&[(3, "MAIN3")]));
++        assert_eq!(r.git(&["status", "--porcelain"]), "");
++        assert!(patch_files(&r).is_empty());
++    }
++
++    #[test]
++    fn dry_run_and_patch_only_do_not_touch_the_work_tree() {
++        let (r, b, _) = setup();
++        let mut o = opts(&[&b]);
++        o.dry_run = true;
++        run(&r.0, o).unwrap();
++        assert!(!r.exists("b.txt"));
++        assert!(patch_files(&r).is_empty());
++
++        let mut o = opts(&[&b]);
++        o.patch_only = true;
++        run(&r.0, o).unwrap();
++        assert!(!r.exists("b.txt"));
++        assert_eq!(patch_files(&r).len(), 1);
++    }
++
++    #[test]
++    fn an_open_session_records_the_change_as_one_atomic_commit() {
++        let (r, b, f) = setup();
++        r.git(&["update-ref", "refs/gitomic/base/main", "HEAD"]);
++        // A change staged by hand must stay out of the recorded commit.
++        r.write("staged.txt", "s\n");
++        r.git(&["add", "staged.txt"]);
++        let head = r.head();
++
++        run(&r.0, opts(&[&b, &f])).unwrap();
++
++        assert_eq!(
++            r.git(&["rev-list", "--count", &format!("{head}..HEAD")]),
++            "1"
++        );
++        assert_eq!(r.git(&["log", "-1", "--format=%s"]), "");
++        let files = r.git(&["show", "--name-only", "--format=", "HEAD"]);
++        let mut names: Vec<&str> = files.lines().collect();
++        names.sort();
++        assert_eq!(names, ["b.txt", "f.txt"]);
++        assert_eq!(r.git(&["diff", "--cached", "--name-only"]), "staged.txt");
++        assert_eq!(r.git(&["status", "--porcelain"]), "A  staged.txt");
++    }
++
++    #[test]
++    fn an_uncommitted_edit_to_a_touched_file_blocks_the_pick() {
++        let (r, _, f) = setup();
++        r.write("f.txt", "edited locally\n");
++
++        let err = run(&r.0, opts(&[&f])).unwrap_err().to_string();
++
++        assert!(err.contains("does not apply"), "{err}");
++        assert_eq!(r.read("f.txt"), "edited locally\n");
++    }
++
++    #[test]
++    fn contained_merge_root_and_unknown_commits_are_refused() {
++        let (r, b, _) = setup();
++        let base = r.git(&["rev-parse", "HEAD~1"]);
++        let err = run(&r.0, opts(&[&base])).unwrap_err().to_string();
++        assert!(err.contains("already contained"), "{err}");
++
++        let err = run(&r.0, opts(&["nonexistent"])).unwrap_err().to_string();
++        assert!(err.contains("does not name"), "{err}");
++
++        let root = r.git(&["rev-list", "--max-parents=0", "HEAD"]);
++        r.git(&["checkout", "-q", "--orphan", "lone"]);
++        r.git(&["rm", "-rfq", "."]);
++        let lone = r.commit_file("z.txt", "z\n", "unrelated root");
++        r.git(&["checkout", "-q", "main"]);
++        let err = run(&r.0, opts(&[&lone])).unwrap_err().to_string();
++        assert!(err.contains("root commit"), "{err}");
++        assert_ne!(root, lone);
++
++        r.git(&["checkout", "-q", "-b", "mergeme", &b]);
++        r.git(&["merge", "-q", "--no-ff", "-m", "merge main", "main"]);
++        let merge = r.head();
++        r.git(&["checkout", "-q", "main"]);
++        let err = run(&r.0, opts(&[&merge])).unwrap_err().to_string();
++        assert!(err.contains("merge commit"), "{err}");
++    }
++
++    #[test]
++    fn a_pick_in_progress_elsewhere_blocks_the_command() {
++        let (r, b, _) = setup();
++        std::fs::write(r.0.join(".git/CHERRY_PICK_HEAD"), &b).unwrap();
++        let err = run(&r.0, opts(&[&b])).unwrap_err().to_string();
++        assert!(err.contains("in progress"), "{err}");
++    }
++
++    #[test]
++    fn a_selection_already_present_under_another_id_changes_nothing() {
++        let (r, b, _) = setup();
++        r.git(&["cherry-pick", &b]);
++        let head = r.head();
++        // The same change, offered again by hand: nothing to apply, nothing modified.
++        run(&r.0, opts(&[&b])).unwrap();
++        assert_eq!(r.head(), head);
++        assert_eq!(r.git(&["status", "--porcelain"]), "");
++    }
++
++    #[test]
++    fn head_moving_after_the_selection_recomputes_the_patch() {
++        let (r, b, _) = setup();
++        let spec = spec_from_hashes(&r.0, &[b]).unwrap();
++        let old = spec.base.clone();
++        // A commit lands between choosing and applying, as a watcher capture would.
++        r.commit_file("late.txt", "l\n", "late");
++        assert_ne!(r.head(), old);
++
++        apply_spec(&r.0, spec, false, false).unwrap();
++
++        assert_eq!(r.read("b.txt"), "b\n");
++        let saved = patch_files(&r);
++        assert_eq!(saved.len(), 1);
++        let text = std::fs::read(patch::patch_dir(&r.0.join(".git")).join(&saved[0])).unwrap();
++        let header = Spec::parse(&text).unwrap();
++        assert_eq!(
++            header.base,
++            r.head(),
++            "the patch was rebuilt on the newer HEAD"
++        );
++    }
++
++    #[test]
++    fn decisions_in_a_spec_settle_a_conflict_without_a_terminal() {
++        let (r, _, f) = setup();
++        r.commit_file("f.txt", &Repo::lines_with(&[(3, "MAIN3")]), "main edits f");
++        let spec = spec_from_hashes(&r.0, &[f.clone()]).unwrap();
++
++        // Decide through the engine, as the interactive screen does, then hand the spec over.
++        let mut job = patch::Job::new(&r.0, &spec.base, &spec.ids(), &[]);
++        let files = match job.advance().unwrap() {
++            patch::Step::Conflicts(mut files) => {
++                files[0].set(0, Some(crate::conflict::Side::B));
++                files
++            }
++            _ => panic!("expected a conflict"),
++        };
++        job.resolve(&files).unwrap();
++        assert!(matches!(job.advance().unwrap(), patch::Step::Done));
++        let decided = job.patch(&spec.picks).unwrap().spec;
++
++        apply_spec(&r.0, decided, false, false).unwrap();
++        assert_eq!(r.read("f.txt"), Repo::lines_with(&[(3, "FEAT3")]));
++    }
++
++    #[test]
++    fn candidates_skip_merges_and_changes_already_present() {
++        let (r, b, f) = setup();
++        r.git(&["cherry-pick", &b]);
++        let got: Vec<String> = candidates(&r.0, "feat")
++            .unwrap()
++            .into_iter()
++            .map(|(id, _)| id)
++            .collect();
++        assert_eq!(
++            got,
++            vec![f.clone()],
++            "the already-picked change is not offered again"
++        );
++
++        let subjects: Vec<String> = candidates(&r.0, "feat")
++            .unwrap()
++            .into_iter()
++            .map(|(_, s)| s)
++            .collect();
++        assert_eq!(subjects, ["edit f"]);
++
++        assert!(candidates(&r.0, "no-such-branch").is_err());
++    }
++
++    #[test]
++    fn candidates_are_newest_first() {
++        let (r, b, f) = setup();
++        let got: Vec<String> = candidates(&r.0, "feat")
++            .unwrap()
++            .into_iter()
++            .map(|(id, _)| id)
++            .collect();
++        assert_eq!(got, vec![f, b]);
++    }
++
++    #[test]
++    fn branches_exclude_the_current_branch_and_remote_head_aliases() {
++        let (r, _, _) = setup();
++        r.git(&["branch", "other"]);
++        r.git(&["update-ref", "refs/remotes/origin/main", "main"]);
++        r.git(&[
++            "symbolic-ref",
++            "refs/remotes/origin/HEAD",
++            "refs/remotes/origin/main",
++        ]);
++        let names = branches(&r.0).unwrap();
++        assert!(names.contains(&"feat".to_string()));
++        assert!(names.contains(&"other".to_string()));
++        assert!(names.contains(&"origin/main".to_string()));
++        assert!(!names.contains(&"main".to_string()));
++        assert!(!names.iter().any(|n| n.ends_with("/HEAD")));
++    }
++
++    #[test]
++    fn the_preview_shows_the_change_against_the_base_and_flags_conflicts() {
++        let (r, b, f) = setup();
++        let base = r.head();
++        let clean = preview(&r.0, &base, &b).unwrap();
++        assert!(clean.contains("add b"), "{clean}");
++        assert!(clean.contains("+++ b/b.txt"), "{clean}");
++        assert!(!clean.contains("CONFLICT"));
++
++        r.commit_file("f.txt", &Repo::lines_with(&[(3, "MAIN3")]), "main edits f");
++        let conflicted = preview(&r.0, &r.head(), &f).unwrap();
++        assert!(conflicted.contains("CONFLICT"), "{conflicted}");
++        assert!(conflicted.contains("f.txt (1 to decide)"), "{conflicted}");
++    }
++}
+diff --git a/src/cherry_ui.rs b/src/cherry_ui.rs
+new file mode 100644
+index 0000000..ad612cc
+--- /dev/null
++++ b/src/cherry_ui.rs
+@@ -0,0 +1,1589 @@
++// Interactive screen for `gitomic cherry-pick` when no commit is named (issue #13). It follows the
++// layout and keys of the `drop` picker (pick.rs): commits on the left, the highlighted commit's
++// diff on the right, vim-style movement, space to mark, Enter to submit behind a y/n confirmation
++// that Enter cannot answer. Three things are added: Tab opens an overlay that chooses the branch to
++// pick from, the diff shows what the commit would change relative to the HEAD that was current when
++// the screen opened, and a conflict opens a decision screen where each conflict hunk is settled
++// with a single key.
++//
++// As in pick.rs, everything except the terminal is testable. `App` consumes key events and reports
++// an `Outcome`; git is reached only through the `Source` trait, and rendering takes any ratatui
++// backend. The screen prepares a `Spec` (which commits, against which base, with which decisions)
++// and returns it; building and applying the patch is the command layer's job (cherry.rs), so the
++// same code path serves the interactive and the command-line forms.
++//
++// Keys, list pane:
++//   j/k, arrows  move            g/G  first/last          space  toggle the mark
++//   l, Right     open the diff   Tab  choose the source branch
++//   Enter        prepare the marked commits (conflicts are decided first), then confirm with y/n
++//   q, Esc       quit (confirmed first when commits are marked)
++// Keys, diff pane: as for `drop` (j/k h/l g/G Ctrl-d/u, Enter/n next, N previous, space, Tab).
++// Keys, branch overlay:
++//   j/k, g/G     move     Enter  use the branch (marks are cleared)     Esc, Tab, q  close
++// Keys, decision screen:
++//   j/k          previous/next conflict     a  keep the tree copy     b  take the picked commit's
++//   c            keep both (text conflicts)  u  undo the decision      Ctrl-d/u  scroll
++//   Enter        continue once every conflict is decided               Esc, q  leave
++
++use std::collections::HashMap;
++use std::io::IsTerminal;
++use std::path::{Path, PathBuf};
++use std::time::Instant;
++
++use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
++use ratatui::layout::{Constraint, Layout, Rect};
++use ratatui::style::{Color, Modifier, Style};
++use ratatui::text::{Line, Span};
++use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph};
++use ratatui::{DefaultTerminal, Frame};
++
++use crate::conflict::{Segment, Side};
++use crate::patch::{Body, FileConflict, Job, Spec, Step};
++use crate::pick::{style_diff, with_terminal, DiffView, H_STEP, RUN_WINDOW};
++use crate::{cherry, git, Res};
++
++// Lines of unchanged text shown above and below a conflict hunk.
++const CONTEXT: usize = 3;
++
++// Where a replay stands after the picks were submitted.
++pub enum Flow {
++    // Every conflict is decided; carries the `git diff --stat` summary of the patch.
++    Ready(String),
++    // A pick conflicts and needs decisions.
++    Conflicts(Vec<FileConflict>),
++    // The selection cannot be applied.
++    Refused(String),
++}
++
++// What the screen needs from git.
++pub trait Source {
++    fn branches(&mut self) -> Result<Vec<String>, String>;
++    // Commits on `branch` that HEAD lacks, newest first.
++    fn commits(&mut self, branch: &str) -> Result<Vec<(String, String)>, String>;
++    // The preview text for one commit.
++    fn diff(&mut self, commit: &str) -> Result<String, String>;
++    // Begin replaying `picks` (oldest first) and report where it stops.
++    fn start(&mut self, picks: &[(String, String)]) -> Result<Flow, String>;
++    // Supply decisions for the conflict last reported and continue.
++    fn resolve(&mut self, files: Vec<FileConflict>) -> Result<Flow, String>;
++    // The recipe for the patch once the replay is `Ready`.
++    fn spec(&mut self) -> Result<Spec, String>;
++}
++
++struct GitSource {
++    cwd: PathBuf,
++    root: PathBuf,
++    // HEAD when the screen opened; every preview and the replay are relative to it.
++    base: String,
++    job: Option<Job>,
++    picks: Vec<(String, String)>,
++    // Decisions carried across restarts of the replay, so a cancelled confirmation does not lose
++    // them.
++    decided: Vec<(String, Side)>,
++}
++
++impl GitSource {
++    fn flow(&mut self, step: Step) -> Result<Flow, String> {
++        match step {
++            Step::Done => {
++                let job = self.job.as_ref().ok_or("no replay in progress")?;
++                let patch = job.patch(&self.picks).map_err(|e| e.to_string())?;
++                if patch.is_empty() {
++                    return Ok(Flow::Refused(
++                        "the selection changes nothing relative to HEAD".to_string(),
++                    ));
++                }
++                Ok(Flow::Ready(patch.stat))
++            }
++            Step::Conflicts(files) => Ok(Flow::Conflicts(files)),
++            Step::Unsupported(list) => Ok(Flow::Refused(format!(
++                "a conflict has no A/B decision ({}); use 'git cherry-pick' for it",
++                list.join("; ")
++            ))),
++        }
++    }
++}
++
++impl Source for GitSource {
++    fn branches(&mut self) -> Result<Vec<String>, String> {
++        cherry::branches(&self.cwd).map_err(|e| e.to_string())
++    }
++
++    fn commits(&mut self, branch: &str) -> Result<Vec<(String, String)>, String> {
++        cherry::candidates(&self.cwd, branch).map_err(|e| e.to_string())
++    }
++
++    fn diff(&mut self, commit: &str) -> Result<String, String> {
++        cherry::preview(&self.root, &self.base, commit).map_err(|e| e.to_string())
++    }
++
++    fn start(&mut self, picks: &[(String, String)]) -> Result<Flow, String> {
++        self.picks = picks.to_vec();
++        let ids: Vec<String> = picks.iter().map(|(id, _)| id.clone()).collect();
++        let mut job = Job::new(&self.root, &self.base, &ids, &self.decided);
++        let step = job.advance().map_err(|e| e.to_string())?;
++        self.decided = job.decisions().to_vec();
++        self.job = Some(job);
++        self.flow(step)
++    }
++
++    fn resolve(&mut self, files: Vec<FileConflict>) -> Result<Flow, String> {
++        let job = self.job.as_mut().ok_or("no replay in progress")?;
++        job.resolve(&files).map_err(|e| e.to_string())?;
++        let step = job.advance().map_err(|e| e.to_string())?;
++        self.decided = job.decisions().to_vec();
++        self.flow(step)
++    }
++
++    fn spec(&mut self) -> Result<Spec, String> {
++        let job = self.job.as_ref().ok_or("no replay in progress")?;
++        job.patch(&self.picks)
++            .map(|p| p.spec)
++            .map_err(|e| e.to_string())
++    }
++}
++
++#[derive(Clone, Copy, PartialEq, Debug)]
++enum Focus {
++    List,
++    Diff,
++}
++
++// What the screen is waiting for. Only `Browse` interprets navigation keys; the confirmations
++// accept y or n and ignore everything else, Enter included.
++#[derive(Clone, PartialEq, Debug)]
++enum Mode {
++    Browse,
++    Overlay,
++    Resolve,
++    ConfirmApply { summary: String },
++    ConfirmQuit,
++}
++
++#[derive(PartialEq, Debug)]
++pub enum Outcome {
++    Continue,
++    Quit,
++    Submit(Spec),
++}
++
++struct Entry {
++    full: String,
++    subject: String,
++    marked: bool,
++}
++
++struct Overlay {
++    names: Vec<String>,
++    cursor: usize,
++}
++
++// The decision screen's state: the conflicted files of the pick being replayed and a cursor over
++// their individual decisions.
++struct Resolver {
++    files: Vec<FileConflict>,
++    // (file index, unit index) for every decision, in display order.
++    units: Vec<(usize, usize)>,
++    cursor: usize,
++    vscroll: usize,
++}
++
++impl Resolver {
++    fn new(files: Vec<FileConflict>) -> Resolver {
++        let units = files
++            .iter()
++            .enumerate()
++            .flat_map(|(fi, f)| (0..f.units()).map(move |u| (fi, u)))
++            .collect();
++        let mut r = Resolver {
++            files,
++            units,
++            cursor: 0,
++            vscroll: 0,
++        };
++        r.cursor = (0..r.units.len())
++            .find(|&i| r.choice_at(i).is_none())
++            .unwrap_or(0);
++        r
++    }
++
++    fn choice_at(&self, i: usize) -> Option<Side> {
++        let (f, u) = self.units[i];
++        self.files[f].choice(u)
++    }
++
++    fn undecided(&self) -> usize {
++        self.files.iter().map(FileConflict::unresolved).sum()
++    }
++
++    fn move_by(&mut self, delta: isize) {
++        let last = self.units.len().saturating_sub(1);
++        let next = self.cursor.saturating_add_signed(delta).min(last);
++        if next != self.cursor {
++            self.cursor = next;
++            self.vscroll = 0;
++        }
++    }
++
++    // Record `side` for the current decision and, when deciding (not undoing), move on to the next
++    // undecided one if any remains. Returns false when the side is not available here.
++    fn decide(&mut self, side: Option<Side>) -> bool {
++        let Some(&(f, u)) = self.units.get(self.cursor) else {
++            return false;
++        };
++        if !self.files[f].set(u, side) {
++            return false;
++        }
++        if side.is_some() {
++            let after = (self.cursor + 1..self.units.len()).find(|&i| self.choice_at(i).is_none());
++            let before = (0..self.cursor).find(|&i| self.choice_at(i).is_none());
++            if let Some(i) = after.or(before) {
++                self.cursor = i;
++                self.vscroll = 0;
++            }
++        }
++        true
++    }
++
++    // Rows of the left pane: one per decision.
++    fn rows(&self) -> Vec<Line<'static>> {
++        self.units
++            .iter()
++            .enumerate()
++            .map(|(i, &(f, u))| {
++                let file = &self.files[f];
++                let mark = self.choice_at(i).map_or(' ', Side::letter);
++                let of = if file.units() > 1 {
++                    format!("  {}/{}", u + 1, file.units())
++                } else {
++                    String::new()
++                };
++                let color = if mark == ' ' {
++                    Color::Yellow
++                } else {
++                    Color::Green
++                };
++                Line::from(Span::styled(
++                    format!("[{mark}] {}{of}", file.path),
++                    Style::new().fg(color),
++                ))
++            })
++            .collect()
++    }
++
++    // The right pane for the current decision.
++    fn detail(&self, pick: &str) -> Vec<Line<'static>> {
++        let Some(&(f, u)) = self.units.get(self.cursor) else {
++            return Vec::new();
++        };
++        let file = &self.files[f];
++        let choice = file.choice(u);
++        let mut out = vec![
++            Line::from(Span::styled(
++                format!(
++                    " {}  decision {} of {}",
++                    file.path,
++                    self.cursor + 1,
++                    self.units.len()
++                ),
++                Style::new().add_modifier(Modifier::BOLD),
++            )),
++            Line::from(""),
++        ];
++        match &file.body {
++            Body::Hunks(segs) => out.extend(hunk_lines(segs, u, choice, pick)),
++            Body::Whole { ours, theirs, .. } => out.extend(whole_lines(ours, theirs, choice, pick)),
++        }
++        out
++    }
++}
++
++// Replace anything a terminal would interpret. Same policy as the diff pane.
++fn clean(raw: &str) -> String {
++    raw.chars()
++        .flat_map(|c| match c {
++            '\t' => vec![' '; 4],
++            c if c.is_control() => vec!['\u{b7}'],
++            c => vec![c],
++        })
++        .collect()
++}
++
++fn side_header(label: &str, chosen: bool, color: Color) -> Line<'static> {
++    let mut style = Style::new().fg(color).add_modifier(Modifier::BOLD);
++    let mut text = format!("---- {label} ----");
++    if chosen {
++        style = style.add_modifier(Modifier::REVERSED);
++        text.push_str("  <- chosen");
++    }
++    Line::from(Span::styled(text, style))
++}
++
++fn body_lines(bytes: &[u8], color: Color, chosen: bool) -> Vec<Line<'static>> {
++    let mut style = Style::new().fg(color);
++    if !chosen {
++        style = style.add_modifier(Modifier::DIM);
++    }
++    String::from_utf8_lossy(bytes)
++        .lines()
++        .map(|l| Line::from(Span::styled(clean(l), style)))
++        .collect()
++}
++
++// The `unit`-th conflict hunk of a file with a few lines of surrounding text, both sides laid out
++// one above the other.
++fn hunk_lines(
++    segs: &[Segment],
++    unit: usize,
++    choice: Option<Side>,
++    pick: &str,
++) -> Vec<Line<'static>> {
++    let mut out = Vec::new();
++    let mut seen = 0;
++    for (i, seg) in segs.iter().enumerate() {
++        let Segment::Hunk(h) = seg else { continue };
++        if seen != unit {
++            seen += 1;
++            continue;
++        }
++        let dim = Style::new().fg(Color::DarkGray);
++        if let Some(Segment::Text(t)) = i.checked_sub(1).and_then(|p| segs.get(p)) {
++            let lines: Vec<String> = String::from_utf8_lossy(t)
++                .lines()
++                .map(str::to_string)
++                .collect();
++            let start = lines.len().saturating_sub(CONTEXT);
++            for l in &lines[start..] {
++                out.push(Line::from(Span::styled(format!("  {}", clean(l)), dim)));
++            }
++        }
++        let a = matches!(choice, Some(Side::A | Side::Both));
++        let b = matches!(choice, Some(Side::B | Side::Both));
++        out.push(side_header(
++            "A  tree copy (checked-out branch)",
++            a,
++            Color::Cyan,
++        ));
++        out.extend(body_lines(&h.ours, Color::Cyan, choice.is_none() || a));
++        out.push(side_header(
++            &format!("B  from picked commit {pick}"),
++            b,
++            Color::Magenta,
++        ));
++        out.extend(body_lines(&h.theirs, Color::Magenta, choice.is_none() || b));
++        out.push(Line::from(Span::styled("---- end ----", dim)));
++        if let Some(Segment::Text(t)) = segs.get(i + 1) {
++            for l in String::from_utf8_lossy(t).lines().take(CONTEXT) {
++                out.push(Line::from(Span::styled(format!("  {}", clean(l)), dim)));
++            }
++        }
++        return out;
++    }
++    out
++}
++
++// The decision text for a file that is settled as a whole.
++fn whole_lines(
++    ours: &Option<crate::patch::Blob>,
++    theirs: &Option<crate::patch::Blob>,
++    choice: Option<Side>,
++    pick: &str,
++) -> Vec<Line<'static>> {
++    let (what, a_text, b_text) = match (ours, theirs) {
++        (Some(_), None) => (
++            "The tree has this file; the picked commit deletes it.",
++            "keep the tree's file".to_string(),
++            "delete the file, as the picked commit does".to_string(),
++        ),
++        (None, Some(_)) => (
++            "The tree lacks this file; the picked commit changes it.",
++            "leave the file deleted".to_string(),
++            "take the picked commit's file".to_string(),
++        ),
++        _ => (
++            "Both sides changed this file and its content cannot be merged line by line.",
++            "keep the tree's copy".to_string(),
++            "take the picked commit's copy".to_string(),
++        ),
++    };
++    let a = choice == Some(Side::A);
++    let b = choice == Some(Side::B);
++    vec![
++        Line::from(what),
++        Line::from(""),
++        side_header(&format!("A  {a_text}"), a, Color::Cyan),
++        side_header(&format!("B  {b_text} (commit {pick})"), b, Color::Magenta),
++    ]
++}
++
++pub struct App {
++    source_label: Option<String>,
++    entries: Vec<Entry>,
++    truncated: bool,
++    cursor: usize,
++    focus: Focus,
++    mode: Mode,
++    views: HashMap<String, DiffView>,
++    vscroll: usize,
++    hscroll: usize,
++    view_h: usize,
++    view_w: usize,
++    last_h: Option<Instant>,
++    status: String,
++    status_is_error: bool,
++    list_state: ListState,
++    overlay: Option<Overlay>,
++    resolver: Option<Resolver>,
++}
++
++impl App {
++    pub fn new() -> App {
++        App {
++            source_label: None,
++            entries: Vec::new(),
++            truncated: false,
++            cursor: 0,
++            focus: Focus::List,
++            mode: Mode::Browse,
++            views: HashMap::new(),
++            vscroll: 0,
++            hscroll: 0,
++            view_h: 20,
++            view_w: 80,
++            last_h: None,
++            status: String::new(),
++            status_is_error: false,
++            list_state: ListState::default(),
++            overlay: None,
++            resolver: None,
++        }
++    }
++
++    // Use the commits of `branch` (newest first). Marks, cached previews and scroll positions
++    // belong to the previous source and are dropped.
++    pub fn set_source(&mut self, branch: &str, commits: Vec<(String, String)>) {
++        self.truncated = commits.len() >= cherry::MAX_CANDIDATES;
++        self.entries = commits
++            .into_iter()
++            .map(|(full, subject)| Entry {
++                full,
++                subject,
++                marked: false,
++            })
++            .collect();
++        self.source_label = Some(branch.to_string());
++        self.views.clear();
++        self.cursor = 0;
++        self.vscroll = 0;
++        self.hscroll = 0;
++        self.focus = Focus::List;
++    }
++
++    // Open the branch overlay on `names`.
++    pub fn open_overlay(&mut self, names: Vec<String>) {
++        self.overlay = Some(Overlay { names, cursor: 0 });
++        self.mode = Mode::Overlay;
++    }
++
++    fn marked_count(&self) -> usize {
++        self.entries.iter().filter(|e| e.marked).count()
++    }
++
++    // The marked commits, oldest first, which is the order they are replayed in.
++    fn marked_picks(&self) -> Vec<(String, String)> {
++        self.entries
++            .iter()
++            .rev()
++            .filter(|e| e.marked)
++            .map(|e| (e.full.clone(), e.subject.clone()))
++            .collect()
++    }
++
++    pub fn ensure_diff(&mut self, src: &mut dyn Source) {
++        let Some(entry) = self.entries.get(self.cursor) else {
++            return;
++        };
++        if self.views.contains_key(&entry.full) {
++            return;
++        }
++        let full = entry.full.clone();
++        let view = match src.diff(&full) {
++            Ok(text) => style_diff(&text),
++            Err(e) => style_diff(&format!("could not show {full}: {e}")),
++        };
++        self.views.insert(full, view);
++    }
++
++    fn view(&self) -> Option<&DiffView> {
++        self.entries
++            .get(self.cursor)
++            .and_then(|e| self.views.get(&e.full))
++    }
++
++    fn max_v(&self) -> usize {
++        self.view()
++            .map_or(0, |v| v.lines.len().saturating_sub(self.view_h))
++    }
++
++    fn max_h(&self) -> usize {
++        self.view()
++            .map_or(0, |v| v.max_width.saturating_sub(self.view_w))
++    }
++
++    fn clamp_scroll(&mut self) {
++        self.vscroll = self.vscroll.min(self.max_v());
++        self.hscroll = self.hscroll.min(self.max_h());
++    }
++
++    fn step(&mut self, delta: isize) {
++        if self.entries.is_empty() {
++            return;
++        }
++        let last = self.entries.len() - 1;
++        let next = self.cursor.saturating_add_signed(delta).min(last);
++        self.jump(next);
++    }
++
++    fn jump(&mut self, index: usize) {
++        if index != self.cursor {
++            self.cursor = index;
++            self.vscroll = 0;
++            self.hscroll = 0;
++        }
++    }
++
++    fn toggle(&mut self) {
++        if let Some(e) = self.entries.get_mut(self.cursor) {
++            e.marked = !e.marked;
++        }
++    }
++
++    fn say(&mut self, text: impl Into<String>, is_error: bool) {
++        self.status = text.into();
++        self.status_is_error = is_error;
++    }
++
++    pub fn handle_key(&mut self, key: KeyEvent, now: Instant, src: &mut dyn Source) -> Outcome {
++        if key.kind == KeyEventKind::Release {
++            return Outcome::Continue;
++        }
++        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
++            return Outcome::Quit;
++        }
++        match self.mode.clone() {
++            Mode::Overlay => {
++                self.key_overlay(key, src);
++                return Outcome::Continue;
++            }
++            Mode::Resolve => {
++                self.key_resolve(key, src);
++                return Outcome::Continue;
++            }
++            Mode::ConfirmApply { .. } => return self.key_confirm_apply(key, src),
++            Mode::ConfirmQuit => return self.key_confirm_quit(key),
++            Mode::Browse => {}
++        }
++        self.status.clear();
++        match self.focus {
++            Focus::List => self.key_list(key, src),
++            Focus::Diff => self.key_diff(key, now, src),
++        }
++    }
++
++    fn open_branches(&mut self, src: &mut dyn Source) {
++        match src.branches() {
++            Ok(names) if names.is_empty() => {
++                self.say("there is no other branch to pick from", true)
++            }
++            Ok(names) => self.open_overlay(names),
++            Err(e) => self.say(e, true),
++        }
++    }
++
++    fn key_list(&mut self, key: KeyEvent, src: &mut dyn Source) -> Outcome {
++        match key.code {
++            KeyCode::Char('j') | KeyCode::Down => self.step(1),
++            KeyCode::Char('k') | KeyCode::Up => self.step(-1),
++            KeyCode::Char('g') | KeyCode::Home => self.jump(0),
++            KeyCode::Char('G') | KeyCode::End => self.jump(self.entries.len().saturating_sub(1)),
++            KeyCode::Char(' ') => self.toggle(),
++            KeyCode::Char('l') | KeyCode::Right => self.focus = Focus::Diff,
++            KeyCode::Tab => self.open_branches(src),
++            KeyCode::Enter => self.submit(src),
++            KeyCode::Char('q') | KeyCode::Esc => return self.request_quit(),
++            _ => {}
++        }
++        Outcome::Continue
++    }
++
++    fn key_diff(&mut self, key: KeyEvent, now: Instant, src: &mut dyn Source) -> Outcome {
++        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
++        match key.code {
++            KeyCode::Char('j') | KeyCode::Down => {
++                self.vscroll = (self.vscroll + 1).min(self.max_v())
++            }
++            KeyCode::Char('k') | KeyCode::Up => self.vscroll = self.vscroll.saturating_sub(1),
++            KeyCode::Char('d') if ctrl => {
++                self.vscroll = (self.vscroll + self.view_h / 2).min(self.max_v())
++            }
++            KeyCode::Char('u') if ctrl => {
++                self.vscroll = self.vscroll.saturating_sub(self.view_h / 2)
++            }
++            KeyCode::Char('g') | KeyCode::Home => self.vscroll = 0,
++            KeyCode::Char('G') | KeyCode::End => self.vscroll = self.max_v(),
++            KeyCode::Char('l') | KeyCode::Right => {
++                self.hscroll = (self.hscroll + H_STEP).min(self.max_h())
++            }
++            KeyCode::Char('h') | KeyCode::Left => self.left(now),
++            KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => self.step(-1),
++            KeyCode::Enter | KeyCode::Char('n') => self.step(1),
++            KeyCode::Char('N') => self.step(-1),
++            KeyCode::Char(' ') => self.toggle(),
++            KeyCode::Tab => self.open_branches(src),
++            KeyCode::Esc => self.focus = Focus::List,
++            KeyCode::Char('q') => return self.request_quit(),
++            _ => {}
++        }
++        Outcome::Continue
++    }
++
++    // Same rule as the `drop` picker: an h that follows another within RUN_WINDOW is part of one
++    // run and never leaves the diff, so holding h to reach the left edge cannot overshoot.
++    fn left(&mut self, now: Instant) {
++        let in_run = self
++            .last_h
++            .is_some_and(|t| now.saturating_duration_since(t) < RUN_WINDOW);
++        self.last_h = Some(now);
++        if self.hscroll > 0 {
++            self.hscroll = self.hscroll.saturating_sub(H_STEP);
++        } else if !in_run {
++            self.focus = Focus::List;
++        }
++    }
++
++    fn key_overlay(&mut self, key: KeyEvent, src: &mut dyn Source) {
++        let Some(ov) = self.overlay.as_mut() else {
++            self.mode = Mode::Browse;
++            return;
++        };
++        let last = ov.names.len().saturating_sub(1);
++        match key.code {
++            KeyCode::Char('j') | KeyCode::Down => ov.cursor = (ov.cursor + 1).min(last),
++            KeyCode::Char('k') | KeyCode::Up => ov.cursor = ov.cursor.saturating_sub(1),
++            KeyCode::Char('g') | KeyCode::Home => ov.cursor = 0,
++            KeyCode::Char('G') | KeyCode::End => ov.cursor = last,
++            KeyCode::Enter => {
++                let name = ov.names[ov.cursor].clone();
++                match src.commits(&name) {
++                    Ok(commits) if commits.is_empty() => {
++                        self.say(format!("{name} has no commit that HEAD lacks"), true);
++                    }
++                    Ok(commits) => {
++                        self.set_source(&name, commits);
++                        self.overlay = None;
++                        self.mode = Mode::Browse;
++                        self.status.clear();
++                    }
++                    Err(e) => self.say(e, true),
++                }
++            }
++            KeyCode::Esc | KeyCode::Tab | KeyCode::Char('q') => {
++                self.overlay = None;
++                self.mode = Mode::Browse;
++            }
++            _ => {}
++        }
++    }
++
++    // Enter in the browse screen: replay the marked commits and report where that stops.
++    fn submit(&mut self, src: &mut dyn Source) {
++        let picks = self.marked_picks();
++        if picks.is_empty() {
++            self.say("nothing is marked; press space on a commit first", true);
++            return;
++        }
++        let flow = src.start(&picks);
++        self.after_flow(flow);
++    }
++
++    fn after_flow(&mut self, flow: Result<Flow, String>) {
++        match flow {
++            Ok(Flow::Ready(summary)) => {
++                self.resolver = None;
++                self.mode = Mode::ConfirmApply { summary };
++            }
++            Ok(Flow::Conflicts(files)) => {
++                self.resolver = Some(Resolver::new(files));
++                self.mode = Mode::Resolve;
++            }
++            Ok(Flow::Refused(reason)) => {
++                self.resolver = None;
++                self.mode = Mode::Browse;
++                self.say(reason, true);
++            }
++            Err(e) => {
++                self.mode = Mode::Browse;
++                self.say(e, true);
++            }
++        }
++    }
++
++    fn key_resolve(&mut self, key: KeyEvent, src: &mut dyn Source) {
++        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
++        let Some(res) = self.resolver.as_mut() else {
++            self.mode = Mode::Browse;
++            return;
++        };
++        match key.code {
++            KeyCode::Char('j') | KeyCode::Down => res.move_by(1),
++            KeyCode::Char('k') | KeyCode::Up => res.move_by(-1),
++            KeyCode::Char('g') | KeyCode::Home => res.move_by(-(res.units.len() as isize)),
++            KeyCode::Char('G') | KeyCode::End => res.move_by(res.units.len() as isize),
++            KeyCode::Char('d') if ctrl => res.vscroll += self.view_h / 2,
++            KeyCode::Char('u') if ctrl => res.vscroll = res.vscroll.saturating_sub(self.view_h / 2),
++            KeyCode::Char('a') => {
++                res.decide(Some(Side::A));
++            }
++            KeyCode::Char('b') => {
++                res.decide(Some(Side::B));
++            }
++            KeyCode::Char('c') => {
++                if !res.decide(Some(Side::Both)) {
++                    self.status = "keeping both is offered for text conflicts only".to_string();
++                    self.status_is_error = true;
++                }
++            }
++            KeyCode::Char('u') => {
++                res.decide(None);
++            }
++            KeyCode::Enter => {
++                let left = res.undecided();
++                if left > 0 {
++                    self.say(format!("{left} conflict(s) still need a decision"), true);
++                    return;
++                }
++                let files = std::mem::take(&mut res.files);
++                self.resolver = None;
++                let flow = src.resolve(files);
++                self.after_flow(flow);
++            }
++            KeyCode::Esc | KeyCode::Char('q') => {
++                self.resolver = None;
++                self.mode = Mode::Browse;
++                self.say("decisions abandoned; selection kept", false);
++            }
++            _ => {}
++        }
++    }
++
++    // Only y and n answer. Every other key, Enter included, is ignored.
++    fn key_confirm_apply(&mut self, key: KeyEvent, src: &mut dyn Source) -> Outcome {
++        match key.code {
++            KeyCode::Char('y') | KeyCode::Char('Y') => match src.spec() {
++                Ok(spec) => Outcome::Submit(spec),
++                Err(e) => {
++                    self.mode = Mode::Browse;
++                    self.say(e, true);
++                    Outcome::Continue
++                }
++            },
++            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
++                self.mode = Mode::Browse;
++                self.say("cancelled; selection kept", false);
++                Outcome::Continue
++            }
++            _ => Outcome::Continue,
++        }
++    }
++
++    fn request_quit(&mut self) -> Outcome {
++        if self.marked_count() == 0 {
++            Outcome::Quit
++        } else {
++            self.mode = Mode::ConfirmQuit;
++            Outcome::Continue
++        }
++    }
++
++    fn key_confirm_quit(&mut self, key: KeyEvent) -> Outcome {
++        match key.code {
++            KeyCode::Char('y') | KeyCode::Char('Y') => Outcome::Quit,
++            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
++                self.mode = Mode::Browse;
++                Outcome::Continue
++            }
++            _ => Outcome::Continue,
++        }
++    }
++
++    pub fn render(&mut self, frame: &mut Frame) {
++        let area = frame.area();
++        let rows = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(area);
++        let left_w = (area.width * 2 / 5).clamp(28, 60).min(area.width / 2);
++        let cols =
++            Layout::horizontal([Constraint::Length(left_w), Constraint::Min(1)]).split(rows[0]);
++
++        if self.mode == Mode::Resolve {
++            self.render_resolve(frame, cols[0], cols[1]);
++        } else {
++            self.render_browse(frame, cols[0], cols[1]);
++        }
++        self.render_bar(frame, rows[1]);
++        if self.mode == Mode::Overlay {
++            self.render_overlay(frame, area);
++        }
++    }
++
++    fn render_browse(&mut self, frame: &mut Frame, left: Rect, right: Rect) {
++        let focused = self.focus;
++        let focus_style = |f: Focus| {
++            if focused == f {
++                Style::new().fg(Color::Cyan)
++            } else {
++                Style::new().fg(Color::DarkGray)
++            }
++        };
++
++        let items: Vec<ListItem> = self
++            .entries
++            .iter()
++            .map(|e| {
++                let subject = if e.subject.is_empty() {
++                    "(no message)"
++                } else {
++                    &e.subject
++                };
++                let mark = if e.marked { 'x' } else { ' ' };
++                let text = format!("[{mark}] {} {subject}", &e.full[..e.full.len().min(8)]);
++                let style = if e.marked {
++                    Style::new().fg(Color::Green)
++                } else {
++                    Style::new()
++                };
++                ListItem::new(Line::from(Span::styled(text, style)))
++            })
++            .collect();
++        let cursor_style = if self.focus == Focus::List {
++            Style::new().add_modifier(Modifier::REVERSED)
++        } else {
++            Style::new().add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
++        };
++        let title = match &self.source_label {
++            Some(name) => format!(
++                " {name}  {} of {} marked{} ",
++                self.marked_count(),
++                self.entries.len(),
++                if self.truncated {
++                    "  (list capped)"
++                } else {
++                    ""
++                }
++            ),
++            None => " Commits  (Tab: choose a branch) ".to_string(),
++        };
++        let list = List::new(items)
++            .block(
++                Block::bordered()
++                    .title(title)
++                    .border_style(focus_style(Focus::List)),
++            )
++            .highlight_style(cursor_style);
++        self.list_state.select(Some(self.cursor));
++        frame.render_stateful_widget(list, left, &mut self.list_state);
++
++        let inner_h = right.height.saturating_sub(2) as usize;
++        let inner_w = right.width.saturating_sub(2) as usize;
++        self.view_h = inner_h.max(1);
++        self.view_w = inner_w.max(1);
++        self.clamp_scroll();
++        let (visible, total): (Vec<Line>, usize) = match self.view() {
++            Some(v) => (
++                v.lines
++                    .iter()
++                    .skip(self.vscroll)
++                    .take(inner_h)
++                    .cloned()
++                    .collect(),
++                v.lines.len(),
++            ),
++            None => (
++                vec![Line::from(
++                    "Press Tab to choose the branch to pick commits from.",
++                )],
++                0,
++            ),
++        };
++        let heading = match self.entries.get(self.cursor) {
++            Some(e) => format!(
++                " {}  line {}/{}  col {} ",
++                &e.full[..e.full.len().min(8)],
++                (self.vscroll + 1).min(total.max(1)),
++                total,
++                self.hscroll + 1
++            ),
++            None => " no commit ".to_string(),
++        };
++        let diff = Paragraph::new(visible)
++            .block(
++                Block::bordered()
++                    .title(heading)
++                    .border_style(focus_style(Focus::Diff)),
++            )
++            .scroll((0, self.hscroll.min(u16::MAX as usize) as u16));
++        frame.render_widget(diff, right);
++    }
++
++    fn render_resolve(&mut self, frame: &mut Frame, left: Rect, right: Rect) {
++        let Some(res) = self.resolver.as_mut() else {
++            return;
++        };
++        let items: Vec<ListItem> = res.rows().into_iter().map(ListItem::new).collect();
++        let title = format!(
++            " Conflicts  {} of {} decided ",
++            res.units.len() - res.undecided(),
++            res.units.len()
++        );
++        let list = List::new(items)
++            .block(
++                Block::bordered()
++                    .title(title)
++                    .border_style(Style::new().fg(Color::Cyan)),
++            )
++            .highlight_style(Style::new().add_modifier(Modifier::REVERSED));
++        let mut state = ListState::default();
++        state.select(Some(res.cursor));
++        frame.render_stateful_widget(list, left, &mut state);
++
++        let pick = self
++            .entries
++            .iter()
++            .find(|e| e.marked)
++            .map_or(String::new(), |e| e.full[..e.full.len().min(8)].to_string());
++        let lines = res.detail(&pick);
++        let inner_h = right.height.saturating_sub(2) as usize;
++        self.view_h = inner_h.max(1);
++        res.vscroll = res.vscroll.min(lines.len().saturating_sub(self.view_h));
++        let visible: Vec<Line> = lines.into_iter().skip(res.vscroll).take(inner_h).collect();
++        let detail = Paragraph::new(visible).block(
++            Block::bordered()
++                .title(" Decide: a = tree copy, b = picked commit ")
++                .border_style(Style::new().fg(Color::Cyan)),
++        );
++        frame.render_widget(detail, right);
++    }
++
++    fn render_overlay(&mut self, frame: &mut Frame, area: Rect) {
++        let Some(ov) = self.overlay.as_ref() else {
++            return;
++        };
++        let w = (area.width * 3 / 5).clamp(30.min(area.width), area.width);
++        let h = (area.height * 3 / 5).clamp(6.min(area.height), area.height);
++        let popup = Rect {
++            x: area.x + (area.width - w) / 2,
++            y: area.y + (area.height - h) / 2,
++            width: w,
++            height: h,
++        };
++        let items: Vec<ListItem> = ov.names.iter().map(|n| ListItem::new(n.as_str())).collect();
++        let list = List::new(items)
++            .block(
++                Block::bordered()
++                    .title(" Pick from which branch?  (Enter use, Esc close) ")
++                    .border_style(Style::new().fg(Color::Yellow)),
++            )
++            .highlight_style(Style::new().add_modifier(Modifier::REVERSED));
++        let mut state = ListState::default();
++        state.select(Some(ov.cursor));
++        frame.render_widget(Clear, popup);
++        frame.render_stateful_widget(list, popup, &mut state);
++    }
++
++    fn render_bar(&self, frame: &mut Frame, area: Rect) {
++        let prompt = Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD);
++        let bar = match &self.mode {
++            Mode::ConfirmApply { summary } => {
++                let last = summary.lines().last().unwrap_or("").trim();
++                Line::from(Span::styled(
++                    format!(
++                        " Apply {} commit(s) as a patch? {last} [y/n] ",
++                        self.marked_count()
++                    ),
++                    prompt,
++                ))
++            }
++            Mode::ConfirmQuit => Line::from(Span::styled(
++                format!(" Quit and discard {} mark(s)? [y/n] ", self.marked_count()),
++                prompt,
++            )),
++            _ if !self.status.is_empty() => {
++                let color = if self.status_is_error {
++                    Color::Red
++                } else {
++                    Color::Green
++                };
++                Line::from(Span::styled(
++                    format!(" {} ", self.status),
++                    Style::new().fg(color).add_modifier(Modifier::BOLD),
++                ))
++            }
++            Mode::Overlay => hint(" j/k move  Enter use branch  Esc close "),
++            Mode::Resolve => hint(
++                " j/k conflict  a tree copy  b picked  c both  u undo  Enter continue  Esc leave ",
++            ),
++            Mode::Browse => match self.focus {
++                Focus::List => {
++                    hint(" j/k move  space mark  l diff  Tab branch  Enter pick marked  q quit ")
++                }
++                Focus::Diff => {
++                    hint(" j/k h/l scroll  Enter/n next  N prev  space mark  Tab branch  q quit")
++                }
++            },
++        };
++        frame.render_widget(Paragraph::new(bar), area);
++    }
++}
++
++fn hint(text: &'static str) -> Line<'static> {
++    Line::from(Span::styled(text, Style::new().fg(Color::DarkGray)))
++}
++
++// Run the screen on the real terminal. Returns the recipe of the patch the operator confirmed, or
++// None when the screen was left without confirming. `from` names the branch to list at once;
++// without it the branch overlay opens first.
++pub fn run(cwd: &Path, from: Option<&str>) -> Res<Option<Spec>> {
++    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
++        return Err(
++            "cherry-pick: no commit given, and the interactive screen needs a terminal".into(),
++        );
++    }
++    let root = git::work_tree(cwd)?;
++    let base = git::rev_parse(&root, "HEAD")?;
++    let mut src = GitSource {
++        cwd: cwd.to_path_buf(),
++        root,
++        base,
++        job: None,
++        picks: Vec::new(),
++        decided: Vec::new(),
++    };
++    let mut app = App::new();
++    match from {
++        Some(branch) => {
++            let commits = src.commits(branch)?;
++            if commits.is_empty() {
++                return Err(
++                    format!("cherry-pick: '{branch}' has no commit that HEAD lacks").into(),
++                );
++            }
++            app.set_source(branch, commits);
++        }
++        None => {
++            let names = src.branches()?;
++            if names.is_empty() {
++                return Err("cherry-pick: there is no other branch to pick from".into());
++            }
++            app.open_overlay(names);
++        }
++    }
++
++    let result = with_terminal(|terminal| event_loop(terminal, &mut app, &mut src));
++    match result? {
++        Outcome::Submit(spec) => Ok(Some(spec)),
++        _ => Ok(None),
++    }
++}
++
++fn event_loop(term: &mut DefaultTerminal, app: &mut App, src: &mut dyn Source) -> Res<Outcome> {
++    loop {
++        app.ensure_diff(src);
++        term.draw(|f| app.render(f))?;
++        if let Event::Key(key) = event::read()? {
++            match app.handle_key(key, Instant::now(), src) {
++                Outcome::Continue => {}
++                done => return Ok(done),
++            }
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::conflict;
++    use crate::patch::Blob;
++    use ratatui::backend::TestBackend;
++    use ratatui::Terminal;
++    use std::collections::VecDeque;
++
++    struct Fake {
++        branches: Vec<String>,
++        commits: Vec<(String, String)>,
++        flows: VecDeque<Result<Flow, String>>,
++        started: Vec<Vec<(String, String)>>,
++        resolved: Vec<Vec<FileConflict>>,
++    }
++
++    impl Fake {
++        fn new() -> Fake {
++            Fake {
++                branches: vec!["feat".to_string(), "origin/dev".to_string()],
++                commits: vec![
++                    (id('a'), "newest".to_string()),
++                    (id('b'), String::new()),
++                    (id('c'), "oldest".to_string()),
++                ],
++                flows: VecDeque::new(),
++                started: Vec::new(),
++                resolved: Vec::new(),
++            }
++        }
++    }
++
++    impl Source for Fake {
++        fn branches(&mut self) -> Result<Vec<String>, String> {
++            Ok(self.branches.clone())
++        }
++
++        fn commits(&mut self, branch: &str) -> Result<Vec<(String, String)>, String> {
++            if branch == "empty" {
++                Ok(Vec::new())
++            } else {
++                Ok(self.commits.clone())
++            }
++        }
++
++        fn diff(&mut self, commit: &str) -> Result<String, String> {
++            Ok(format!(
++                "commit {commit}\nAuthor: T <t@e.invalid>\nDate:   now\n\n    msg\n\n \
++                 a.txt | 1 +\n\ndiff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n\
++                 @@ -1 +1 @@\n-old\n+new\n"
++            ))
++        }
++
++        fn start(&mut self, picks: &[(String, String)]) -> Result<Flow, String> {
++            self.started.push(picks.to_vec());
++            self.flows
++                .pop_front()
++                .unwrap_or(Ok(Flow::Ready("1 file changed".into())))
++        }
++
++        fn resolve(&mut self, files: Vec<FileConflict>) -> Result<Flow, String> {
++            self.resolved.push(files);
++            self.flows
++                .pop_front()
++                .unwrap_or(Ok(Flow::Ready("1 file changed".into())))
++        }
++
++        fn spec(&mut self) -> Result<Spec, String> {
++            Ok(Spec {
++                base: id('0'),
++                picks: self.started.last().cloned().unwrap_or_default(),
++                decisions: Vec::new(),
++            })
++        }
++    }
++
++    fn id(c: char) -> String {
++        c.to_string().repeat(40)
++    }
++
++    fn key(code: KeyCode) -> KeyEvent {
++        KeyEvent::new(code, KeyModifiers::NONE)
++    }
++
++    fn ch(c: char) -> KeyCode {
++        KeyCode::Char(c)
++    }
++
++    fn press(app: &mut App, fake: &mut Fake, code: KeyCode) -> Outcome {
++        let out = app.handle_key(key(code), Instant::now(), fake);
++        app.ensure_diff(fake);
++        out
++    }
++
++    // An app already showing the fake's commits.
++    fn app() -> (App, Fake) {
++        let mut fake = Fake::new();
++        let mut app = App::new();
++        app.set_source("feat", fake.commits.clone());
++        app.view_h = 10;
++        app.view_w = 40;
++        app.ensure_diff(&mut fake);
++        (app, fake)
++    }
++
++    fn text_conflict(path: &str, src: &str) -> FileConflict {
++        FileConflict {
++            path: path.to_string(),
++            mode: "100644".to_string(),
++            body: Body::Hunks(conflict::parse(src.as_bytes()).unwrap()),
++        }
++    }
++
++    fn whole_conflict(path: &str) -> FileConflict {
++        let blob = |o: &str| {
++            Some(Blob {
++                mode: "100644".to_string(),
++                oid: o.repeat(40),
++            })
++        };
++        FileConflict {
++            path: path.to_string(),
++            mode: "100644".to_string(),
++            body: Body::Whole {
++                ours: blob("1"),
++                theirs: None,
++                choice: None,
++            },
++        }
++    }
++
++    const TWO_HUNKS: &str = "a\n<<<<<<< HEAD\nA1\n=======\nB1\n>>>>>>> x\nmid\n\
++         <<<<<<< HEAD\nA2\n=======\nB2\n>>>>>>> x\n";
++
++    // Mark the first commit and press Enter with the given flows queued.
++    fn submit_with(flows: Vec<Result<Flow, String>>) -> (App, Fake) {
++        let (mut app, mut fake) = app();
++        fake.flows = flows.into();
++        press(&mut app, &mut fake, ch(' '));
++        press(&mut app, &mut fake, KeyCode::Enter);
++        (app, fake)
++    }
++
++    #[test]
++    fn tab_opens_the_overlay_and_enter_switches_source_clearing_marks() {
++        let (mut a, mut f) = app();
++        press(&mut a, &mut f, ch(' '));
++        assert_eq!(a.marked_count(), 1);
++
++        press(&mut a, &mut f, KeyCode::Tab);
++        assert_eq!(a.mode, Mode::Overlay);
++        press(&mut a, &mut f, ch('j'));
++        press(&mut a, &mut f, ch('j'));
++        assert_eq!(
++            a.overlay.as_ref().unwrap().cursor,
++            1,
++            "stops at the last branch"
++        );
++        press(&mut a, &mut f, KeyCode::Enter);
++
++        assert_eq!(a.mode, Mode::Browse);
++        assert_eq!(a.source_label.as_deref(), Some("origin/dev"));
++        assert_eq!(a.marked_count(), 0);
++        assert_eq!(a.cursor, 0);
++    }
++
++    #[test]
++    fn escape_closes_the_overlay_without_changing_anything() {
++        let (mut a, mut f) = app();
++        press(&mut a, &mut f, ch(' '));
++        press(&mut a, &mut f, KeyCode::Tab);
++        press(&mut a, &mut f, KeyCode::Esc);
++        assert_eq!(a.mode, Mode::Browse);
++        assert_eq!(a.source_label.as_deref(), Some("feat"));
++        assert_eq!(a.marked_count(), 1);
++    }
++
++    #[test]
++    fn tab_works_from_the_diff_pane_and_a_branch_without_commits_is_refused() {
++        let (mut a, mut f) = app();
++        f.branches = vec!["empty".to_string()];
++        press(&mut a, &mut f, ch('l'));
++        press(&mut a, &mut f, KeyCode::Tab);
++        assert_eq!(a.mode, Mode::Overlay);
++        press(&mut a, &mut f, KeyCode::Enter);
++        assert_eq!(a.mode, Mode::Overlay, "stays open");
++        assert!(a.status_is_error);
++        assert_eq!(a.source_label.as_deref(), Some("feat"));
++    }
++
++    #[test]
++    fn with_no_other_branch_tab_says_so() {
++        let (mut a, mut f) = app();
++        f.branches.clear();
++        press(&mut a, &mut f, KeyCode::Tab);
++        assert_eq!(a.mode, Mode::Browse);
++        assert!(a.status.contains("no other branch"));
++    }
++
++    #[test]
++    fn enter_with_nothing_marked_explains_and_starts_nothing() {
++        let (mut a, mut f) = app();
++        press(&mut a, &mut f, KeyCode::Enter);
++        assert!(a.status.contains("nothing is marked"));
++        assert!(f.started.is_empty());
++    }
++
++    #[test]
++    fn marked_commits_are_submitted_oldest_first() {
++        let (mut a, mut f) = app();
++        press(&mut a, &mut f, ch(' '));
++        press(&mut a, &mut f, ch('G'));
++        press(&mut a, &mut f, ch(' '));
++        press(&mut a, &mut f, KeyCode::Enter);
++        let picks: Vec<String> = f.started[0].iter().map(|(i, _)| i.clone()).collect();
++        assert_eq!(picks, vec![id('c'), id('a')]);
++    }
++
++    #[test]
++    fn a_clean_selection_asks_for_confirmation_that_only_y_can_give() {
++        let (mut a, mut f) = submit_with(vec![Ok(Flow::Ready("2 files changed".into()))]);
++        assert!(matches!(a.mode, Mode::ConfirmApply { .. }));
++        for code in [KeyCode::Enter, ch(' '), ch('j'), ch('x')] {
++            assert_eq!(press(&mut a, &mut f, code), Outcome::Continue);
++            assert!(matches!(a.mode, Mode::ConfirmApply { .. }));
++        }
++        match press(&mut a, &mut f, ch('y')) {
++            Outcome::Submit(spec) => assert_eq!(spec.picks.len(), 1),
++            other => panic!("expected a submit, got {other:?}"),
++        }
++    }
++
++    #[test]
++    fn n_and_escape_cancel_the_confirmation_and_keep_the_marks() {
++        for code in [ch('n'), ch('N'), KeyCode::Esc] {
++            let (mut a, mut f) = submit_with(vec![Ok(Flow::Ready(String::new()))]);
++            assert_eq!(press(&mut a, &mut f, code), Outcome::Continue);
++            assert_eq!(a.mode, Mode::Browse);
++            assert_eq!(a.marked_count(), 1);
++        }
++    }
++
++    #[test]
++    fn a_refused_selection_is_reported_with_the_marks_intact() {
++        let (a, _) = submit_with(vec![Ok(Flow::Refused("cannot".into()))]);
++        assert_eq!(a.mode, Mode::Browse);
++        assert!(a.status_is_error);
++        assert_eq!(a.status, "cannot");
++        assert_eq!(a.marked_count(), 1);
++    }
++
++    #[test]
++    fn a_conflict_opens_the_decision_screen_on_the_first_undecided_unit() {
++        let (a, _) = submit_with(vec![Ok(Flow::Conflicts(vec![text_conflict(
++            "f.txt", TWO_HUNKS,
++        )]))]);
++        assert_eq!(a.mode, Mode::Resolve);
++        let res = a.resolver.as_ref().unwrap();
++        assert_eq!(res.units.len(), 2);
++        assert_eq!(res.cursor, 0);
++        assert_eq!(res.undecided(), 2);
++    }
++
++    #[test]
++    fn deciding_moves_on_and_enter_waits_until_everything_is_decided() {
++        let (mut a, mut f) = submit_with(vec![Ok(Flow::Conflicts(vec![text_conflict(
++            "f.txt", TWO_HUNKS,
++        )]))]);
++        press(&mut a, &mut f, ch('b'));
++        assert_eq!(
++            a.resolver.as_ref().unwrap().cursor,
++            1,
++            "advances to the next undecided"
++        );
++        press(&mut a, &mut f, KeyCode::Enter);
++        assert!(a.status.contains("1 conflict(s) still need a decision"));
++        assert_eq!(a.mode, Mode::Resolve);
++        assert!(f.resolved.is_empty());
++
++        f.flows.push_back(Ok(Flow::Ready("done".into())));
++        press(&mut a, &mut f, ch('a'));
++        press(&mut a, &mut f, KeyCode::Enter);
++        assert!(matches!(a.mode, Mode::ConfirmApply { .. }));
++        let sent = &f.resolved[0][0];
++        assert_eq!(sent.choice(0), Some(Side::B));
++        assert_eq!(sent.choice(1), Some(Side::A));
++    }
++
++    #[test]
++    fn navigation_undo_and_both_work_in_the_decision_screen() {
++        let (mut a, mut f) = submit_with(vec![Ok(Flow::Conflicts(vec![text_conflict(
++            "f.txt", TWO_HUNKS,
++        )]))]);
++        press(&mut a, &mut f, ch('j'));
++        assert_eq!(a.resolver.as_ref().unwrap().cursor, 1);
++        press(&mut a, &mut f, ch('j'));
++        assert_eq!(a.resolver.as_ref().unwrap().cursor, 1, "stops at the last");
++        press(&mut a, &mut f, ch('k'));
++        press(&mut a, &mut f, ch('c'));
++        assert_eq!(a.resolver.as_ref().unwrap().choice_at(0), Some(Side::Both));
++        // Deciding moved the cursor on to the other hunk; go back and undo.
++        press(&mut a, &mut f, ch('k'));
++        press(&mut a, &mut f, ch('u'));
++        assert_eq!(a.resolver.as_ref().unwrap().choice_at(0), None);
++        assert_eq!(a.resolver.as_ref().unwrap().undecided(), 2);
++    }
++
++    #[test]
++    fn a_whole_file_conflict_refuses_keeping_both() {
++        let (mut a, mut f) =
++            submit_with(vec![Ok(Flow::Conflicts(vec![whole_conflict("gone.txt")]))]);
++        press(&mut a, &mut f, ch('c'));
++        assert!(a.status_is_error);
++        assert_eq!(a.resolver.as_ref().unwrap().undecided(), 1);
++        press(&mut a, &mut f, ch('a'));
++        assert_eq!(a.resolver.as_ref().unwrap().undecided(), 0);
++    }
++
++    #[test]
++    fn a_later_pick_can_raise_another_conflict_after_the_first_is_resolved() {
++        let (mut a, mut f) = submit_with(vec![
++            Ok(Flow::Conflicts(vec![whole_conflict("one.txt")])),
++            Ok(Flow::Conflicts(vec![text_conflict("two.txt", TWO_HUNKS)])),
++        ]);
++        press(&mut a, &mut f, ch('b'));
++        press(&mut a, &mut f, KeyCode::Enter);
++        assert_eq!(a.mode, Mode::Resolve);
++        assert_eq!(a.resolver.as_ref().unwrap().files[0].path, "two.txt");
++    }
++
++    #[test]
++    fn leaving_the_decision_screen_returns_to_browsing_with_marks_kept() {
++        for code in [KeyCode::Esc, ch('q')] {
++            let (mut a, mut f) =
++                submit_with(vec![Ok(Flow::Conflicts(vec![whole_conflict("g.txt")]))]);
++            assert_eq!(press(&mut a, &mut f, code), Outcome::Continue);
++            assert_eq!(a.mode, Mode::Browse);
++            assert_eq!(a.marked_count(), 1);
++            assert!(a.resolver.is_none());
++        }
++    }
++
++    #[test]
++    fn quitting_asks_only_when_something_is_marked() {
++        let (mut a, mut f) = app();
++        assert_eq!(press(&mut a, &mut f, ch('q')), Outcome::Quit);
++
++        let (mut a, mut f) = app();
++        press(&mut a, &mut f, ch(' '));
++        assert_eq!(press(&mut a, &mut f, ch('q')), Outcome::Continue);
++        assert_eq!(a.mode, Mode::ConfirmQuit);
++        assert_eq!(press(&mut a, &mut f, KeyCode::Enter), Outcome::Continue);
++        assert_eq!(press(&mut a, &mut f, ch('y')), Outcome::Quit);
++    }
++
++    #[test]
++    fn ctrl_c_quits_from_any_screen() {
++        let (mut a, mut f) = submit_with(vec![Ok(Flow::Conflicts(vec![whole_conflict("g.txt")]))]);
++        let ctrl_c = KeyEvent::new(ch('c'), KeyModifiers::CONTROL);
++        assert_eq!(a.handle_key(ctrl_c, Instant::now(), &mut f), Outcome::Quit);
++    }
++
++    #[test]
++    fn diff_pane_keys_match_the_drop_picker() {
++        let (mut a, mut f) = app();
++        press(&mut a, &mut f, ch('l'));
++        assert_eq!(a.focus, Focus::Diff);
++        press(&mut a, &mut f, ch('n'));
++        assert_eq!(a.cursor, 1);
++        press(&mut a, &mut f, ch('N'));
++        assert_eq!(a.cursor, 0);
++        press(&mut a, &mut f, ch('h'));
++        assert_eq!(a.focus, Focus::List);
++    }
++
++    fn render_text(a: &mut App, w: u16, h: u16) -> String {
++        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
++        term.draw(|f| a.render(f)).unwrap();
++        let buf = term.backend().buffer().clone();
++        (0..h)
++            .map(|y| {
++                (0..w)
++                    .map(|x| buf[(x, y)].symbol().to_string())
++                    .collect::<String>()
++            })
++            .collect::<Vec<_>>()
++            .join("\n")
++    }
++
++    #[test]
++    fn browse_screen_shows_source_marks_diff_and_hints() {
++        let (mut a, mut f) = app();
++        press(&mut a, &mut f, ch(' '));
++        let screen = render_text(&mut a, 100, 20);
++        assert!(screen.contains("feat  1 of 3 marked"), "{screen}");
++        assert!(screen.contains("[x] aaaaaaaa newest"), "{screen}");
++        assert!(screen.contains("(no message)"), "{screen}");
++        assert!(screen.contains("+new"), "{screen}");
++        assert!(screen.contains("Tab branch"), "{screen}");
++    }
++
++    #[test]
++    fn overlay_lists_the_branches_over_the_browse_screen() {
++        let (mut a, mut f) = app();
++        press(&mut a, &mut f, KeyCode::Tab);
++        let screen = render_text(&mut a, 100, 20);
++        assert!(screen.contains("Pick from which branch?"), "{screen}");
++        assert!(screen.contains("origin/dev"), "{screen}");
++    }
++
++    #[test]
++    fn without_a_source_the_screen_points_at_tab() {
++        let mut a = App::new();
++        let screen = render_text(&mut a, 100, 12);
++        assert!(screen.contains("Tab: choose a branch"), "{screen}");
++        assert!(
++            screen.contains("Press Tab to choose the branch"),
++            "{screen}"
++        );
++    }
++
++    #[test]
++    fn decision_screen_shows_both_sides_context_and_the_chosen_one() {
++        let (mut a, mut f) = submit_with(vec![Ok(Flow::Conflicts(vec![text_conflict(
++            "f.txt", TWO_HUNKS,
++        )]))]);
++        let screen = render_text(&mut a, 110, 24);
++        assert!(screen.contains("Conflicts  0 of 2 decided"), "{screen}");
++        assert!(screen.contains("[ ] f.txt  1/2"), "{screen}");
++        assert!(screen.contains("A  tree copy"), "{screen}");
++        assert!(
++            screen.contains("B  from picked commit aaaaaaaa"),
++            "{screen}"
++        );
++        assert!(screen.contains("A1") && screen.contains("B1"), "{screen}");
++        assert!(!screen.contains("<- chosen"));
++
++        press(&mut a, &mut f, ch('b'));
++        press(&mut a, &mut f, ch('k'));
++        let screen = render_text(&mut a, 110, 24);
++        assert!(screen.contains("[B] f.txt  1/2"), "{screen}");
++        assert!(screen.contains("<- chosen"), "{screen}");
++        assert!(screen.contains("1 of 2 decided"), "{screen}");
++    }
++
++    #[test]
++    fn decision_screen_describes_a_whole_file_conflict() {
++        let (mut a, _) = submit_with(vec![Ok(Flow::Conflicts(vec![whole_conflict("gone.txt")]))]);
++        let screen = render_text(&mut a, 110, 20);
++        assert!(screen.contains("the picked commit deletes it"), "{screen}");
++        assert!(screen.contains("keep the tree's file"), "{screen}");
++        assert!(screen.contains("delete the file"), "{screen}");
++    }
++
++    #[test]
++    fn confirmation_bar_names_the_count_and_the_change_summary() {
++        let (mut a, _) = submit_with(vec![Ok(Flow::Ready(
++            " b.txt | 1 +\n 1 file changed".into(),
++        ))]);
++        let screen = render_text(&mut a, 120, 12);
++        assert!(
++            screen.contains("Apply 1 commit(s) as a patch? 1 file changed [y/n]"),
++            "{screen}"
++        );
++    }
++
++    #[test]
++    fn tiny_terminals_do_not_panic() {
++        let (mut a, mut f) = app();
++        for (w, h) in [(1, 1), (10, 3), (30, 5)] {
++            render_text(&mut a, w, h);
++        }
++        press(&mut a, &mut f, KeyCode::Tab);
++        render_text(&mut a, 12, 4);
++        let (mut a, _) = submit_with(vec![Ok(Flow::Conflicts(vec![text_conflict(
++            "f.txt", TWO_HUNKS,
++        )]))]);
++        render_text(&mut a, 12, 4);
++    }
++}
+diff --git a/src/commands.rs b/src/commands.rs
+index c19828a..439574b 100644
+--- a/src/commands.rs
++++ b/src/commands.rs
+@@ -21,7 +21,7 @@ use crate::{git, watch, Res};
+ 
+ // The pid of a live watcher for `branch`, or None when no watcher is running for it. A pidfile whose process
+ // has died is treated as absent, so a crash leaves no lingering "running" illusion.
+-fn live_watcher(git_dir: &Path, branch: &str) -> Option<i32> {
++pub(crate) fn live_watcher(git_dir: &Path, branch: &str) -> Option<i32> {
+     let pid = proc::read_pid(&state_dir(git_dir, branch))?;
+     if proc::alive(pid) {
+         Some(pid)
+@@ -798,7 +798,7 @@ fn template(commits: &[String]) -> String {
+ // watcher is still live. Confirming the watcher has exited before returning is what lets a caller safely run a
+ // subsequent reset without racing a live watcher over the index. A genuinely wedged watcher is interrupted by
+ // the operator (Ctrl-C) rather than by a timer.
+-fn terminate_watcher(git_dir: &Path, branch: &str) -> Res<bool> {
++pub(crate) fn terminate_watcher(git_dir: &Path, branch: &str) -> Res<bool> {
+     let sdir = state_dir(git_dir, branch);
+     let pid = match proc::read_pid(&sdir) {
+         Some(p) => p,
+@@ -839,7 +839,7 @@ fn terminate_watcher(git_dir: &Path, branch: &str) -> Res<bool> {
+ // had not yet committed are recovered from the state directory and used for this capture, so a change made
+ // after the watcher's last debounce cycle — including a rename, whose new half tracked-only staging would drop
+ // — is still captured whole. For tracked/all modes the set is consumed and ignored.
+-fn report_flush(root: &Path, git_dir: &Path, branch: &str, cfg: &Config) {
++pub(crate) fn report_flush(root: &Path, git_dir: &Path, branch: &str, cfg: &Config) {
+     let observed = watch::take_pending_observed(&state_dir(git_dir, branch));
+     match watch::flush_once(root, git_dir, &git::base_ref(branch), cfg, &observed) {
+         watch::Flush::Committed(sha) if !sha.is_empty() => {
+@@ -886,7 +886,7 @@ fn reject_legacy_session(root: &Path) -> Res<()> {
+ }
+ 
+ // Abbreviate an object id for display, matching git's conventional short length.
+-fn short(sha: &str) -> String {
++pub(crate) fn short(sha: &str) -> String {
+     sha.chars().take(12).collect()
+ }
+ 
+diff --git a/src/conflict.rs b/src/conflict.rs
+new file mode 100644
+index 0000000..9565394
+--- /dev/null
++++ b/src/conflict.rs
+@@ -0,0 +1,333 @@
++// Conflict hunks of a text file (issue #13). `git merge-tree` leaves a conflicted file in the
++// result tree with conflict markers in place; this module splits such a file into plain text and
++// conflict hunks, records a per-hunk decision, and renders the file again once every hunk has one.
++// It has no dependency on git or the terminal, so the whole module is exercised by ordinary unit
++// tests.
++//
++// Terminology follows the picker: side A is the copy already in the tree (the checked-out branch),
++// side B is the version carried by the commit being picked.
++
++// The decision for one conflict hunk.
++#[derive(Clone, Copy, PartialEq, Eq, Debug)]
++pub enum Side {
++    // Keep the tree copy.
++    A,
++    // Take the picked commit's version.
++    B,
++    // Keep both, tree copy first.
++    Both,
++}
++
++impl Side {
++    // One-letter form used in patch headers and on screen.
++    pub fn letter(self) -> char {
++        match self {
++            Side::A => 'A',
++            Side::B => 'B',
++            Side::Both => 'C',
++        }
++    }
++
++    #[allow(dead_code)]
++    pub fn from_letter(c: char) -> Option<Side> {
++        match c {
++            'A' => Some(Side::A),
++            'B' => Some(Side::B),
++            'C' => Some(Side::Both),
++            _ => None,
++        }
++    }
++}
++
++#[derive(Clone, PartialEq, Eq, Debug)]
++pub struct Hunk {
++    pub ours: Vec<u8>,
++    pub theirs: Vec<u8>,
++    pub choice: Option<Side>,
++}
++
++impl Hunk {
++    // The bytes this hunk contributes under its current decision, or None while undecided.
++    fn chosen(&self) -> Option<Vec<u8>> {
++        let mut out = Vec::new();
++        match self.choice? {
++            Side::A => out.extend_from_slice(&self.ours),
++            Side::B => out.extend_from_slice(&self.theirs),
++            Side::Both => {
++                out.extend_from_slice(&self.ours);
++                out.extend_from_slice(&self.theirs);
++            }
++        }
++        Some(out)
++    }
++}
++
++#[derive(Clone, PartialEq, Eq, Debug)]
++pub enum Segment {
++    Text(Vec<u8>),
++    Hunk(Hunk),
++}
++
++// Length of a marker line's run of marker characters. Git lengthens the run only when the file
++// itself contains such lines; that case fails the parse below and falls back to a whole-file
++// decision, which is always correct if less fine grained.
++const MARKER: usize = 7;
++
++fn strip_eol(line: &[u8]) -> &[u8] {
++    let line = line.strip_suffix(b"\n").unwrap_or(line);
++    line.strip_suffix(b"\r").unwrap_or(line)
++}
++
++// True when `line` is a marker made of `ch`, optionally followed by a space and a label.
++fn is_marker(line: &[u8], ch: u8) -> bool {
++    let body = strip_eol(line);
++    body.len() >= MARKER
++        && body[..MARKER].iter().all(|&b| b == ch)
++        && (body.len() == MARKER || body[MARKER] == b' ')
++}
++
++#[derive(PartialEq)]
++enum State {
++    Text,
++    Ours,
++    Base,
++    Theirs,
++}
++
++// Split `content` into text and conflict hunks. Returns None when the file contains no complete
++// conflict, or when the markers are not well formed (a marker inside a hunk, a missing separator or
++// terminator), so a caller never guesses at a structure it cannot verify. A diff3-style base
++// section is recognised and discarded; only the two sides are kept.
++pub fn parse(content: &[u8]) -> Option<Vec<Segment>> {
++    let mut segments: Vec<Segment> = Vec::new();
++    let mut text: Vec<u8> = Vec::new();
++    let mut ours: Vec<u8> = Vec::new();
++    let mut theirs: Vec<u8> = Vec::new();
++    let mut state = State::Text;
++    let mut hunks = 0usize;
++
++    for line in content.split_inclusive(|&b| b == b'\n') {
++        match state {
++            State::Text => {
++                if is_marker(line, b'<') {
++                    if !text.is_empty() {
++                        segments.push(Segment::Text(std::mem::take(&mut text)));
++                    }
++                    state = State::Ours;
++                } else {
++                    // A lone separator outside a hunk is ordinary text (a setext heading, for
++                    // instance), not a sign of a malformed conflict.
++                    text.extend_from_slice(line);
++                }
++            }
++            State::Ours => {
++                if is_marker(line, b'|') {
++                    state = State::Base;
++                } else if is_marker(line, b'=') {
++                    state = State::Theirs;
++                } else if is_marker(line, b'<') || is_marker(line, b'>') {
++                    return None;
++                } else {
++                    ours.extend_from_slice(line);
++                }
++            }
++            State::Base => {
++                if is_marker(line, b'=') {
++                    state = State::Theirs;
++                } else if is_marker(line, b'<') || is_marker(line, b'>') {
++                    return None;
++                }
++            }
++            State::Theirs => {
++                if is_marker(line, b'>') {
++                    segments.push(Segment::Hunk(Hunk {
++                        ours: std::mem::take(&mut ours),
++                        theirs: std::mem::take(&mut theirs),
++                        choice: None,
++                    }));
++                    hunks += 1;
++                    state = State::Text;
++                } else if is_marker(line, b'<') || is_marker(line, b'=') || is_marker(line, b'|') {
++                    return None;
++                } else {
++                    theirs.extend_from_slice(line);
++                }
++            }
++        }
++    }
++    if state != State::Text || hunks == 0 {
++        return None;
++    }
++    if !text.is_empty() {
++        segments.push(Segment::Text(text));
++    }
++    Some(segments)
++}
++
++pub fn hunk_count(segments: &[Segment]) -> usize {
++    segments
++        .iter()
++        .filter(|s| matches!(s, Segment::Hunk(_)))
++        .count()
++}
++
++pub fn unresolved_count(segments: &[Segment]) -> usize {
++    segments
++        .iter()
++        .filter(|s| matches!(s, Segment::Hunk(h) if h.choice.is_none()))
++        .count()
++}
++
++// The file as it stands under the current decisions, or None while any hunk is undecided.
++pub fn render(segments: &[Segment]) -> Option<Vec<u8>> {
++    let mut out = Vec::new();
++    for seg in segments {
++        match seg {
++            Segment::Text(t) => out.extend_from_slice(t),
++            Segment::Hunk(h) => out.extend_from_slice(&h.chosen()?),
++        }
++    }
++    Some(out)
++}
++
++// A stable identity for a conflict, derived from where it is and what both sides hold (FNV-1a, 64
++// bit). The same conflict met again while a patch is recomputed against a newer HEAD hashes to the
++// same value, so an earlier decision can be reused; a conflict whose content changed does not, and
++// is asked about afresh.
++pub fn fingerprint(path: &str, ours: &[u8], theirs: &[u8]) -> String {
++    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
++    let mut feed = |bytes: &[u8]| {
++        for &b in bytes {
++            hash ^= u64::from(b);
++            hash = hash.wrapping_mul(0x0100_0000_01b3);
++        }
++        // A separator no field can produce keeps ("ab", "c") distinct from ("a", "bc").
++        hash ^= 0xff;
++        hash = hash.wrapping_mul(0x0100_0000_01b3);
++    };
++    feed(path.as_bytes());
++    feed(ours);
++    feed(theirs);
++    format!("{hash:016x}")
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn hunk(ours: &str, theirs: &str) -> Segment {
++        Segment::Hunk(Hunk {
++            ours: ours.as_bytes().to_vec(),
++            theirs: theirs.as_bytes().to_vec(),
++            choice: None,
++        })
++    }
++
++    fn text(t: &str) -> Segment {
++        Segment::Text(t.as_bytes().to_vec())
++    }
++
++    #[test]
++    fn parses_text_and_hunks_in_order() {
++        let src = "l1\n<<<<<<< HEAD\nMAIN\n=======\nFEAT\n>>>>>>> abc\nl3\n";
++        let segs = parse(src.as_bytes()).unwrap();
++        assert_eq!(
++            segs,
++            vec![text("l1\n"), hunk("MAIN\n", "FEAT\n"), text("l3\n")]
++        );
++        assert_eq!(hunk_count(&segs), 1);
++        assert_eq!(unresolved_count(&segs), 1);
++    }
++
++    #[test]
++    fn parses_several_hunks() {
++        let src = "<<<<<<< a\n1\n=======\n2\n>>>>>>> b\nmid\n<<<<<<< a\n3\n=======\n4\n>>>>>>> b\n";
++        let segs = parse(src.as_bytes()).unwrap();
++        assert_eq!(hunk_count(&segs), 2);
++        assert_eq!(segs.len(), 3);
++    }
++
++    #[test]
++    fn discards_a_diff3_base_section() {
++        let src = "<<<<<<< HEAD\nours\n||||||| base\nold\n=======\ntheirs\n>>>>>>> x\n";
++        let segs = parse(src.as_bytes()).unwrap();
++        assert_eq!(segs, vec![hunk("ours\n", "theirs\n")]);
++    }
++
++    #[test]
++    fn keeps_carriage_returns_inside_sides() {
++        let src = "<<<<<<< HEAD\r\nA\r\n=======\r\nB\r\n>>>>>>> x\r\n";
++        let mut segs = parse(src.as_bytes()).unwrap();
++        assert_eq!(segs, vec![hunk("A\r\n", "B\r\n")]);
++        if let Segment::Hunk(h) = &mut segs[0] {
++            h.choice = Some(Side::B);
++        }
++        assert_eq!(render(&segs).unwrap(), b"B\r\n");
++    }
++
++    #[test]
++    fn empty_side_is_a_valid_hunk() {
++        let src = "<<<<<<< HEAD\n=======\nadded\n>>>>>>> x\n";
++        let segs = parse(src.as_bytes()).unwrap();
++        assert_eq!(segs, vec![hunk("", "added\n")]);
++    }
++
++    #[test]
++    fn rejects_files_without_a_complete_conflict() {
++        assert!(parse(b"plain\ntext\n").is_none());
++        assert!(parse(b"<<<<<<< HEAD\nours\n=======\ntheirs\n").is_none());
++        assert!(parse(b"<<<<<<< HEAD\nours\n>>>>>>> x\n").is_none());
++        assert!(parse(b"=======\n").is_none());
++        assert!(parse(b"<<<<<<< a\n<<<<<<< b\n=======\n>>>>>>> c\n").is_none());
++        assert!(parse(b"").is_none());
++    }
++
++    #[test]
++    fn longer_marker_runs_and_prose_are_not_markers() {
++        // Eight characters is not a marker of length seven: git lengthens markers when the file
++        // holds such lines, and this parser declines those files.
++        assert!(parse(b"<<<<<<<< x\na\n========\nb\n>>>>>>>> y\n").is_none());
++        let segs = parse(b"<<<<<<< a\nx\n=======\ny\n>>>>>>> b\n=== not a marker\n").unwrap();
++        assert_eq!(segs.len(), 2);
++    }
++
++    #[test]
++    fn render_waits_for_every_decision() {
++        let mut segs = parse(b"a\n<<<<<<< x\n1\n=======\n2\n>>>>>>> y\nb\n").unwrap();
++        assert!(render(&segs).is_none());
++        if let Segment::Hunk(h) = &mut segs[1] {
++            h.choice = Some(Side::A);
++        }
++        assert_eq!(render(&segs).unwrap(), b"a\n1\nb\n");
++        assert_eq!(unresolved_count(&segs), 0);
++    }
++
++    #[test]
++    fn each_side_renders_as_chosen() {
++        for (side, want) in [(Side::A, "1\n"), (Side::B, "2\n"), (Side::Both, "1\n2\n")] {
++            let mut segs = parse(b"<<<<<<< x\n1\n=======\n2\n>>>>>>> y\n").unwrap();
++            if let Segment::Hunk(h) = &mut segs[0] {
++                h.choice = Some(side);
++            }
++            assert_eq!(render(&segs).unwrap(), want.as_bytes());
++        }
++    }
++
++    #[test]
++    fn fingerprint_depends_on_every_field_and_their_boundaries() {
++        let base = fingerprint("f", b"ab", b"c");
++        assert_eq!(base, fingerprint("f", b"ab", b"c"));
++        assert_ne!(base, fingerprint("g", b"ab", b"c"));
++        assert_ne!(base, fingerprint("f", b"a", b"bc"));
++        assert_ne!(base, fingerprint("f", b"ab", b"d"));
++        assert_eq!(base.len(), 16);
++    }
++
++    #[test]
++    fn side_letters_round_trip() {
++        for s in [Side::A, Side::B, Side::Both] {
++            assert_eq!(Side::from_letter(s.letter()), Some(s));
++        }
++        assert_eq!(Side::from_letter('z'), None);
++    }
++}
+diff --git a/src/git.rs b/src/git.rs
+index 29dbc24..eff9796 100644
+--- a/src/git.rs
++++ b/src/git.rs
+@@ -394,3 +394,95 @@ pub fn add_pathspec(dir: &Path, paths: &[&str]) -> Res<()> {
+ pub fn index_locked(git_dir: &Path) -> bool {
+     git_dir.join("index.lock").exists()
+ }
++
++// Raw bytes of a blob or of a `<tree>:<path>` entry. The other wrappers here return trimmed UTF-8
++// text; file content may be neither, so this one returns the bytes untouched.
++pub fn cat_blob(dir: &Path, spec: &str) -> Res<Vec<u8>> {
++    let out = Command::new("git")
++        .arg("-C")
++        .arg(dir)
++        .args(["cat-file", "blob", spec])
++        .output()?;
++    if !out.status.success() {
++        let msg = String::from_utf8_lossy(&out.stderr);
++        return Err(format!("git cat-file {spec}: {}", msg.trim()).into());
++    }
++    Ok(out.stdout)
++}
++
++// Store `bytes` as a loose blob and return its object id.
++pub fn hash_object_write(dir: &Path, bytes: &[u8]) -> Res<String> {
++    let mut child = Command::new("git")
++        .arg("-C")
++        .arg(dir)
++        .args(["hash-object", "-w", "--stdin"])
++        .stdin(Stdio::piped())
++        .stdout(Stdio::piped())
++        .stderr(Stdio::piped())
++        .spawn()?;
++    {
++        let mut stdin = child
++            .stdin
++            .take()
++            .ok_or("git hash-object: stdin unavailable")?;
++        stdin.write_all(bytes)?;
++    }
++    let out = child.wait_with_output()?;
++    if !out.status.success() {
++        let msg = String::from_utf8_lossy(&out.stderr);
++        return Err(format!("git hash-object: {}", msg.trim()).into());
++    }
++    Ok(String::from_utf8(out.stdout)?.trim().to_string())
++}
++
++// Record exactly the given work-tree-relative paths as one commit with an empty message, leaving any
++// other staged change out of it. The paths are staged first so that a newly created file is known to
++// the index; `--only` then restricts the commit to them. Hooks are bypassed, matching the watcher's
++// atomic commits. Returns the new commit's object id, or None when the paths held no change.
++pub fn commit_only(dir: &Path, paths: &[&str]) -> Res<Option<String>> {
++    if paths.is_empty() {
++        return Ok(None);
++    }
++    add_pathspec(dir, paths)?;
++    let mut input = String::new();
++    for p in paths {
++        input.push_str(p);
++        input.push(NUL);
++    }
++    let mut child = Command::new("git")
++        .arg("-C")
++        .arg(dir)
++        .args([
++            "commit",
++            "--only",
++            "--allow-empty-message",
++            "--no-verify",
++            "--quiet",
++            "-m",
++            "",
++            "--pathspec-from-file=-",
++            "--pathspec-file-nul",
++        ])
++        .stdin(Stdio::piped())
++        .stdout(Stdio::piped())
++        .stderr(Stdio::piped())
++        .spawn()?;
++    {
++        let mut stdin = child.stdin.take().ok_or("git commit: stdin unavailable")?;
++        stdin.write_all(input.as_bytes())?;
++    }
++    let out = child.wait_with_output()?;
++    if !out.status.success() {
++        let text = format!(
++            "{}{}",
++            String::from_utf8_lossy(&out.stdout),
++            String::from_utf8_lossy(&out.stderr)
++        );
++        // Nothing to commit is an answer, not a fault: the paths already matched HEAD.
++        if text.contains("nothing to commit") || text.contains("no changes added") {
++            return Ok(None);
++        }
++        return Err(format!("git commit: {}", text.trim()).into());
++    }
++    Ok(Some(rev_parse(dir, "HEAD")?))
++}
+diff --git a/src/main.rs b/src/main.rs
+index 9ac9483..6fa8c5f 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -11,11 +11,17 @@
+ use std::path::PathBuf;
+ use std::process::ExitCode;
+ 
++mod cherry;
++mod cherry_ui;
+ mod commands;
+ mod config;
++mod conflict;
+ mod git;
++mod patch;
+ mod pick;
+ mod proc;
++#[cfg(test)]
++mod testrepo;
+ mod watch;
+ 
+ // Application-wide fallible result. A boxed trait object keeps the error surface dependency-free while still
+@@ -98,6 +104,7 @@ fn dispatch(args: &[String]) -> Res<()> {
+                 commands::drop_commits(&cwd, &opts.hashes, opts.dry_run)
+             }
+         }
++        "cherry-pick" | "pick" => cherry::run(&cwd, parse_cherry(&args[1..])?),
+         "stop" => commands::stop(&cwd),
+         "abort" => commands::abort(&cwd, args[1..].iter().any(|a| a == "--force" || a == "-f")),
+         "-h" | "--help" | "help" | "" => {
+@@ -168,6 +175,38 @@ impl DropOpts {
+     }
+ }
+ 
++// Parse cherry-pick arguments. Every positional word is a commit (abbreviated or full), replayed in
++// the order given; with none, the interactive screen opens. `--from <branch>` names the branch that
++// screen lists first; `-n/--dry-run` reports the patch without writing or applying it;
++// `-p/--patch-only` writes the patch file and stops.
++fn parse_cherry(rest: &[String]) -> Res<cherry::Opts> {
++    let mut opts = cherry::Opts {
++        from: None,
++        hashes: Vec::new(),
++        dry_run: false,
++        patch_only: false,
++    };
++    let mut it = rest.iter();
++    while let Some(arg) = it.next() {
++        match arg.as_str() {
++            "-n" | "--dry-run" => opts.dry_run = true,
++            "-p" | "--patch-only" => opts.patch_only = true,
++            "--from" => {
++                let value = it.next().ok_or("expected a branch after --from")?;
++                opts.from = Some(value.clone());
++            }
++            flag if flag.starts_with("--from=") => {
++                opts.from = Some(flag["--from=".len()..].to_string());
++            }
++            flag if flag.starts_with('-') => {
++                return Err(format!("unexpected option '{flag}' for cherry-pick").into())
++            }
++            hash => opts.hashes.push(hash.to_string()),
++        }
++    }
++    Ok(opts)
++}
++
+ // Parsed options for the init command.
+ struct InitOpts {
+     foreground: bool,
+@@ -264,6 +303,18 @@ COMMANDS:
+                        'git cherry-pick <full id>' (printed). With no hash, opens an interactive
+                        picker: commits on the left, the highlighted diff on the right, space to
+                        mark, Enter to drop the marked commits after a y/n confirmation. Aliases: rm.
++  cherry-pick [options] [<hash>...]
++                       Bring commits from another branch onto the checked-out one by way of a
++                       patch file, without rewriting history. The chosen commits are replayed onto
++                       the current HEAD and the result is applied to the work tree; with a session
++                       open it is recorded as one atomic commit (a live watcher is paused
++                       meanwhile), otherwise it is left uncommitted. With no hash, opens an
++                       interactive screen: commits on the left, what each would change on the
++                       right, space to mark, Tab to choose the branch, Enter to prepare. A
++                       conflict opens a decision screen: a keeps the tree copy, b takes the picked
++                       commit's, c keeps both, per conflict hunk. Options: --from <branch>,
++                       -n/--dry-run (report only), -p/--patch-only (write the patch file, apply
++                       nothing). With hashes, conflicts are refused. Aliases: pick.
+   stop                 Stop the watcher but keep the base and recorded commits for later finish/resume.
+   abort [--force]      Discard the session: reset the branch to the base and drop the atomic commits.
+   help, --version
+diff --git a/src/patch.rs b/src/patch.rs
+new file mode 100644
+index 0000000..5a06dd1
+--- /dev/null
++++ b/src/patch.rs
+@@ -0,0 +1,999 @@
++// Patch construction for `gitomic cherry-pick` (issue #13). A patch is computed against one
++// specific commit (its base) by replaying the chosen commits, oldest first, onto that base inside
++// the object database with `git merge-tree`; the result is the diff between the base and the final
++// tree. Nothing here reads or writes the index or work tree of the repository, so building a patch,
++// however often it is repeated, cannot disturb uncommitted work.
++//
++// The module is deliberately independent of the terminal and of session handling, and a patch
++// carries a small header naming its base, its source commits, and every conflict decision taken.
++// That makes a patch reproducible: `rebuild` recomputes it against a newer base, reusing each
++// recorded decision whose conflict reappears unchanged. The command layer uses this when HEAD
++// advances between choosing commits and applying them, and the same function is the natural core of
++// a stand-alone patch re-write command should one be added.
++
++use std::collections::BTreeMap;
++use std::path::{Path, PathBuf};
++use std::process::Command;
++use std::sync::atomic::{AtomicUsize, Ordering};
++
++use crate::conflict::{self, Segment, Side};
++use crate::{git, Res};
++
++// A file version as git's index records it: mode and blob id.
++#[derive(Clone, Debug)]
++pub struct Blob {
++    pub mode: String,
++    pub oid: String,
++}
++
++// How one conflicted path is decided.
++#[derive(Clone, Debug)]
++pub enum Body {
++    // A text file with conflict hunks, each decided on its own.
++    Hunks(Vec<Segment>),
++    // A file decided as a whole: binary content, a text file whose markers could not be parsed, or
++    // a modify/delete conflict. `None` on either side stands for "absent there".
++    Whole {
++        ours: Option<Blob>,
++        theirs: Option<Blob>,
++        choice: Option<Side>,
++    },
++}
++
++#[derive(Clone, Debug)]
++pub struct FileConflict {
++    pub path: String,
++    // Mode used for a file rebuilt from its hunks.
++    pub mode: String,
++    pub body: Body,
++}
++
++impl FileConflict {
++    // Number of separate decisions this file needs.
++    pub fn units(&self) -> usize {
++        match &self.body {
++            Body::Hunks(segs) => conflict::hunk_count(segs),
++            Body::Whole { .. } => 1,
++        }
++    }
++
++    pub fn unresolved(&self) -> usize {
++        match &self.body {
++            Body::Hunks(segs) => conflict::unresolved_count(segs),
++            Body::Whole { choice, .. } => usize::from(choice.is_none()),
++        }
++    }
++
++    // The current decision of unit `unit`.
++    pub fn choice(&self, unit: usize) -> Option<Side> {
++        match &self.body {
++            Body::Hunks(segs) => hunks(segs).nth(unit).and_then(|h| h.choice),
++            Body::Whole { choice, .. } => choice.filter(|_| unit == 0),
++        }
++    }
++
++    // Record a decision for unit `unit`. Returns false, changing nothing, when the unit does not
++    // exist or the side is not available for it (a whole-file conflict has no "both").
++    pub fn set(&mut self, unit: usize, side: Option<Side>) -> bool {
++        match &mut self.body {
++            Body::Hunks(segs) => match hunks_mut(segs).nth(unit) {
++                Some(h) => {
++                    h.choice = side;
++                    true
++                }
++                None => false,
++            },
++            Body::Whole { choice, .. } => {
++                if unit != 0 || side == Some(Side::Both) {
++                    return false;
++                }
++                *choice = side;
++                true
++            }
++        }
++    }
++
++    // Stable identities of the units, in order; see `conflict::fingerprint`.
++    pub fn fingerprints(&self) -> Vec<String> {
++        match &self.body {
++            Body::Hunks(segs) => hunks(segs)
++                .map(|h| conflict::fingerprint(&self.path, &h.ours, &h.theirs))
++                .collect(),
++            Body::Whole { ours, theirs, .. } => {
++                let id = |b: &Option<Blob>| b.as_ref().map_or("-".to_string(), |b| b.oid.clone());
++                vec![conflict::fingerprint(
++                    &self.path,
++                    id(ours).as_bytes(),
++                    id(theirs).as_bytes(),
++                )]
++            }
++        }
++    }
++
++    // Adopt remembered decisions for every unit whose fingerprint is known.
++    fn apply_saved(&mut self, saved: &[(String, Side)]) {
++        for (unit, fp) in self.fingerprints().iter().enumerate() {
++            if let Some((_, side)) = saved.iter().find(|(f, _)| f == fp) {
++                self.set(unit, Some(*side));
++            }
++        }
++    }
++
++    // The decisions taken so far, as (fingerprint, side) pairs.
++    fn decisions(&self) -> Vec<(String, Side)> {
++        self.fingerprints()
++            .into_iter()
++            .enumerate()
++            .filter_map(|(unit, fp)| self.choice(unit).map(|side| (fp, side)))
++            .collect()
++    }
++}
++
++fn hunks(segs: &[Segment]) -> impl Iterator<Item = &conflict::Hunk> {
++    segs.iter().filter_map(|s| match s {
++        Segment::Hunk(h) => Some(h),
++        Segment::Text(_) => None,
++    })
++}
++
++fn hunks_mut(segs: &mut [Segment]) -> impl Iterator<Item = &mut conflict::Hunk> {
++    segs.iter_mut().filter_map(|s| match s {
++        Segment::Hunk(h) => Some(h),
++        Segment::Text(_) => None,
++    })
++}
++
++// The result of merging one commit onto a base.
++pub enum Merged {
++    Clean(String),
++    Conflicted {
++        tree: String,
++        files: Vec<FileConflict>,
++    },
++    // Conflict kinds that have no A/B decision (renames, directory/file clashes, and the like),
++    // with git's own description of each.
++    Unsupported(Vec<String>),
++}
++
++// Apply `pick`'s own change (its diff against its first parent) onto the commit `onto`, in the
++// object database. `merge.conflictStyle` is pinned so the marker layout is the one
++// `conflict::parse` expects whatever the user's configuration says.
++pub fn merge(root: &Path, onto: &str, pick: &str) -> Res<Merged> {
++    let out = Command::new("git")
++        .arg("-C")
++        .arg(root)
++        .args(["-c", "merge.conflictStyle=merge"])
++        .args(["merge-tree", "--write-tree", "-z"])
++        .arg(format!("--merge-base={pick}^"))
++        .arg(onto)
++        .arg(pick)
++        .output()?;
++    match out.status.code() {
++        Some(0) => {
++            let tree = out
++                .stdout
++                .split(|&b| b == 0)
++                .next()
++                .map(|t| String::from_utf8_lossy(t).trim().to_string())
++                .unwrap_or_default();
++            if tree.is_empty() {
++                return Err("git merge-tree: no tree id in output".into());
++            }
++            Ok(Merged::Clean(tree))
++        }
++        Some(1) => parse_conflicts(root, &out.stdout),
++        _ => {
++            let msg = String::from_utf8_lossy(&out.stderr);
++            Err(format!("git merge-tree: {}", msg.trim()).into())
++        }
++    }
++}
++
++// Conflict kinds `merge` can present for a decision.
++const SUPPORTED: [&str; 4] = [
++    "CONFLICT (contents)",
++    // Reported alongside a contents conflict when the file is binary.
++    "CONFLICT (binary)",
++    "CONFLICT (modify/delete)",
++    "CONFLICT (add/add)",
++];
++
++#[derive(Default)]
++struct Stages {
++    ours: Option<Blob>,
++    theirs: Option<Blob>,
++    base: bool,
++}
++
++// Parse the NUL-delimited output of `git merge-tree --write-tree -z` for a conflicted merge: the
++// tree id, one `<mode> <oid> <stage>\t<path>` record per conflicted index entry, an empty field,
++// and then groups of informational messages (`<n>`, n paths, a type, a message).
++fn parse_conflicts(root: &Path, stdout: &[u8]) -> Res<Merged> {
++    let mut fields = stdout.split(|&b| b == 0);
++    let tree = String::from_utf8_lossy(fields.next().unwrap_or_default())
++        .trim()
++        .to_string();
++    if tree.is_empty() {
++        return Err("git merge-tree: no tree id in output".into());
++    }
++
++    let mut stages: BTreeMap<String, Stages> = BTreeMap::new();
++    for field in fields.by_ref() {
++        if field.is_empty() {
++            break;
++        }
++        let text = String::from_utf8_lossy(field);
++        let (meta, path) = text
++            .split_once('\t')
++            .ok_or("git merge-tree: malformed conflict entry")?;
++        let mut parts = meta.split(' ');
++        let (mode, oid, stage) = (parts.next(), parts.next(), parts.next());
++        let (Some(mode), Some(oid), Some(stage)) = (mode, oid, stage) else {
++            return Err("git merge-tree: malformed conflict entry".into());
++        };
++        let entry = stages.entry(path.to_string()).or_default();
++        let blob = Blob {
++            mode: mode.to_string(),
++            oid: oid.to_string(),
++        };
++        match stage {
++            "1" => entry.base = true,
++            "2" => entry.ours = Some(blob),
++            "3" => entry.theirs = Some(blob),
++            _ => return Err("git merge-tree: unexpected stage".into()),
++        }
++    }
++
++    let mut unsupported = Vec::new();
++    let rest: Vec<&[u8]> = fields.collect();
++    let mut i = 0;
++    while i < rest.len() {
++        let Ok(n) = String::from_utf8_lossy(rest[i]).trim().parse::<usize>() else {
++            break;
++        };
++        let ty = rest.get(i + 1 + n).map(|f| String::from_utf8_lossy(f));
++        let msg = rest.get(i + 2 + n).map(|f| String::from_utf8_lossy(f));
++        if let (Some(ty), Some(msg)) = (ty, msg) {
++            if ty.starts_with("CONFLICT") && !SUPPORTED.contains(&ty.as_ref()) {
++                unsupported.push(msg.trim().to_string());
++            }
++        }
++        i += 3 + n;
++    }
++    if !unsupported.is_empty() {
++        return Ok(Merged::Unsupported(unsupported));
++    }
++
++    let mut files = Vec::new();
++    for (path, st) in stages {
++        let mode = st
++            .ours
++            .as_ref()
++            .or(st.theirs.as_ref())
++            .map_or("100644".to_string(), |b| b.mode.clone());
++        let body = match (&st.ours, &st.theirs) {
++            (Some(_), Some(_)) => {
++                let content = git::cat_blob(root, &format!("{tree}:{path}")).ok();
++                let parsed = content
++                    .filter(|c| !c.contains(&0))
++                    .and_then(|c| conflict::parse(&c));
++                match parsed {
++                    Some(segs) => Body::Hunks(segs),
++                    None => Body::Whole {
++                        ours: st.ours,
++                        theirs: st.theirs,
++                        choice: None,
++                    },
++                }
++            }
++            (Some(_), None) | (None, Some(_)) => Body::Whole {
++                ours: st.ours,
++                theirs: st.theirs,
++                choice: None,
++            },
++            (None, None) => {
++                return Ok(Merged::Unsupported(vec![format!(
++                    "{path}: conflict with no version on either side (base only)"
++                )]));
++            }
++        };
++        files.push(FileConflict { path, mode, body });
++    }
++    Ok(Merged::Conflicted { tree, files })
++}
++
++static NEXT_INDEX: AtomicUsize = AtomicUsize::new(0);
++
++// Turn a conflicted tree and a full set of decisions into a clean tree. A throwaway index file is
++// seeded from the conflicted tree, the decided files are written into it, and `write-tree` reads it
++// back, so the repository's own index and work tree are never involved.
++fn resolved_tree(root: &Path, tree: &str, files: &[FileConflict]) -> Res<String> {
++    let git_dir = git::git_dir(root)?;
++    let n = NEXT_INDEX.fetch_add(1, Ordering::SeqCst);
++    let index = git_dir.join(format!("gitomic-pick-{}-{n}.idx", std::process::id()));
++    let _ = std::fs::remove_file(&index);
++    let result = (|| -> Res<String> {
++        let run = |args: &[&str]| -> Res<String> {
++            let out = Command::new("git")
++                .arg("-C")
++                .arg(root)
++                .args(args)
++                .env("GIT_INDEX_FILE", &index)
++                .output()?;
++            if !out.status.success() {
++                let msg = String::from_utf8_lossy(&out.stderr);
++                return Err(format!("git {}: {}", args.join(" "), msg.trim()).into());
++            }
++            Ok(String::from_utf8(out.stdout)?.trim().to_string())
++        };
++        run(&["read-tree", tree])?;
++        for file in files {
++            match &file.body {
++                Body::Hunks(segs) => {
++                    let bytes = conflict::render(segs)
++                        .ok_or_else(|| format!("{}: a hunk is still undecided", file.path))?;
++                    let oid = git::hash_object_write(root, &bytes)?;
++                    run(&[
++                        "update-index",
++                        "--add",
++                        "--cacheinfo",
++                        &file.mode,
++                        &oid,
++                        &file.path,
++                    ])?;
++                }
++                Body::Whole {
++                    ours,
++                    theirs,
++                    choice,
++                } => {
++                    let picked = match choice {
++                        Some(Side::A) => ours,
++                        Some(Side::B) => theirs,
++                        _ => return Err(format!("{}: not decided", file.path).into()),
++                    };
++                    match picked {
++                        Some(b) => run(&[
++                            "update-index",
++                            "--add",
++                            "--cacheinfo",
++                            &b.mode,
++                            &b.oid,
++                            &file.path,
++                        ])?,
++                        None => run(&["update-index", "--force-remove", "--", &file.path])?,
++                    };
++                }
++            }
++        }
++        run(&["write-tree"])
++    })();
++    let _ = std::fs::remove_file(&index);
++    result
++}
++
++// Progress of a replay: what remains to be merged and the running result.
++pub struct Job {
++    root: PathBuf,
++    base: String,
++    picks: Vec<String>,
++    // A scratch commit whose tree is the running result; `base` until the first pick is merged.
++    // Merge inputs must be commits, and the scratch commits are unreferenced, so they vanish at gc.
++    tip: String,
++    done: usize,
++    pending_tree: Option<String>,
++    decided: Vec<(String, Side)>,
++}
++
++// Where a replay stopped.
++pub enum Step {
++    Done,
++    // A pick conflicts; the files carry whatever decisions were already known.
++    Conflicts(Vec<FileConflict>),
++    Unsupported(Vec<String>),
++}
++
++impl Job {
++    // `picks` are full commit ids, oldest first. `decided` seeds the decisions reused when a
++    // matching conflict appears.
++    pub fn new(root: &Path, base: &str, picks: &[String], decided: &[(String, Side)]) -> Job {
++        Job {
++            root: root.to_path_buf(),
++            base: base.to_string(),
++            picks: picks.to_vec(),
++            tip: base.to_string(),
++            done: 0,
++            pending_tree: None,
++            decided: decided.to_vec(),
++        }
++    }
++
++    // Merge picks until one needs a decision or all are merged. A conflict whose every unit already
++    // has a remembered decision is resolved without stopping.
++    pub fn advance(&mut self) -> Res<Step> {
++        loop {
++            if self.done == self.picks.len() {
++                return Ok(Step::Done);
++            }
++            let pick = self.picks[self.done].clone();
++            match merge(&self.root, &self.tip, &pick)? {
++                Merged::Clean(tree) => self.take(&tree)?,
++                Merged::Unsupported(list) => return Ok(Step::Unsupported(list)),
++                Merged::Conflicted { tree, mut files } => {
++                    for f in &mut files {
++                        f.apply_saved(&self.decided);
++                    }
++                    if files.iter().all(|f| f.unresolved() == 0) {
++                        let clean = resolved_tree(&self.root, &tree, &files)?;
++                        self.take(&clean)?;
++                    } else {
++                        self.pending_tree = Some(tree);
++                        return Ok(Step::Conflicts(files));
++                    }
++                }
++            }
++        }
++    }
++
++    // Supply the decisions for the conflict `advance` reported, then continue with `advance`.
++    pub fn resolve(&mut self, files: &[FileConflict]) -> Res<()> {
++        let tree = self
++            .pending_tree
++            .take()
++            .ok_or("no conflict is waiting for a decision")?;
++        let clean = match resolved_tree(&self.root, &tree, files) {
++            Ok(t) => t,
++            Err(e) => {
++                self.pending_tree = Some(tree);
++                return Err(e);
++            }
++        };
++        for f in files {
++            for (fp, side) in f.decisions() {
++                if !self.decided.iter().any(|(k, _)| *k == fp) {
++                    self.decided.push((fp, side));
++                }
++            }
++        }
++        self.take(&clean)
++    }
++
++    // Adopt `tree` as the result of the pick being merged.
++    fn take(&mut self, tree: &str) -> Res<()> {
++        self.tip = git::commit_tree(
++            &self.root,
++            tree,
++            &self.tip,
++            "gitomic cherry-pick scratch",
++            "gitomic",
++            "gitomic@localhost",
++            "1970-01-01T00:00:00+00:00",
++        )?;
++        self.done += 1;
++        Ok(())
++    }
++
++    // Every decision known to this job, taken now or seeded, for recording in a patch header.
++    pub fn decisions(&self) -> &[(String, Side)] {
++        &self.decided
++    }
++
++    // The patch between the base and the running result.
++    pub fn patch(&self, subjects: &[(String, String)]) -> Res<Patch> {
++        let base = &self.base;
++        let tip = &self.tip;
++        let body = diff_bytes(
++            &self.root,
++            &[
++                "diff",
++                "--binary",
++                "--full-index",
++                "--no-renames",
++                "--no-color",
++                base,
++                tip,
++            ],
++        )?;
++        let names = diff_bytes(
++            &self.root,
++            &["diff", "--name-only", "-z", "--no-renames", base, tip],
++        )?;
++        let stat = String::from_utf8_lossy(&diff_bytes(
++            &self.root,
++            &["diff", "--stat", "--no-renames", "--no-color", base, tip],
++        )?)
++        .into_owned();
++        let paths = names
++            .split(|&b| b == 0)
++            .filter(|p| !p.is_empty())
++            .map(|p| String::from_utf8_lossy(p).into_owned())
++            .collect();
++        Ok(Patch {
++            spec: Spec {
++                base: self.base.clone(),
++                picks: subjects.to_vec(),
++                decisions: self.decided.clone(),
++            },
++            body,
++            paths,
++            stat,
++        })
++    }
++}
++
++fn diff_bytes(root: &Path, args: &[&str]) -> Res<Vec<u8>> {
++    let out = Command::new("git")
++        .arg("-C")
++        .arg(root)
++        .args(args)
++        .output()?;
++    if !out.status.success() {
++        let msg = String::from_utf8_lossy(&out.stderr);
++        return Err(format!("git {}: {}", args.join(" "), msg.trim()).into());
++    }
++    Ok(out.stdout)
++}
++
++// What a patch was built from; enough to build it again.
++#[derive(Clone, Debug, PartialEq)]
++pub struct Spec {
++    // The commit the patch applies to.
++    pub base: String,
++    // (full id, subject) of each source commit, oldest first.
++    pub picks: Vec<(String, String)>,
++    // (fingerprint, side) of every conflict decision.
++    pub decisions: Vec<(String, Side)>,
++}
++
++const HEADER_TAG: &str = "# gitomic-patch 1";
++
++impl Spec {
++    pub fn ids(&self) -> Vec<String> {
++        self.picks.iter().map(|(id, _)| id.clone()).collect()
++    }
++
++    // The header lines, ending with a blank line. `git apply` skips text ahead of the first
++    // `diff --git` line, so a patch carrying this header applies unchanged.
++    pub fn header(&self) -> String {
++        let mut out = format!("{HEADER_TAG}\n# base {}\n", self.base);
++        for (id, subject) in &self.picks {
++            let subject = subject.replace(['\n', '\r'], " ");
++            out.push_str(&format!("# pick {id} {subject}\n"));
++        }
++        for (fp, side) in &self.decisions {
++            out.push_str(&format!("# decision {fp} {}\n", side.letter()));
++        }
++        out.push('\n');
++        out
++    }
++
++    // Read a header back from the start of a patch file. None when the file does not begin with
++    // one. Not used by a command yet: it is the entry point for re-basing an existing patch file,
++    // and is covered by tests so that the format cannot drift unnoticed.
++    #[allow(dead_code)]
++    pub fn parse(patch: &[u8]) -> Option<Spec> {
++        let text = String::from_utf8_lossy(&patch[..patch.len().min(64 * 1024)]).into_owned();
++        let mut lines = text.lines();
++        if lines.next()? != HEADER_TAG {
++            return None;
++        }
++        let mut base = None;
++        let mut picks = Vec::new();
++        let mut decisions = Vec::new();
++        for line in lines {
++            let Some(rest) = line.strip_prefix("# ") else {
++                break;
++            };
++            if let Some(b) = rest.strip_prefix("base ") {
++                base = Some(b.trim().to_string());
++            } else if let Some(p) = rest.strip_prefix("pick ") {
++                let (id, subject) = p.split_once(' ').unwrap_or((p, ""));
++                picks.push((id.to_string(), subject.to_string()));
++            } else if let Some(d) = rest.strip_prefix("decision ") {
++                let (fp, side) = d.split_once(' ')?;
++                let side = Side::from_letter(side.trim().chars().next()?)?;
++                decisions.push((fp.to_string(), side));
++            }
++        }
++        Some(Spec {
++            base: base?,
++            picks,
++            decisions,
++        })
++    }
++}
++
++// A finished patch: its recipe, the diff, and the paths the diff touches.
++pub struct Patch {
++    pub spec: Spec,
++    body: Vec<u8>,
++    pub paths: Vec<String>,
++    // `git diff --stat` of the change, for reports.
++    pub stat: String,
++}
++
++impl Patch {
++    // True when applying the patch would change nothing (every pick is already present in the
++    // base).
++    pub fn is_empty(&self) -> bool {
++        self.body.is_empty()
++    }
++
++    // The full file content: header, then the diff.
++    pub fn bytes(&self) -> Vec<u8> {
++        let mut out = self.spec.header().into_bytes();
++        out.extend_from_slice(&self.body);
++        out
++    }
++}
++
++// What a build produced.
++pub enum Built {
++    Ready(Box<Patch>),
++    // A conflict needs a decision; the files are returned undecided.
++    Conflicts(Vec<FileConflict>),
++    Unsupported(Vec<String>),
++}
++
++// Replay `spec` against its own base. Decisions in the spec are reused where their conflicts recur.
++pub fn build(root: &Path, spec: &Spec) -> Res<Built> {
++    let mut job = Job::new(root, &spec.base, &spec.ids(), &spec.decisions);
++    match job.advance()? {
++        Step::Done => Ok(Built::Ready(Box::new(job.patch(&spec.picks)?))),
++        Step::Conflicts(files) => Ok(Built::Conflicts(files)),
++        Step::Unsupported(list) => Ok(Built::Unsupported(list)),
++    }
++}
++
++// Recompute `spec` against `new_base`, typically the HEAD that appeared after the original patch
++// was prepared. Decisions carry over wherever the same conflict recurs.
++pub fn rebuild(root: &Path, spec: &Spec, new_base: &str) -> Res<Built> {
++    build(
++        root,
++        &Spec {
++            base: new_base.to_string(),
++            ..spec.clone()
++        },
++    )
++}
++
++// Directory holding written patch files. Kept beside, not inside, the per-branch session state so a
++// branch named like a subdirectory cannot collide with it.
++pub fn patch_dir(git_dir: &Path) -> PathBuf {
++    git_dir.join("gitomic-picks")
++}
++
++static NEXT_PATCH: AtomicUsize = AtomicUsize::new(0);
++
++// Write `patch` to a new file under `dir` and return its path. The name carries the base and the
++// time, so successive patches never overwrite one another.
++pub fn write(dir: &Path, patch: &Patch) -> Res<PathBuf> {
++    std::fs::create_dir_all(dir)?;
++    let secs = std::time::SystemTime::now()
++        .duration_since(std::time::UNIX_EPOCH)
++        .map_or(0, |d| d.as_secs());
++    let n = NEXT_PATCH.fetch_add(1, Ordering::SeqCst);
++    let base: String = patch.spec.base.chars().take(8).collect();
++    let path = dir.join(format!("pick-{secs}-{n}-{base}.patch"));
++    std::fs::write(&path, patch.bytes())?;
++    Ok(path)
++}
++
++// Test whether the patch file applies to the work tree, changing nothing. The error carries git's
++// own explanation, which names the offending file and hunk.
++pub fn check(root: &Path, file: &Path) -> Res<()> {
++    apply_with(root, file, true)
++}
++
++// Apply the patch file to the work tree only; the index is not touched.
++pub fn apply(root: &Path, file: &Path) -> Res<()> {
++    apply_with(root, file, false)
++}
++
++fn apply_with(root: &Path, file: &Path, check_only: bool) -> Res<()> {
++    let mut cmd = Command::new("git");
++    cmd.arg("-C").arg(root).arg("apply");
++    if check_only {
++        cmd.arg("--check");
++    }
++    let out = cmd.arg(file).output()?;
++    if !out.status.success() {
++        let msg = String::from_utf8_lossy(&out.stderr);
++        return Err(msg.trim().to_string().into());
++    }
++    Ok(())
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::testrepo::Repo;
++
++    // `main` and `feat` both edit the given lines of one file, starting from the same base. HEAD is
++    // left on `main`. Returns the id of the commit on `feat`.
++    fn diverge(r: &Repo, main_edits: &[(usize, &str)], feat_edits: &[(usize, &str)]) -> String {
++        r.commit_file("f.txt", &Repo::lines(), "base");
++        r.git(&["checkout", "-q", "-b", "feat"]);
++        let feat = r.commit_file("f.txt", &Repo::lines_with(feat_edits), "feat edit");
++        r.git(&["checkout", "-q", "main"]);
++        r.commit_file("f.txt", &Repo::lines_with(main_edits), "main edit");
++        feat
++    }
++
++    fn conflicts(job: &mut Job) -> Vec<FileConflict> {
++        match job.advance().unwrap() {
++            Step::Conflicts(files) => files,
++            Step::Done => panic!("expected a conflict, got a clean replay"),
++            Step::Unsupported(l) => panic!("unsupported: {l:?}"),
++        }
++    }
++
++    // Apply the job's patch to the work tree of `r` and return the resulting file.
++    fn applied(r: &Repo, job: &Job, name: &str) -> String {
++        let patch = job.patch(&[]).unwrap();
++        let file = r.0.join("out.patch");
++        std::fs::write(&file, patch.bytes()).unwrap();
++        r.git(&["apply", file.to_str().unwrap()]);
++        r.read(name)
++    }
++
++    #[test]
++    fn a_clean_replay_needs_no_decision_and_yields_the_change() {
++        let r = Repo::new();
++        r.commit_file("a.txt", "a\n", "base");
++        r.git(&["checkout", "-q", "-b", "feat"]);
++        let feat = r.commit_file("b.txt", "b\n", "add b");
++        r.git(&["checkout", "-q", "main"]);
++        r.commit_file("c.txt", "c\n", "add c");
++
++        let mut job = Job::new(&r.0, &r.head(), &[feat], &[]);
++        assert!(matches!(job.advance().unwrap(), Step::Done));
++        let patch = job.patch(&[]).unwrap();
++        assert_eq!(patch.paths, vec!["b.txt".to_string()]);
++        assert!(!patch.is_empty());
++        assert!(patch.stat.contains("b.txt"));
++    }
++
++    #[test]
++    fn each_hunk_can_take_a_different_side() {
++        let r = Repo::new();
++        let feat = diverge(
++            &r,
++            &[(2, "MAIN2"), (9, "MAIN9")],
++            &[(2, "FEAT2"), (9, "FEAT9")],
++        );
++        let mut job = Job::new(&r.0, &r.head(), &[feat], &[]);
++
++        let mut files = conflicts(&mut job);
++        assert_eq!(files.len(), 1);
++        assert_eq!(files[0].units(), 2);
++        assert_eq!(files[0].unresolved(), 2);
++        assert!(files[0].set(0, Some(Side::B)));
++        assert!(files[0].set(1, Some(Side::A)));
++        job.resolve(&files).unwrap();
++        assert!(matches!(job.advance().unwrap(), Step::Done));
++
++        let want = Repo::lines_with(&[(2, "FEAT2"), (9, "MAIN9")]);
++        assert_eq!(applied(&r, &job, "f.txt"), want);
++        assert_eq!(job.decisions().len(), 2);
++    }
++
++    #[test]
++    fn keeping_both_sides_orders_the_tree_copy_first() {
++        let r = Repo::new();
++        let feat = diverge(&r, &[(5, "MAIN5")], &[(5, "FEAT5")]);
++        let mut job = Job::new(&r.0, &r.head(), &[feat], &[]);
++        let mut files = conflicts(&mut job);
++        assert!(files[0].set(0, Some(Side::Both)));
++        job.resolve(&files).unwrap();
++        assert!(matches!(job.advance().unwrap(), Step::Done));
++        let want = Repo::lines_with(&[(5, "MAIN5\nFEAT5")]);
++        assert_eq!(applied(&r, &job, "f.txt"), want);
++    }
++
++    #[test]
++    fn an_undecided_hunk_blocks_resolution_and_keeps_the_conflict_pending() {
++        let r = Repo::new();
++        let feat = diverge(&r, &[(2, "MAIN2")], &[(2, "FEAT2")]);
++        let mut job = Job::new(&r.0, &r.head(), &[feat], &[]);
++        let files = conflicts(&mut job);
++        assert!(job.resolve(&files).is_err());
++        // The pending conflict survives the failed attempt.
++        let mut files = files;
++        files[0].set(0, Some(Side::A));
++        job.resolve(&files).unwrap();
++    }
++
++    #[test]
++    fn modify_delete_is_decided_as_a_whole_file() {
++        for (side, survives) in [(Side::A, true), (Side::B, false)] {
++            let r = Repo::new();
++            r.commit_file("keep.txt", "k\n", "base");
++            r.commit_file("gone.txt", "x\n", "gone");
++            r.git(&["checkout", "-q", "-b", "feat"]);
++            r.git(&["rm", "-q", "gone.txt"]);
++            r.git(&["commit", "-q", "-m", "delete gone"]);
++            let feat = r.head();
++            r.git(&["checkout", "-q", "main"]);
++            r.commit_file("gone.txt", "y\n", "modify gone");
++
++            let mut job = Job::new(&r.0, &r.head(), &[feat], &[]);
++            let mut files = conflicts(&mut job);
++            assert!(matches!(files[0].body, Body::Whole { .. }));
++            assert!(
++                !files[0].set(0, Some(Side::Both)),
++                "no 'both' for a whole file"
++            );
++            assert!(files[0].set(0, Some(side)));
++            job.resolve(&files).unwrap();
++            assert!(matches!(job.advance().unwrap(), Step::Done));
++
++            let patch = job.patch(&[]).unwrap();
++            assert_eq!(patch.is_empty(), survives, "side {side:?}");
++            if !survives {
++                assert_eq!(patch.paths, vec!["gone.txt".to_string()]);
++            }
++        }
++    }
++
++    #[test]
++    fn binary_conflicts_fall_back_to_a_whole_file_decision() {
++        let r = Repo::new();
++        std::fs::write(r.0.join("b.bin"), [0u8, 1, 2]).unwrap();
++        r.git(&["add", "b.bin"]);
++        r.git(&["commit", "-q", "-m", "base"]);
++        r.git(&["checkout", "-q", "-b", "feat"]);
++        std::fs::write(r.0.join("b.bin"), [0u8, 9, 9]).unwrap();
++        r.git(&["commit", "-qam", "feat bin"]);
++        let feat = r.head();
++        r.git(&["checkout", "-q", "main"]);
++        std::fs::write(r.0.join("b.bin"), [0u8, 7, 7]).unwrap();
++        r.git(&["commit", "-qam", "main bin"]);
++
++        let mut job = Job::new(&r.0, &r.head(), &[feat], &[]);
++        let mut files = conflicts(&mut job);
++        assert!(matches!(files[0].body, Body::Whole { .. }));
++        files[0].set(0, Some(Side::B));
++        job.resolve(&files).unwrap();
++        assert!(matches!(job.advance().unwrap(), Step::Done));
++        let patch = job.patch(&[]).unwrap();
++        // The patch is a binary patch and applies.
++        let file = r.0.join("bin.patch");
++        std::fs::write(&file, patch.bytes()).unwrap();
++        r.git(&["apply", file.to_str().unwrap()]);
++        assert_eq!(std::fs::read(r.0.join("b.bin")).unwrap(), vec![0u8, 9, 9]);
++    }
++
++    #[test]
++    fn a_rename_conflict_is_reported_as_unsupported() {
++        let r = Repo::new();
++        r.commit_file("f.txt", &Repo::lines(), "base");
++        r.git(&["checkout", "-q", "-b", "feat"]);
++        r.git(&["mv", "f.txt", "h.txt"]);
++        r.git(&["commit", "-q", "-m", "rename to h"]);
++        let feat = r.head();
++        r.git(&["checkout", "-q", "main"]);
++        r.git(&["mv", "f.txt", "g.txt"]);
++        r.git(&["commit", "-q", "-m", "rename to g"]);
++
++        let mut job = Job::new(&r.0, &r.head(), &[feat], &[]);
++        match job.advance().unwrap() {
++            Step::Unsupported(list) => assert!(list.iter().any(|m| m.contains("rename"))),
++            _ => panic!("a rename/rename conflict must not be offered as an A/B decision"),
++        }
++    }
++
++    #[test]
++    fn later_picks_build_on_the_result_of_earlier_ones() {
++        let r = Repo::new();
++        r.commit_file("f.txt", &Repo::lines(), "base");
++        r.git(&["checkout", "-q", "-b", "feat"]);
++        let one = r.commit_file("f.txt", &Repo::lines_with(&[(2, "ONE")]), "one");
++        let two = r.commit_file("f.txt", &Repo::lines_with(&[(2, "TWO")]), "two");
++        r.git(&["checkout", "-q", "main"]);
++        r.commit_file("other.txt", "o\n", "other");
++
++        let mut job = Job::new(&r.0, &r.head(), &[one.clone(), two.clone()], &[]);
++        assert!(matches!(job.advance().unwrap(), Step::Done));
++        assert_eq!(applied(&r, &job, "f.txt"), Repo::lines_with(&[(2, "TWO")]));
++
++        // The second alone depends on the first and conflicts.
++        let mut alone = Job::new(&r.0, &r.head(), &[two], &[]);
++        assert!(matches!(alone.advance().unwrap(), Step::Conflicts(_)));
++    }
++
++    #[test]
++    fn decisions_are_reused_when_the_patch_is_rebuilt_on_a_newer_head() {
++        let r = Repo::new();
++        let feat = diverge(&r, &[(2, "MAIN2")], &[(2, "FEAT2")]);
++        let old_head = r.head();
++        let mut job = Job::new(&r.0, &old_head, std::slice::from_ref(&feat), &[]);
++        let mut files = conflicts(&mut job);
++        files[0].set(0, Some(Side::B));
++        job.resolve(&files).unwrap();
++        assert!(matches!(job.advance().unwrap(), Step::Done));
++        let spec = job.patch(&[(feat, "feat edit".to_string())]).unwrap().spec;
++        assert_eq!(spec.decisions.len(), 1);
++
++        // HEAD advances with an unrelated commit.
++        let new_head = r.commit_file("later.txt", "l\n", "later");
++        match rebuild(&r.0, &spec, &new_head).unwrap() {
++            Built::Ready(p) => {
++                assert_eq!(p.spec.base, new_head);
++                assert_eq!(p.paths, vec!["f.txt".to_string()]);
++            }
++            _ => panic!("the recorded decision should have carried over"),
++        }
++    }
++
++    #[test]
++    fn a_changed_conflict_is_not_decided_by_an_old_decision() {
++        let r = Repo::new();
++        let feat = diverge(&r, &[(2, "MAIN2")], &[(2, "FEAT2")]);
++        let mut job = Job::new(&r.0, &r.head(), std::slice::from_ref(&feat), &[]);
++        let mut files = conflicts(&mut job);
++        files[0].set(0, Some(Side::B));
++        job.resolve(&files).unwrap();
++        let spec = job.patch(&[(feat, String::new())]).unwrap().spec;
++
++        // The tree side of the same line changes again: same place, different conflict.
++        let new_head = r.commit_file("f.txt", &Repo::lines_with(&[(2, "MAIN2 again")]), "again");
++        assert!(matches!(
++            rebuild(&r.0, &spec, &new_head).unwrap(),
++            Built::Conflicts(_)
++        ));
++    }
++
++    #[test]
++    fn the_header_round_trips_and_does_not_disturb_git_apply() {
++        let r = Repo::new();
++        r.commit_file("a.txt", "a\n", "base");
++        r.git(&["checkout", "-q", "-b", "feat"]);
++        let feat = r.commit_file("b.txt", "b\n", "add b: with \"quotes\"");
++        r.git(&["checkout", "-q", "main"]);
++
++        let mut job = Job::new(
++            &r.0,
++            &r.head(),
++            std::slice::from_ref(&feat),
++            &[("00ff".to_string(), Side::Both)],
++        );
++        assert!(matches!(job.advance().unwrap(), Step::Done));
++        let picks = vec![(feat, "add b: with \"quotes\"".to_string())];
++        let patch = job.patch(&picks).unwrap();
++        let bytes = patch.bytes();
++
++        assert_eq!(Spec::parse(&bytes), Some(patch.spec.clone()));
++        assert!(Spec::parse(b"diff --git a/x b/x\n").is_none());
++
++        let file = write(&patch_dir(&r.0.join(".git")), &patch).unwrap();
++        check(&r.0, &file).unwrap();
++        apply(&r.0, &file).unwrap();
++        assert_eq!(r.read("b.txt"), "b\n");
++        // Applied a second time it no longer fits.
++        assert!(check(&r.0, &file).is_err());
++    }
++
++    #[test]
++    fn building_never_touches_the_index_or_work_tree() {
++        let r = Repo::new();
++        let feat = diverge(&r, &[(2, "MAIN2")], &[(2, "FEAT2")]);
++        r.write("scratch.txt", "untracked\n");
++        r.write("f.txt", "locally edited\n");
++        let before = r.git(&["status", "--porcelain"]);
++        let mut job = Job::new(&r.0, &r.head(), &[feat], &[]);
++        let mut files = conflicts(&mut job);
++        files[0].set(0, Some(Side::A));
++        job.resolve(&files).unwrap();
++        assert!(matches!(job.advance().unwrap(), Step::Done));
++        assert_eq!(r.git(&["status", "--porcelain"]), before);
++        assert_eq!(r.read("f.txt"), "locally edited\n");
++        // No throwaway index is left behind.
++        let leftovers = std::fs::read_dir(r.0.join(".git"))
++            .unwrap()
++            .filter_map(|e| e.ok())
++            .filter(|e| e.file_name().to_string_lossy().starts_with("gitomic-pick-"))
++            .count();
++        assert_eq!(leftovers, 0);
++    }
++}
+diff --git a/src/pick.rs b/src/pick.rs
+index 1475571..7f95f85 100644
+--- a/src/pick.rs
++++ b/src/pick.rs
+@@ -41,10 +41,10 @@ use ratatui::{DefaultTerminal, Frame};
+ use crate::{commands, Res};
+ 
+ // Columns moved by one horizontal scroll key press.
+-const H_STEP: usize = 8;
++pub(crate) const H_STEP: usize = 8;
+ // Two h presses closer together than this are treated as one continuous run (key auto-repeat or a
+ // held key), so the second cannot switch panes if the first was still scrolling.
+-const RUN_WINDOW: Duration = Duration::from_millis(200);
++pub(crate) const RUN_WINDOW: Duration = Duration::from_millis(200);
+ // Diffs longer than this are cut off, so that a commit touching a generated file cannot stall the
+ // picker or exhaust memory. The cut is announced on the final line.
+ const MAX_DIFF_LINES: usize = 20_000;
+@@ -121,9 +121,9 @@ struct Entry {
+ }
+ 
+ // A commit's text, pre-styled once, with the width of its widest line for horizontal scroll limits.
+-struct DiffView {
+-    lines: Vec<Line<'static>>,
+-    max_width: usize,
++pub(crate) struct DiffView {
++    pub(crate) lines: Vec<Line<'static>>,
++    pub(crate) max_width: usize,
+ }
+ 
+ pub struct App {
+@@ -513,7 +513,7 @@ impl App {
+ // escape sequence in a diffed file would otherwise be interpreted by the terminal. Patch lines are
+ // coloured only after the first `diff --git` line, so a commit message that happens to begin with
+ // '+' or '-' keeps the default style.
+-fn style_diff(text: &str) -> DiffView {
++pub(crate) fn style_diff(text: &str) -> DiffView {
+     let mut lines = Vec::new();
+     let mut max_width = 0;
+     let mut in_patch = false;
+@@ -563,6 +563,25 @@ fn style_diff(text: &str) -> DiffView {
+     DiffView { lines, max_width }
+ }
+ 
++// Run `body` on the real terminal: alternate screen and raw mode on entry, both restored on exit
++// whether `body` succeeds or fails (ratatui also restores them on panic). Shared by every
++// interactive screen in the program.
++pub(crate) fn with_terminal<T>(body: impl FnOnce(&mut DefaultTerminal) -> Res<T>) -> Res<T> {
++    let mut terminal = ratatui::try_init()?;
++    // Terminals that speak the kitty keyboard protocol then report Shift-Enter as such; others send
++    // a plain Return for it, and N covers that case. The flag is pushed without first asking the
++    // terminal whether it is supported: the query blocks until the terminal answers, and a terminal
++    // that does not know the sequence ignores the push and the matching pop.
++    let _ = execute!(
++        std::io::stdout(),
++        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
++    );
++    let result = body(&mut terminal);
++    let _ = execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
++    ratatui::restore();
++    result
++}
++
+ // Run the picker on the real terminal. Returns the full ids of the commits the operator marked and
+ // confirmed, or None when the picker was left without confirming anything. Errors when there is no
+ // terminal to draw on or no commit that could be dropped.
+@@ -581,18 +600,7 @@ pub fn run(cwd: &Path) -> Res<Option<Vec<String>>> {
+     };
+     let mut app = App::new(choices);
+ 
+-    let mut terminal = ratatui::try_init()?;
+-    // Terminals that speak the kitty keyboard protocol then report Shift-Enter as such; others send
+-    // a plain Return for it, and N covers that case. The flag is pushed without first asking the
+-    // terminal whether it is supported: the query blocks until the terminal answers, and a terminal
+-    // that does not know the sequence ignores the push and the matching pop.
+-    let _ = execute!(
+-        std::io::stdout(),
+-        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+-    );
+-    let result = event_loop(&mut terminal, &mut app, &mut src);
+-    let _ = execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
+-    ratatui::restore();
++    let result = with_terminal(|terminal| event_loop(terminal, &mut app, &mut src));
+ 
+     match result? {
+         Outcome::Submit(ids) => Ok(Some(ids)),
+diff --git a/src/testrepo.rs b/src/testrepo.rs
+new file mode 100644
+index 0000000..37c7452
+--- /dev/null
++++ b/src/testrepo.rs
+@@ -0,0 +1,81 @@
++// Throwaway repositories for tests, one per value, created in the system temporary directory and
++// removed on drop, so no test depends on another's state or on the developer's own git
++// configuration.
++
++use std::fs;
++use std::path::PathBuf;
++use std::sync::atomic::{AtomicUsize, Ordering};
++
++use crate::git;
++
++static NEXT: AtomicUsize = AtomicUsize::new(0);
++
++pub struct Repo(pub PathBuf);
++
++impl Repo {
++    // A repository on branch `main` with a local identity.
++    pub fn new() -> Repo {
++        let n = NEXT.fetch_add(1, Ordering::SeqCst);
++        let dir = std::env::temp_dir().join(format!("gitomic-t-{}-{n}", std::process::id()));
++        let _ = fs::remove_dir_all(&dir);
++        fs::create_dir_all(&dir).unwrap();
++        let repo = Repo(dir);
++        repo.git(&["init", "-q", "-b", "main"]);
++        repo.git(&["config", "user.name", "Test"]);
++        repo.git(&["config", "user.email", "test@example.invalid"]);
++        repo
++    }
++
++    pub fn git(&self, args: &[&str]) -> String {
++        git::run(&self.0, args).unwrap()
++    }
++
++    pub fn write(&self, name: &str, content: &str) {
++        let path = self.0.join(name);
++        if let Some(parent) = path.parent() {
++            fs::create_dir_all(parent).unwrap();
++        }
++        fs::write(path, content).unwrap();
++    }
++
++    pub fn read(&self, name: &str) -> String {
++        fs::read_to_string(self.0.join(name)).unwrap()
++    }
++
++    pub fn exists(&self, name: &str) -> bool {
++        self.0.join(name).exists()
++    }
++
++    // Write `content` to `name` and record it as one commit with `msg`; returns the commit id.
++    pub fn commit_file(&self, name: &str, content: &str, msg: &str) -> String {
++        self.write(name, content);
++        self.git(&["add", name]);
++        self.git(&["commit", "-q", "-m", msg]);
++        self.head()
++    }
++
++    pub fn head(&self) -> String {
++        self.git(&["rev-parse", "HEAD"])
++    }
++
++    // Ten numbered lines, the shape most conflict tests edit.
++    pub fn lines() -> String {
++        (1..=10).map(|i| format!("l{i}\n")).collect()
++    }
++
++    // Replace the numbered line `n` (1-based) of `lines()` with `text`.
++    pub fn lines_with(edits: &[(usize, &str)]) -> String {
++        (1..=10)
++            .map(|i| match edits.iter().find(|(n, _)| *n == i) {
++                Some((_, t)) => format!("{t}\n"),
++                None => format!("l{i}\n"),
++            })
++            .collect()
++    }
++}
++
++impl Drop for Repo {
++    fn drop(&mut self) {
++        let _ = fs::remove_dir_all(&self.0);
++    }
++}

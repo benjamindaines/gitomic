@@ -144,6 +144,13 @@ vim-style keys, `space` to mark and the same rule that only `y`/`n` answer a pro
   the first thing shown.
 - The right pane shows what each commit would change relative to the `HEAD` that was current when the screen
   opened, not the commit's own diff. A commit that would conflict is announced above its diff.
+- A commit that would change nothing on `HEAD` (its change is already there in another form) is drawn in gray
+  and skipped by `j`/`k`, `g`/`G` and, in the diff pane, `n`/`N`. Whether a commit applies is worked out for
+  the commits near the selection while the screen is idle, and on demand when movement reaches one; a commit
+  that conflicts counts as applying. When no later commit applies, the selection stays put and the status
+  line says so.
+- The diff of a commit loads once the selection has rested on it for 150 ms, so holding `j` or `k` does not
+  run a merge for every commit passed. A diff already loaded is shown at once.
 - `R` follows one file. It marks the highlighted commit and every older commit of the source branch that
   changes the same file (the commits `HEAD` lacks), each restricted to that file, so that replaying them
   brings the file to its state on the source branch at the highlighted commit. When the highlighted commit

@@ -139,6 +139,20 @@ pub fn touching(cwd: &Path, source: &str, path: &str) -> Res<Vec<String>> {
     Ok(out.lines().map(str::to_string).collect())
 }
 
+// Whether replaying `pick` onto `base` would change anything. A commit whose change the branch
+// already holds in another form (the same edit made by hand, or a later commit that supersedes it)
+// merges to exactly the tree of `base` and reports false. A conflict, or a conflict the picker
+// cannot present, reports true: those commits need the user's attention and stay selectable.
+pub fn applies(root: &Path, base: &str, pick: &str) -> Res<bool> {
+    match patch::merge(root, base, pick)? {
+        Merged::Clean(tree) => {
+            let current = git::rev_parse(root, &format!("{base}^{{tree}}"))?;
+            Ok(tree != current)
+        }
+        Merged::Conflicted { .. } | Merged::Unsupported(_) => Ok(true),
+    }
+}
+
 // The text the picker shows for one commit: its header and message, then what applying it to `base`
 // would change. A conflict is announced ahead of the diff, whose conflicted files show the markers
 // that the decision screen later resolves.
@@ -635,6 +649,40 @@ mod tests {
 
         apply_spec(&r.0, decided, false, false).unwrap();
         assert_eq!(r.read("f.txt"), Repo::lines_with(&[(3, "FEAT3")]));
+    }
+
+    #[test]
+    fn applies_is_false_only_when_the_branch_already_holds_the_change() {
+        let (r, b, f) = setup();
+        let base = r.head();
+        assert!(applies(&r.0, &base, &b).unwrap(), "a new file applies");
+        assert!(applies(&r.0, &base, &f).unwrap(), "an edit applies");
+
+        // The same edit made by hand under a different commit: patch-id differs by context, so the
+        // commit stays listed, yet replaying it changes nothing.
+        r.commit_file(
+            "f.txt",
+            &Repo::lines_with(&[(3, "FEAT3")]),
+            "same edit by hand",
+        );
+        r.commit_file(
+            "f.txt",
+            &Repo::lines_with(&[(3, "FEAT3"), (9, "LATER")]),
+            "then more",
+        );
+        let base = r.head();
+        assert!(!applies(&r.0, &base, &f).unwrap(), "already present");
+        assert!(
+            applies(&r.0, &base, &b).unwrap(),
+            "unrelated commit still applies"
+        );
+    }
+
+    #[test]
+    fn a_conflicting_commit_still_counts_as_applicable() {
+        let (r, _, f) = setup();
+        r.commit_file("f.txt", &Repo::lines_with(&[(3, "MAIN3")]), "main edits f");
+        assert!(applies(&r.0, &r.head(), &f).unwrap());
     }
 
     #[test]

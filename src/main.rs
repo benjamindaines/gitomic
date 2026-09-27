@@ -1,10 +1,13 @@
 // gitomic — a session-scoped helper for recording atomic commits.
 //
-// Working within a git repository, `gitomic init` marks the current HEAD as a session base and forks a
-// background watcher that records each settled change as its own commit bearing an empty placeholder message.
-// `gitomic finish` stops the watcher and stamps a single message across every commit in the batch, so a
-// session of many recoverable steps collapses to one authored intent without losing per-step history. All
-// commits are local; publishing remains an explicit, separate `git push`.
+// Working within a git repository, `gitomic init` forks a private session branch from the current HEAD and a
+// background watcher that records each settled change onto it as its own commit bearing an empty placeholder
+// message. `gitomic finish` stops the watcher, stamps a single message across every commit in the batch, and
+// integrates the batch back onto the branch the operator began on, so a session of many recoverable steps
+// collapses to one authored intent without losing per-step history. Recording on a private branch keeps an
+// out-of-band move of the origin branch (a pull, another client, a direct-to-remote commit) from being
+// mistaken for session work or overwriting it (issue #10). All commits are local; publishing remains an
+// explicit, separate `git push`.
 //
 // The repository is inferred from the working directory, so any command may be run from anywhere in the tree.
 
@@ -270,20 +273,23 @@ USAGE:
   gitomic <command> [options]     run inside a git repository (any subdirectory)
 
 COMMANDS:
-                       NOTE: gitomic does not currently verify that the commit marked at the beginning of
-                       a session is still valid! Until that is added, do not move HEAD outside of gitomic.
-                       Example: don't pull while gitomic is running or merge or anything like that.
+                       Moving the origin branch out of band during a session (a pull, a push from another
+                       client, a direct-to-remote commit later fetched) is safe: recording happens on a
+                       private session branch, so an out-of-band move is never miscounted as session work,
+                       and finish integrates the two lines rather than letting one overwrite the other.
 
-  init [options]       Mark HEAD as the session base for the checked-out branch and fork a watcher bound to
-                       that branch. If a base already exists for it without a running watcher, resume that
-                       session. Sessions are independent per branch: switching branches leaves this one's
-                       watcher running but idle until it is checked out again, and 'init' on the new branch
-                       starts (or resumes) that branch's own session. Aliases: start.
-  finish [options]     Stop the watcher and apply one message to every atomic commit in the session,
-                       then clear the session. Aliases: commit.
-  status               Show every branch with an open session (base, pending atomic-commit count, watcher
-                       state, log path), marking whichever is currently checked out. A branch with no open
-                       session is omitted.
+  init [options]       Fork a private session branch '<branch>-<short base>' from HEAD, check it out, and
+                       fork a watcher that records each settled change onto it. Reported and treated as the
+                       branch you were on; the private branch is where commits actually land. If a session
+                       is already open, resume it. Sessions are independent per branch. Aliases: start.
+  finish [options]     Stop the watcher, apply one message to every atomic commit in the session, and
+                       integrate the batch back onto the origin branch: a straight commit when the origin
+                       branch has not moved, a replay on top when it advanced, or — if the work conflicts
+                       with an out-of-band change — left on the session branch for a manual merge or pull
+                       request while the origin branch is left untouched. Aliases: commit.
+  status               Show every open session (origin branch, base, pending atomic-commit count, watcher
+                       state, log path), the private session branch, and whether the origin branch has
+                       moved since the session began. A branch with no open session is omitted.
   active               List every live gitomic watcher on this machine, across every repository — does not
                        need to be run from inside a repository. Prints nothing when nothing is running, so
                        it is quiet by default; meant to be called from a shell profile on new-terminal open.
@@ -325,7 +331,8 @@ COMMANDS:
                        file, apply nothing). With hashes, conflicts are refused.
                        Aliases: pick.
   stop                 Stop the watcher but keep the base and recorded commits for later finish/resume.
-  abort [--force]      Discard the session: reset the branch to the base and drop the atomic commits.
+  abort [--force]      Discard the session: drop the atomic commits, return to the origin branch, and remove
+                       the session branch. Working-tree files are preserved as uncommitted.
   help, --version
 
 INIT OPTIONS:

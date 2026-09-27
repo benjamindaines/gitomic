@@ -282,6 +282,46 @@ pub fn delete_ref(dir: &Path, refname: &str) -> Res<()> {
     Ok(())
 }
 
+// True when a local branch of this name exists. The refs/heads/ prefix distinguishes a branch from a tag or a
+// remote-tracking ref of the same short name, so a session branch name is tested against branches alone.
+pub fn branch_exists(dir: &Path, name: &str) -> Res<bool> {
+    rev_exists(dir, &format!("refs/heads/{name}"))
+}
+
+// Create a new branch at `start` and check it out, moving HEAD and the work tree to it in one step. Used at
+// session start to place recording on a private branch rather than on the branch the operator believes they are
+// on. `start` is an explicit commit so the branch point is pinned rather than inferred from an ambient HEAD.
+pub fn create_and_checkout(dir: &Path, name: &str, start: &str) -> Res<()> {
+    run(dir, &["checkout", "-q", "-b", name, start])?;
+    Ok(())
+}
+
+// Switch HEAD and the work tree to an existing branch. Used at session end to return to the branch the operator
+// began on. Uncommitted modifications that do not collide with the switch are carried across by git; a switch
+// that would overwrite local changes fails and the error is returned rather than forcing the move.
+pub fn checkout(dir: &Path, name: &str) -> Res<()> {
+    run(dir, &["checkout", "-q", name])?;
+    Ok(())
+}
+
+// Delete a local branch unconditionally (`git branch -D`), used to retire the ephemeral session branch once its
+// commits have been integrated onto the origin branch. The branch being deleted must not be the checked-out one,
+// so callers switch to the origin branch first. A missing branch is not an error, so teardown is idempotent.
+pub fn delete_branch(dir: &Path, name: &str) -> Res<()> {
+    if branch_exists(dir, name)? {
+        run(dir, &["branch", "-q", "-D", name])?;
+    }
+    Ok(())
+}
+
+// True when `ancestor` is an ancestor of (or equal to) `descendant`. Distinguishes a fast-forward advance of the
+// origin branch (base is still an ancestor of the moved tip) from a divergence (the two share only an older
+// commit), which decides whether the finalized batch can be replayed onto the moved tip or must be left on the
+// session branch for manual reconciliation.
+pub fn is_ancestor(dir: &Path, ancestor: &str, descendant: &str) -> Res<bool> {
+    succeeds(dir, &["merge-base", "--is-ancestor", ancestor, descendant])
+}
+
 // Number of commits reachable in `range`, used to report the pending batch size without materialising the list.
 pub fn count(dir: &Path, range: &str) -> Res<usize> {
     let out = run(dir, &["rev-list", "--count", range])?;

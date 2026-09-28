@@ -380,7 +380,7 @@ pub fn abort(cwd: &Path, force: bool) -> Res<()> {
         );
         println!(
             "  working-tree files are preserved; content from discarded commits reverts to unstaged/untracked. \
-             Re-run with --force to proceed."
+             Re-run with --yes to proceed."
         );
         return Ok(());
     }

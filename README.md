@@ -7,6 +7,11 @@ authored intent — without flattening the intermediate history into a single co
 It is deliberately narrow: it never touches credentials, never contacts a remote, and writes nothing but local
 commits. Publishing stays an explicit, separate `git push`.
 
+NOTE: You may notice a warning about how `gitomic` doesn't track changes to HEAD, etc. At this point, that's
+fixed, or at least worked around. You'll just end up with a new un-merged branch if HEAD moves in a way that
+conflicts with your local changes. No force pushes, no lost work, just need to use the cherry-pick feature 
+to get to a mergable state, then fire off a PR and be done with it. 
+
 ## Model
 
 A session has two pieces of state, both inspectable with plain git:

@@ -23,6 +23,7 @@ mod proc;
 #[cfg(test)]
 mod testrepo;
 mod watch;
+mod work;
 
 // Application-wide fallible result. A boxed trait object keeps the error surface dependency-free while still
 // carrying git's own diagnostics upward to the top-level reporter.

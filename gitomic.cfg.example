@@ -33,6 +33,11 @@ coalesce_same_file = true
 #   *.swp, *.swo, *.swx, *.un~, *.kate-swp, #*#, .#*, *~
 # ignore_patterns = *.bak, *.generated
 
+# Size in MiB above which `gitomic cherry-pick`'s screen does not read a changed file to draw a
+# commit's preview (an OTA seed image, say). The file is listed with its size instead, and `D` on
+# that commit reads it after a confirmation. 0 turns the limit off.
+cherry_size_limit_mb = 32
+
 # Reserved for a future always-on multi-repository mode; currently accepted and ignored. The manual,
 # cwd-scoped model supersedes it.
 # watch_dir = /home/ben/code

@@ -159,15 +159,26 @@ pub enum Merged {
 // object database. `merge.conflictStyle` is pinned so the marker layout is the one
 // `conflict::parse` expects whatever the user's configuration says.
 pub fn merge(root: &Path, onto: &str, pick: &str) -> Res<Merged> {
-    let out = Command::new("git")
-        .arg("-C")
+    merge_cancellable(root, onto, pick, None)
+}
+
+// `merge` that another thread can abandon: with a `cancel` handle, firing it kills the running git
+// command and the result is the `git::CANCELLED` error.
+pub fn merge_cancellable(
+    root: &Path,
+    onto: &str,
+    pick: &str,
+    cancel: Option<&git::Cancel>,
+) -> Res<Merged> {
+    let mut cmd = Command::new("git");
+    cmd.arg("-C")
         .arg(root)
         .args(["-c", "merge.conflictStyle=merge"])
         .args(["merge-tree", "--write-tree", "-z"])
         .arg(format!("--merge-base={pick}^"))
         .arg(onto)
-        .arg(pick)
-        .output()?;
+        .arg(pick);
+    let out = git::output_cancellable(cmd, cancel)?;
     match out.status.code() {
         Some(0) => {
             let tree = out

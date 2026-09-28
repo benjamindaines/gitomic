@@ -49,6 +49,11 @@ pub struct Config {
     // Applies only under `StageMode::Observed`, the only mode that consults the observed-path set at all;
     // `Tracked` and `All` stage by `git add -u`/`-A` directly and never route through this list.
     pub ignore_patterns: Vec<String>,
+    // Size in MiB above which the interactive cherry-pick screen does not read a changed file to show
+    // its diff. Such a file is listed with its size, and its commit is loaded in full only after the
+    // operator asks for it (`D`). Reading a multi-gigabyte image to draw a preview is what makes the
+    // screen unusable on slow hardware. 0 turns the limit off.
+    pub cherry_size_limit_mb: u64,
 }
 
 // Editor swap, lock, and backup file conventions excluded from watcher observation by default. These files
@@ -82,6 +87,7 @@ impl Default for Config {
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
+            cherry_size_limit_mb: 32,
         }
     }
 }
@@ -134,6 +140,14 @@ impl Config {
                     cfg.debounce_ms = value.parse().map_err(|_| {
                         format!(
                             "gitomic.cfg line {}: debounce_ms must be an integer",
+                            lineno + 1
+                        )
+                    })?;
+                }
+                "cherry_size_limit_mb" => {
+                    cfg.cherry_size_limit_mb = value.parse().map_err(|_| {
+                        format!(
+                            "gitomic.cfg line {}: cherry_size_limit_mb must be an integer",
                             lineno + 1
                         )
                     })?;
@@ -252,6 +266,24 @@ mod tests {
                 .map(|s| s.to_string())
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn the_cherry_size_limit_defaults_to_32_and_can_be_set_or_turned_off() {
+        assert_eq!(Config::default().cherry_size_limit_mb, 32);
+        assert_eq!(
+            Config::parse("cherry_size_limit_mb = 8")
+                .unwrap()
+                .cherry_size_limit_mb,
+            8
+        );
+        assert_eq!(
+            Config::parse("cherry_size_limit_mb = 0")
+                .unwrap()
+                .cherry_size_limit_mb,
+            0
+        );
+        assert!(Config::parse("cherry_size_limit_mb = big").is_err());
     }
 
     #[test]

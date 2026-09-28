@@ -3,9 +3,10 @@
 // repository directory via `git -C <dir>` rather than relying on the process working directory.
 
 use std::collections::HashSet;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use crate::Res;
 
@@ -70,6 +71,169 @@ pub fn run(dir: &Path, args: &[&str]) -> Res<String> {
         return Err(format!("git {}: {}", args.join(" "), msg.trim()).into());
     }
     Ok(String::from_utf8(out.stdout)?.trim_end().to_string())
+}
+
+// Message of the error returned when a `Cancel` fired; callers that cancel on purpose ignore it.
+pub const CANCELLED: &str = "cancelled";
+
+// Handle by which another thread abandons a git command that is running or about to run. Firing it
+// kills the child process registered by `run_capped`, so a superseded request stops consuming CPU and
+// disk at once instead of running to completion. A fired handle stays fired: every later command run
+// with it fails at once with `CANCELLED`.
+#[derive(Default)]
+pub struct Cancel {
+    fired: AtomicBool,
+    // Process id of the child currently running under this handle; 0 when there is none.
+    pid: AtomicU32,
+}
+
+impl Cancel {
+    pub fn cancel(&self) {
+        self.fired.store(true, Ordering::SeqCst);
+        let pid = self.pid.load(Ordering::SeqCst);
+        if pid != 0 {
+            // SAFETY: `kill` only sends a signal. A stale id can at worst name a process that has
+            // exited and is reaped by its own parent within the same instant; the id is cleared
+            // before the child is waited for.
+            unsafe {
+                libc::kill(pid as libc::pid_t, libc::SIGKILL);
+            }
+        }
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.fired.load(Ordering::SeqCst)
+    }
+}
+
+// The output of `run_capped`.
+pub struct Capped {
+    pub text: String,
+    // True when the output exceeded the cap and the command was stopped early.
+    pub truncated: bool,
+}
+
+// Run git and return at most `max` bytes of stdout, converted lossily so that a byte sequence that is
+// not UTF-8 is shown rather than turned into an error. When the output is longer than `max` the
+// command is killed, so a diff of a huge generated file is never produced in full only to be cut
+// afterwards. With a `cancel` handle the command can be abandoned from another thread.
+pub fn run_capped(dir: &Path, args: &[&str], max: usize, cancel: Option<&Cancel>) -> Res<Capped> {
+    if cancel.is_some_and(Cancel::is_cancelled) {
+        return Err(CANCELLED.into());
+    }
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    if let Some(c) = cancel {
+        c.pid.store(child.id(), Ordering::SeqCst);
+        // A cancel that arrived between the check above and the registration kills nothing, so it
+        // is honoured here.
+        if c.is_cancelled() {
+            let _ = child.kill();
+        }
+    }
+    let mut stdout = child.stdout.take().ok_or("git: no stdout pipe")?;
+    let mut stderr = child.stderr.take().ok_or("git: no stderr pipe")?;
+    // Standard error is drained on its own thread so that a chatty command cannot block on a full pipe
+    // while stdout is being read.
+    let err_thread = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stderr.read_to_end(&mut buf);
+        buf
+    });
+    let mut buf = Vec::new();
+    let read = (&mut stdout).take(max as u64 + 1).read_to_end(&mut buf);
+    let truncated = buf.len() > max;
+    if truncated {
+        buf.truncate(max);
+        let _ = child.kill();
+    }
+    drop(stdout);
+    let status = child.wait();
+    if let Some(c) = cancel {
+        c.pid.store(0, Ordering::SeqCst);
+        if c.is_cancelled() {
+            return Err(CANCELLED.into());
+        }
+    }
+    let err = err_thread.join().unwrap_or_default();
+    read?;
+    let status = status?;
+    if !truncated && !status.success() {
+        let msg = String::from_utf8_lossy(&err);
+        return Err(format!("git {}: {}", args.join(" "), msg.trim()).into());
+    }
+    Ok(Capped {
+        text: String::from_utf8_lossy(&buf).trim_end().to_string(),
+        truncated,
+    })
+}
+
+// Run a prepared git command to completion and return its whole output, like `Command::output`,
+// but abandonable: with a `cancel` handle the child is killed when it fires and the result is
+// `CANCELLED`. For commands whose output is binary or structured and needs no cap.
+pub fn output_cancellable(mut cmd: Command, cancel: Option<&Cancel>) -> Res<std::process::Output> {
+    let Some(cancel) = cancel else {
+        return Ok(cmd.output()?);
+    };
+    if cancel.is_cancelled() {
+        return Err(CANCELLED.into());
+    }
+    let child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    cancel.pid.store(child.id(), Ordering::SeqCst);
+    // A cancel that arrived between the check above and the registration killed nothing.
+    if cancel.is_cancelled() {
+        unsafe {
+            // SAFETY: signals the child just started, which has not been waited for.
+            libc::kill(child.id() as libc::pid_t, libc::SIGKILL);
+        }
+    }
+    let out = child.wait_with_output();
+    cancel.pid.store(0, Ordering::SeqCst);
+    if cancel.is_cancelled() {
+        return Err(CANCELLED.into());
+    }
+    Ok(out?)
+}
+
+// Sizes in bytes of the objects `ids`, in the same order, read from their headers alone; None for an
+// id that names no object. One `cat-file --batch-check` process answers for all of them.
+pub fn blob_sizes(dir: &Path, ids: &[String]) -> Res<Vec<Option<u64>>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["cat-file", "--batch-check=%(objectsize)"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let mut stdin = child.stdin.take().ok_or("git cat-file: no stdin pipe")?;
+    let input: String = ids.iter().map(|i| format!("{i}\n")).collect();
+    // The ids are written on their own thread, so a long list cannot fill the pipe that the answers
+    // are waiting to leave through.
+    let writer = std::thread::spawn(move || {
+        let _ = stdin.write_all(input.as_bytes());
+    });
+    let out = child.wait_with_output()?;
+    let _ = writer.join();
+    let text = String::from_utf8_lossy(&out.stdout);
+    let sizes: Vec<Option<u64>> = text.lines().map(|l| l.trim().parse::<u64>().ok()).collect();
+    if sizes.len() != ids.len() {
+        return Err("git cat-file: unexpected number of answers".into());
+    }
+    Ok(sizes)
 }
 
 // Run git purely for its exit status, treating a clean non-zero exit as `false` rather than an error. Used
@@ -485,4 +649,82 @@ pub fn commit_only(dir: &Path, paths: &[&str]) -> Res<Option<String>> {
         return Err(format!("git commit: {}", text.trim()).into());
     }
     Ok(Some(rev_parse(dir, "HEAD")?))
+}
+
+#[cfg(test)]
+mod capped_tests {
+    use super::*;
+    use crate::testrepo::Repo;
+
+    fn repo_with_blob(bytes: &[u8]) -> Repo {
+        let r = Repo::new();
+        std::fs::write(r.0.join("blob"), bytes).unwrap();
+        r.git(&["add", "blob"]);
+        r.git(&["commit", "-q", "-m", "blob"]);
+        r
+    }
+
+    #[test]
+    fn output_below_the_cap_is_returned_whole() {
+        let r = repo_with_blob(b"hello\n");
+        let out = run_capped(&r.0, &["show", "HEAD:blob"], 1024, None).unwrap();
+        assert_eq!(out.text, "hello");
+        assert!(!out.truncated);
+    }
+
+    #[test]
+    fn output_above_the_cap_is_cut_and_the_command_stopped() {
+        let r = repo_with_blob(&vec![b'x'; 2 * 1024 * 1024]);
+        let out = run_capped(&r.0, &["show", "HEAD:blob"], 1000, None).unwrap();
+        assert!(out.truncated);
+        assert_eq!(out.text.len(), 1000);
+    }
+
+    #[test]
+    fn bytes_that_are_not_utf8_are_shown_not_refused() {
+        let r = repo_with_blob(&[b'a', 0xff, 0xfe, b'b']);
+        let out = run_capped(&r.0, &["show", "HEAD:blob"], 1024, None).unwrap();
+        assert_eq!(out.text, "a\u{fffd}\u{fffd}b");
+    }
+
+    #[test]
+    fn a_failing_command_reports_gits_own_message() {
+        let r = repo_with_blob(b"x");
+        let err = run_capped(&r.0, &["show", "HEAD:nothere"], 1024, None)
+            .err()
+            .expect("fails");
+        assert!(err.to_string().contains("nothere"), "{err}");
+    }
+
+    #[test]
+    fn a_fired_cancel_refuses_to_start_and_stops_a_running_command() {
+        let r = repo_with_blob(b"x");
+        let cancel = Cancel::default();
+        cancel.cancel();
+        let err = run_capped(&r.0, &["show", "HEAD:blob"], 1024, Some(&cancel))
+            .err()
+            .expect("cancelled");
+        assert_eq!(err.to_string(), CANCELLED);
+
+        // A command that would wait forever: git opens a named pipe that nothing writes to.
+        let r = repo_with_blob(b"x");
+        let fifo = r.0.join("pipe");
+        let c_path = std::ffi::CString::new(fifo.to_string_lossy().as_bytes()).unwrap();
+        // SAFETY: `c_path` is a valid NUL-terminated path that lives through the call.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        let cancel = std::sync::Arc::new(Cancel::default());
+        let c2 = cancel.clone();
+        let t = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            c2.cancel();
+        });
+        let started = std::time::Instant::now();
+        let path = fifo.to_string_lossy().into_owned();
+        let err = run_capped(&r.0, &["hash-object", &path], 1024, Some(&cancel))
+            .err()
+            .expect("cancelled while running");
+        t.join().unwrap();
+        assert_eq!(err.to_string(), CANCELLED);
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    }
 }

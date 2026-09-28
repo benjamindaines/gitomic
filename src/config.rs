@@ -54,6 +54,13 @@ pub struct Config {
     // operator asks for it (`D`). Reading a multi-gigabyte image to draw a preview is what makes the
     // screen unusable on slow hardware. 0 turns the limit off.
     pub cherry_size_limit_mb: u64,
+    // When true, `init` installs a `pre-push` hook that refuses to push a branch while that branch has an open
+    // session holding placeholder commits, and `finish` removes it once the session is closed. Off by default:
+    // a hook is per-clone state that gitomic writes into the repository, it has to stand aside for an existing
+    // `pre-push` hook, and `git push --no-verify` bypasses it, so it is a guard the operator opts into rather
+    // than one imposed on every repository. The unconditional protection is in `finish`, which refuses to
+    // rewrite a commit a remote already holds whether or not this is set.
+    pub push_guard: bool,
 }
 
 // Editor swap, lock, and backup file conventions excluded from watcher observation by default. These files
@@ -88,6 +95,7 @@ impl Default for Config {
                 .map(|s| s.to_string())
                 .collect(),
             cherry_size_limit_mb: 32,
+            push_guard: false,
         }
     }
 }
@@ -155,6 +163,7 @@ impl Config {
                 "finalize_numbering" => cfg.finalize_numbering = parse_bool(value, lineno + 1)?,
                 "stage" => cfg.stage = parse_stage(value, lineno + 1)?,
                 "coalesce_same_file" => cfg.coalesce_same_file = parse_bool(value, lineno + 1)?,
+                "push_guard" => cfg.push_guard = parse_bool(value, lineno + 1)?,
                 // Comma-separated glob patterns, extending (never replacing) DEFAULT_IGNORE_PATTERNS. A blank
                 // entry from stray comma placement (",," or a trailing comma) is dropped rather than becoming
                 // a pattern that matches everything.

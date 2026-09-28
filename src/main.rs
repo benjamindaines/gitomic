@@ -58,6 +58,7 @@ fn dispatch(args: &[String]) -> Res<()> {
         }
         "status" => commands::status(&cwd),
         "active" => commands::active(),
+        "switch" | "s" => commands::switch(args.get(1).map(String::as_str)),
         "diff" => {
             let stat = args[1..].iter().any(|a| a == "--stat");
             commands::diff(&cwd, stat)
@@ -269,6 +270,48 @@ const BASHRC_SNIPPET: &str = r#"    gitomicSessions() {
                 "$c_ylw$c_bold" "Active gitomic sessions:" "$c_rst" \
                 "$active"
         fi
+    }
+
+    gitomicSwitch() {
+        # No <n>: let the real binary write its numbered listing straight to the terminal, rather than
+        # capturing it into a variable meant to hold a single cd/checkout target. `command gitomic`,
+        # not a bare `gitomic`, throughout: once the `gitomic()` function below is also loaded, a bare
+        # `gitomic` here would call that function instead of the binary, recursing into this same code.
+        if [ $# -eq 0 ]; then
+            command gitomic switch
+            return
+        fi
+        local line target branch
+        line=$(command gitomic switch "$@") || return 1
+        IFS=$'\t' read -r target branch <<< "$line"
+        cd -- "$target" || return 1
+        # Two sessions can be live on the same repository at once, each on its own branch (issue #4's
+        # per-branch session state), so getting to the right one is a checkout as well as a cd; a repo
+        # already on that branch makes this a harmless no-op ("Already on '<branch>'").
+        git checkout "$branch"
+    }
+    alias gs=gitomicSwitch
+
+    # Shadows the `gitomic` binary with a same-named shell function, so `gitomic switch <n>` and
+    # `gitomic s <n>` — typed exactly as such, no separate alias needed — actually land you in the
+    # target repository and branch, not just print where it is. A compiled binary can never change its
+    # parent shell's directory on its own (the reason gitomicSwitch/gs exists above); shadowing its own
+    # name is what closes that gap without giving up the plain `gitomic <command>` interface for
+    # everything else. Only `switch <n>` / `s <n>` (an argument present) is intercepted; `switch`/`s`
+    # with no argument, and every other command, falls through to `command gitomic "$@"` — the real
+    # binary — completely unchanged, including its exit code and interactive stdio (init -f, cherry-pick's
+    # interactive screen, etc. all still work normally through this).
+    gitomic() {
+        case "$1" in
+            switch|s)
+                if [ $# -ge 2 ]; then
+                    shift
+                    gitomicSwitch "$@"
+                    return
+                fi
+                ;;
+        esac
+        command gitomic "$@"
     }"#;
 
 fn print_usage() {
@@ -299,6 +342,16 @@ COMMANDS:
   active               List every live gitomic watcher on this machine, across every repository — does not
                        need to be run from inside a repository. Prints nothing when nothing is running, so
                        it is quiet by default; meant to be called from a shell profile on new-terminal open.
+  switch [<n>]         Without <n>, list every live gitomic watcher on this machine like 'active', with a
+                       1-based number prepended; the numbering follows activation order, not the working
+                       directory, and renumbers on its own as sessions close. With <n>, print that
+                       session's '<repo path>\t<branch>' on stdout and nothing else — two sessions can be
+                       live on the same repository at once, each on its own branch, so the branch is part
+                       of what a selection resolves to, not just the repository. This binary, run
+                       directly, can never change its parent shell's directory or checked-out branch, so
+                       on its own it only ever prints that line; add the shell snippet below to make
+                       'gitomic switch <n>' / 'gitomic s <n>' (and 'gs <n>') actually take you there.
+                       Aliases: s.
   diff [--stat]        Show the consolidated diff of the checked-out branch's pending batch (base..HEAD) —
                        the atomic commits recorded so far this session, not the working tree. --stat prints
                        a summary instead of the full patch. Requires an active session.
@@ -356,8 +409,15 @@ NOTES:
   All commits are local; run 'git push' yourself to publish. Atomic commits and the finalize rewrite
   bypass git hooks. Config: ${{XDG_CONFIG_HOME:-~/.config}}/gitomic/gitomic.cfg.
 
-  Add the following to your .bashrc file to be reminded of running sessions, and call it where it should run
-  (for example, on its own line after the definition):
+  Add the following to your .bashrc file, and call gitomicSessions where it should run (for example, on
+  its own line after the definition), to be reminded of running sessions on new-terminal open, and to gain
+  what the binary alone cannot provide, since a subprocess can never change its parent shell's directory
+  or checked-out branch: 'gitomic switch <n>' and 'gitomic s <n>', typed exactly like that (the last
+  function below shadows the 'gitomic' binary itself with a same-named shell function, forwarding
+  everything except 'switch <n>'/'s <n>' straight through to it unchanged), or 'gs <n>' as a shorter
+  equivalent, actually cd into that session's repository and check out its branch — also covering a
+  switch between two sessions live on the same repository at once, each on its own branch. With no <n>,
+  'gitomic switch'/'gitomic s'/'gs' all still just list, exactly as the binary alone would:
 
 {snippet}
 ",

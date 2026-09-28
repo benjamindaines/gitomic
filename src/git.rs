@@ -29,8 +29,10 @@ pub const LEGACY_BASE_REF: &str = "refs/gitomic/base";
 
 // Branch names (with the refs/gitomic/base/ prefix stripped) of every branch currently holding an open
 // session, in for-each-ref's lexical order. An empty vector means no branch has one; it says nothing about
-// LEGACY_BASE_REF, which callers check separately. Backs `status`'s all-branches listing.
-pub fn session_branches(dir: &Path) -> Res<Vec<String>> {
+// LEGACY_BASE_REF, which callers check separately. Backs `status`'s all-branches listing. Named for what it
+// returns — the branches that have a session — rather than for the refs it reads: the earlier name
+// `session_branches` read as bookkeeping over a set of dedicated branches, which these refs are not.
+pub fn branches_with_session(dir: &Path) -> Res<Vec<String>> {
     let out = run(
         dir,
         &[
@@ -452,14 +454,6 @@ pub fn branch_exists(dir: &Path, name: &str) -> Res<bool> {
     rev_exists(dir, &format!("refs/heads/{name}"))
 }
 
-// Create a new branch at `start` and check it out, moving HEAD and the work tree to it in one step. Used at
-// session start to place recording on a private branch rather than on the branch the operator believes they are
-// on. `start` is an explicit commit so the branch point is pinned rather than inferred from an ambient HEAD.
-pub fn create_and_checkout(dir: &Path, name: &str, start: &str) -> Res<()> {
-    run(dir, &["checkout", "-q", "-b", name, start])?;
-    Ok(())
-}
-
 // Switch HEAD and the work tree to an existing branch. Used at session end to return to the branch the operator
 // began on. Uncommitted modifications that do not collide with the switch are carried across by git; a switch
 // that would overwrite local changes fails and the error is returned rather than forcing the move.
@@ -689,6 +683,53 @@ pub fn commit_only(dir: &Path, paths: &[&str]) -> Res<Option<String>> {
         return Err(format!("git commit: {}", text.trim()).into());
     }
     Ok(Some(rev_parse(dir, "HEAD")?))
+}
+
+// One line per commit in `range`, oldest first: object id, parent ids, and subject. A single `git log` call
+// rather than one invocation per commit, so auditing a long batch costs one process. NUL separates the three
+// fields: git forbids NUL inside a commit message, and `%s` is the subject alone, so every record occupies
+// exactly one line and no field can contain either delimiter.
+pub fn commit_summaries(dir: &Path, range: &str) -> Res<Vec<(String, Vec<String>, String)>> {
+    let out = run(dir, &["log", "--reverse", "--format=%H%x00%P%x00%s", range])?;
+    Ok(out
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| {
+            let mut f = l.splitn(3, NUL);
+            let id = f.next().unwrap_or_default().to_string();
+            let parents = f
+                .next()
+                .unwrap_or_default()
+                .split_whitespace()
+                .map(str::to_string)
+                .collect();
+            let subject = f.next().unwrap_or_default().to_string();
+            (id, parents, subject)
+        })
+        .collect())
+}
+
+// Commits in `range` that a remote-tracking ref already contains, oldest first. Computed as the range minus the
+// set git reports as reachable from no remote, so a repository with no remote-tracking refs at all yields an
+// empty result (nothing is published) rather than an error. Callers use this to refuse rewriting history that
+// has been handed to a remote, since restamping a message produces new object ids and would require a force
+// push to publish; `drop` already applies the same rule to its candidate set.
+pub fn published_in_range(dir: &Path, range: &str) -> Res<Vec<String>> {
+    let all = rev_list_reverse(dir, range)?;
+    let unpublished: HashSet<String> = run(dir, &["rev-list", range, "--not", "--remotes"])?
+        .lines()
+        .map(str::to_string)
+        .collect();
+    Ok(all
+        .into_iter()
+        .filter(|c| !unpublished.contains(c))
+        .collect())
+}
+
+// Path of the pre-push hook for this repository. A hook lives in the git directory, so it is per-clone and
+// never committed.
+pub fn pre_push_hook_path(git_dir: &Path) -> PathBuf {
+    git_dir.join("hooks").join("pre-push")
 }
 
 #[cfg(test)]

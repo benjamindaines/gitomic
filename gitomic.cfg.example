@@ -38,6 +38,13 @@ coalesce_same_file = true
 # that commit reads it after a confirmation. 0 turns the limit off.
 cherry_size_limit_mb = 32
 
+# Install a pre-push hook while a session is open, refusing to push a branch whose pending batch still holds
+# unfinalized placeholder commits. Off by default: the hook is per-clone state written into the repository, it
+# stands aside rather than replacing a pre-push hook you already have, and `git push --no-verify` bypasses it.
+# The protection that always applies is in `finish`, which refuses to rewrite a commit a remote already holds
+# regardless of this setting, since rewriting one would need a force push to publish.
+push_guard = no
+
 # Reserved for a future always-on multi-repository mode; currently accepted and ignored. The manual,
 # cwd-scoped model supersedes it.
 # watch_dir = /home/ben/code

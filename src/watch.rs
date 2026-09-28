@@ -10,14 +10,29 @@
 // writes to that directory. On a shutdown signal the watcher does not commit; it persists any observed-but-
 // uncommitted paths so the foreground `finish`/`stop` capture can stage them, then exits.
 //
-// Each watcher is bound to the branch it was started for (issue #4). A single work tree can only have one
-// branch checked out at a time, so a mid-session `git checkout`/`git switch` is detected, not prevented: on
-// every debounce-elapsed cycle and on shutdown, the watcher compares the currently checked-out branch against
-// its own and stands down (skips the capture, or drops rather than persists observed-but-uncommitted paths)
-// whenever they differ, rather than blindly committing onto whatever branch happens to be current. Running
-// `gitomic init` again on the newly checked-out branch starts (or resumes) that branch's own watcher with its
-// own pidfile and base marker; switching back makes the original watcher active again with no re-init needed,
-// since it never stopped polling — it was only refusing to act while its branch was not the one checked out.
+// Each watcher is bound to the branch it was started for (issue #4), which is the branch the operator was
+// standing on when `gitomic init` ran. A single work tree can only have one branch checked out at a time, so a
+// mid-session `git checkout`/`git switch` is detected, not prevented: on every debounce-elapsed cycle and on
+// shutdown, the watcher compares the currently checked-out branch against its own and stands down (skips the
+// capture, or drops rather than persists observed-but-uncommitted paths) whenever they differ, rather than
+// blindly committing onto whatever branch happens to be current. Running `gitomic init` on the newly
+// checked-out branch starts that branch's own watcher with its own pidfile and base marker; switching back
+// makes the original watcher active again with no re-init needed, since it never stopped polling — it was only
+// refusing to act while its branch was not the one checked out.
+//
+// That comparison is against the operator's own branch, which is what makes standing down a rare and correct
+// outcome rather than a permanent one. Under issue #10 the watcher was bound to a private branch that `init`
+// checked out, so any return of HEAD to the operator's branch satisfied the mismatch condition and muted the
+// watcher for the rest of the session while it went on reporting itself as running (issue #22). Recording in
+// place leaves nothing for HEAD to be away from.
+//
+// A commit that reaches base..<branch> without being one of this watcher's placeholders — an out-of-band
+// commit, a merge, a pull that advanced the branch mid-session — is reported in the log and does not stop the
+// capture. Recording continues deliberately: silently declining to record is the failure mode this issue is
+// about, and a foreign commit is something `finish` can account for (it restamps only the placeholders and
+// returns a foreign commit its own message) rather than a reason to stop capturing the operator's work. The
+// decision about whether the batch can be finalized belongs to `finish`, where it is reported to the operator
+// instead of to a log file.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -140,6 +155,21 @@ pub fn run(root: &Path, git_dir: &Path, branch: &str, cfg: &Config, verbose: boo
                         if verbose {
                             log("debounce window elapsed; running commit cycle");
                         }
+                        // Reported once per cycle in which it is present rather than tracked across cycles: the
+                        // condition persists until the operator acts on it, and a log line per debounce window
+                        // is the signal that something landed in the batch from outside.
+                        if let Some((id, subject)) = foreign_in_batch(root, &base_ref, "HEAD") {
+                            let what = if subject.is_empty() {
+                                "a merge or an empty-message commit".to_string()
+                            } else {
+                                format!("'{subject}'")
+                            };
+                            log(&format!(
+                                "note: the pending batch contains a commit this session did not record \
+                                 ({} — {what}); recording continues, and 'gitomic status' reports it",
+                                short_id(&id)
+                            ));
+                        }
                         commit_cycle(root, &git_dir, &base_ref, cfg, verbose, &observed);
                     }
                     Ok(cur) => log(&format!(
@@ -225,6 +255,24 @@ enum Breadth<'a> {
     Observed(&'a BTreeSet<String>),
     Tracked,
     All,
+}
+
+// The first commit in the pending batch that this session did not record, if any. An atomic commit carries an
+// empty message and exactly one parent, so a commit in base..tip with either a subject or a second parent came
+// from somewhere else: an out-of-band commit, a merge, or a pull that landed on the branch mid-session. Returned
+// rather than logged so the caller reports it in its own register. A read failure yields None so that an
+// unreadable range degrades to the prior behaviour of attempting the capture rather than blocking it; `finish`
+// checks the same range again before rewriting anything, so a missed detection here is not the last line of
+// defence.
+pub(crate) fn foreign_in_batch(root: &Path, base_ref: &str, tip: &str) -> Option<(String, String)> {
+    if base_ref.is_empty() {
+        return None;
+    }
+    let summaries = git::commit_summaries(root, &format!("{base_ref}..{tip}")).ok()?;
+    summaries
+        .into_iter()
+        .find(|(_, parents, subject)| !subject.is_empty() || parents.len() != 1)
+        .map(|(id, _, subject)| (id, subject))
 }
 
 // Capture one atomic commit on the watcher's configured staging policy. `observed` is the set of paths the
@@ -367,6 +415,18 @@ fn same_paths_as_last_commit(root: &Path, base_ref: &str) -> bool {
     if head == base {
         return false; // first capture of the session; nothing to coalesce into yet
     }
+    // Never amend a commit a remote already holds. Amending it rewrites its object id, which diverges the branch
+    // from its remote-tracking ref with no indication that anything happened — a push during a session is enough
+    // to reach this, since recording continues on the branch that was pushed. A fresh commit is always safe, so
+    // coalescing simply declines. A failure to read the published set declines for the same reason.
+    match git::published_in_range(root, &format!("{base_ref}..HEAD")) {
+        Ok(published) => {
+            if published.contains(&head) {
+                return false;
+            }
+        }
+        Err(_) => return false,
+    }
     let (mut prior, mut staged) = match (git::commit_paths(root, "HEAD"), git::staged_paths(root)) {
         (Ok(p), Ok(s)) => (p, s),
         _ => return false,
@@ -443,6 +503,12 @@ fn trace_event(event: &notify::Event, git_dir: &Path, ignore_patterns: &[String]
         })
         .collect();
     log(&format!("event {:?} -> {}", event.kind, tagged.join(", ")));
+}
+
+// Abbreviate an object id for a log line. Local to the watcher so a diagnostic never depends on the command
+// layer, which formats for a terminal rather than a log.
+fn short_id(sha: &str) -> String {
+    sha.chars().take(12).collect()
 }
 
 // Emit a timestamped diagnostic line to the redirected log.

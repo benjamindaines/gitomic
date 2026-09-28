@@ -7,17 +7,15 @@ authored intent — without flattening the intermediate history into a single co
 It is deliberately narrow: it never touches credentials, never contacts a remote, and writes nothing but local
 commits. Publishing stays an explicit, separate `git push`.
 
-NOTE: You may notice a warning about how `gitomic` doesn't track changes to HEAD, etc. At this point, that's
-fixed, or at least worked around. You'll just end up with a new un-merged branch if HEAD moves in a way that
-conflicts with your local changes. No force pushes, no lost work, just need to use the cherry-pick feature 
-to get to a mergable state, then fire off a PR and be done with it. 
-
 ## Model
 
 A session has two pieces of state, both inspectable with plain git:
 
-- A ref `refs/gitomic/base` marking the commit HEAD sat on when the session began.
-- A background watcher process, identified by a pidfile at `<git-dir>/gitomic/watch.pid`.
+- A ref `refs/gitomic/base/<branch>` marking the commit HEAD sat on when the session began.
+- A background watcher process, identified by a pidfile under `<git-dir>/gitomic/<branch>/`.
+
+Recording happens on the branch you are standing on. `gitomic init` does not check anything out, and no gitomic
+command moves HEAD or the work tree while a session is open.
 
 `gitomic init` plants the base and forks the watcher. As the work tree settles after each burst of edits, the
 watcher records one commit with an empty placeholder message — unless the settled paths are exactly the paths
@@ -30,6 +28,13 @@ is removed.
 Because the batch is unpublished, rewriting the messages is safe. The result is N commits carrying the same
 message; each remains individually recoverable by hash and reflog. Enable numbering to append ` [i/N]` so the
 commits stay distinguishable in `git log`.
+
+A commit that reaches `base..HEAD` without coming from the watcher — a `pull` that advanced the branch, a
+manual commit, work from another client — is reported by `gitomic status` and keeps its own message through the
+finalize; only the placeholders are restamped. Two cases stop the finalize instead, with the branch untouched
+and the session preserved: a commit a remote-tracking branch already contains, since rewriting it would need a
+force push to publish, and a merge commit, which a single-parent replay cannot carry. `push_guard` optionally
+installs a pre-push hook that refuses to push a branch whose batch is still unfinalized.
 
 ## Usage
 
@@ -228,6 +233,9 @@ default, so the file is optional. See `gitomic.cfg.example`.
 - **The watcher stands down during multi-step operations** — an in-progress merge, rebase, cherry-pick, revert,
   or bisect suspends auto-committing; a held `index.lock` defers to a later cycle.
 - **A detached HEAD is refused at `init`** — finalize needs a branch ref to advance.
+- **One session per branch, and the watcher follows its own branch** — a watcher records only while its branch
+  is the checked-out one, and resumes by itself when you switch back, with no re-init. Switching to a different
+  branch suspends capture for that session rather than committing onto whatever is current.
 - **Events inside the git directory are ignored** — committing writes to `.git`, so those writes are filtered
   to prevent a feedback loop.
 - **Hooks are bypassed** — placeholder commits use `--no-verify`, and the finalize rewrite uses `commit-tree`,

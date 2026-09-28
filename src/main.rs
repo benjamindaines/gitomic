@@ -1,21 +1,32 @@
 // gitomic — a session-scoped helper for recording atomic commits.
 //
-// Working within a git repository, `gitomic init` marks the current HEAD as a session base and forks a
-// background watcher that records each settled change as its own commit bearing an empty placeholder message.
-// `gitomic finish` stops the watcher and stamps a single message across every commit in the batch, so a
-// session of many recoverable steps collapses to one authored intent without losing per-step history. All
-// commits are local; publishing remains an explicit, separate `git push`.
+// Working within a git repository, `gitomic init` forks a private session branch from the current HEAD and a
+// background watcher that records each settled change onto it as its own commit bearing an empty placeholder
+// message. `gitomic finish` stops the watcher, stamps a single message across every commit in the batch, and
+// integrates the batch back onto the branch the operator began on, so a session of many recoverable steps
+// collapses to one authored intent without losing per-step history. Recording on a private branch keeps an
+// out-of-band move of the origin branch (a pull, another client, a direct-to-remote commit) from being
+// mistaken for session work or overwriting it (issue #10). All commits are local; publishing remains an
+// explicit, separate `git push`.
 //
 // The repository is inferred from the working directory, so any command may be run from anywhere in the tree.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+mod cherry;
+mod cherry_ui;
 mod commands;
 mod config;
+mod conflict;
 mod git;
+mod patch;
+mod pick;
 mod proc;
+#[cfg(test)]
+mod testrepo;
 mod watch;
+mod work;
 
 // Application-wide fallible result. A boxed trait object keeps the error surface dependency-free while still
 // carrying git's own diagnostics upward to the top-level reporter.
@@ -37,14 +48,74 @@ fn dispatch(args: &[String]) -> Res<()> {
     let command = args.first().map(String::as_str).unwrap_or("");
 
     match command {
-        "init" | "start" => commands::init(&cwd),
+        "init" | "start" => {
+            let opts = InitOpts::parse(&args[1..])?;
+            commands::init(&cwd, opts.foreground, opts.verbose)
+        }
         "finish" | "commit" => {
             let opts = FinishOpts::parse(&args[1..])?;
             commands::finish(&cwd, opts.message, opts.numbering)
         }
         "status" => commands::status(&cwd),
+        "active" => commands::active(),
+        "diff" => {
+            let stat = args[1..].iter().any(|a| a == "--stat");
+            commands::diff(&cwd, stat)
+        }
+        "build-safe" => {
+            // Scriptable session gate. Exit code is the primary signal: 0 when no session is open (safe to
+            // build), 1 when a session is open (not safe), 2 on error (e.g. not inside a repository), so a
+            // script can distinguish "session active" from "gitomic could not answer". The words true/false
+            // are printed for capture in a variable unless -q/--quiet is given. This arm sets the process exit
+            // code directly rather than routing through the Ok/Err reporter, since "session open" is a normal
+            // negative answer, not an error to be printed.
+            let quiet = args[1..].iter().any(|a| a == "-q" || a == "--quiet");
+            match commands::build_safe(&cwd) {
+                Ok(safe) => {
+                    if !quiet {
+                        println!("{}", if safe { "true" } else { "false" });
+                    }
+                    std::process::exit(if safe { 0 } else { 1 });
+                }
+                Err(e) => {
+                    eprintln!("gitomic: {e}");
+                    std::process::exit(2);
+                }
+            }
+        }
+        "exec" | "run" => {
+            let rest = &args[1..];
+            // `-c` as the first token selects shell mode (the remaining tokens form one command string, su
+            // -style); otherwise the tokens are an argv executed directly without a shell.
+            let (shell, argv) = match rest.first().map(String::as_str) {
+                Some("-c") => (true, rest[1..].to_vec()),
+                _ => (false, rest.to_vec()),
+            };
+            commands::exec(&cwd, &argv, shell)
+        }
+        "drop" | "rm" => {
+            let opts = DropOpts::parse(&args[1..])?;
+            if opts.hashes.is_empty() {
+                // No hash given: choose interactively, then drop through the ordinary path.
+                match pick::run(&cwd)? {
+                    Some(hashes) => commands::drop_commits(&cwd, &hashes, opts.dry_run),
+                    None => {
+                        println!("gitomic: nothing dropped");
+                        Ok(())
+                    }
+                }
+            } else {
+                commands::drop_commits(&cwd, &opts.hashes, opts.dry_run)
+            }
+        }
+        "cherry-pick" | "pick" => cherry::run(&cwd, parse_cherry(&args[1..])?),
         "stop" => commands::stop(&cwd),
-        "abort" => commands::abort(&cwd, args[1..].iter().any(|a| a == "--force" || a == "-f")),
+        "abort" => commands::abort(
+            &cwd,
+            args[1..]
+                .iter()
+                .any(|a| a == "--force" || a == "-f" || a == "--yes" || a == "-y"),
+        ),
         "-h" | "--help" | "help" | "" => {
             print_usage();
             Ok(())
@@ -87,12 +158,118 @@ impl FinishOpts {
     }
 }
 
+// Parsed options for the drop command.
+struct DropOpts {
+    hashes: Vec<String>,
+    dry_run: bool,
+}
+
+impl DropOpts {
+    // Parse drop arguments. Every positional word is a commit hash (abbreviated or full);
+    // `-n/--dry-run` reports what would be dropped, and whether every later commit still applies,
+    // without changing anything. With no hash at all, the interactive picker is used.
+    fn parse(rest: &[String]) -> Res<DropOpts> {
+        let mut hashes = Vec::new();
+        let mut dry_run = false;
+        for arg in rest {
+            match arg.as_str() {
+                "-n" | "--dry-run" => dry_run = true,
+                flag if flag.starts_with('-') => {
+                    return Err(format!("unexpected option '{flag}' for drop").into())
+                }
+                hash => hashes.push(hash.to_string()),
+            }
+        }
+        Ok(DropOpts { hashes, dry_run })
+    }
+}
+
+// Parse cherry-pick arguments. Every positional word is a commit (abbreviated or full), replayed in
+// the order given; with none, the interactive screen opens. `--from <branch>` names the branch that
+// screen lists first; `-n/--dry-run` reports the patch without writing or applying it;
+// `-p/--patch-only` writes the patch file and stops.
+fn parse_cherry(rest: &[String]) -> Res<cherry::Opts> {
+    let mut opts = cherry::Opts {
+        only: None,
+        from: None,
+        hashes: Vec::new(),
+        dry_run: false,
+        patch_only: false,
+    };
+    let mut it = rest.iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "-n" | "--dry-run" => opts.dry_run = true,
+            "-p" | "--patch-only" => opts.patch_only = true,
+            "--only" => {
+                let value = it.next().ok_or("expected a path after --only")?;
+                opts.only = Some(value.clone());
+            }
+            "--from" => {
+                let value = it.next().ok_or("expected a branch after --from")?;
+                opts.from = Some(value.clone());
+            }
+            flag if flag.starts_with("--from=") => {
+                opts.from = Some(flag["--from=".len()..].to_string());
+            }
+            flag if flag.starts_with('-') => {
+                return Err(format!("unexpected option '{flag}' for cherry-pick").into())
+            }
+            hash => opts.hashes.push(hash.to_string()),
+        }
+    }
+    Ok(opts)
+}
+
+// Parsed options for the init command.
+struct InitOpts {
+    foreground: bool,
+    verbose: bool,
+}
+
+impl InitOpts {
+    // Parse init arguments. `-f/--foreground` runs the watcher in the calling process with diagnostics on the
+    // terminal instead of detaching it into the background; `-v/--verbose` adds a per-event trace line.
+    // Foreground implies verbose, so the operator sees the event stream by default while reproducing a
+    // scenario; `-v` alone fattens the detached watcher's log without keeping the process in the foreground.
+    fn parse(rest: &[String]) -> Res<InitOpts> {
+        let mut foreground = false;
+        let mut verbose = false;
+        for arg in rest {
+            match arg.as_str() {
+                "-f" | "--foreground" => foreground = true,
+                "-v" | "--verbose" => verbose = true,
+                other => return Err(format!("unexpected argument '{other}' for init").into()),
+            }
+        }
+        Ok(InitOpts {
+            foreground,
+            verbose: verbose || foreground,
+        })
+    }
+}
+
 // Absolute path helper retained for potential future subcommands that accept an explicit repository path;
 // currently every command resolves the repository from the working directory.
 #[allow(dead_code)]
 fn as_path(s: &str) -> PathBuf {
     PathBuf::from(s)
 }
+
+// Shell function offered to users for their .bashrc. Held as a raw string so that braces, backslashes and quotes
+// reach the terminal verbatim; substituted into the help text as a format argument, which is not re-parsed.
+const BASHRC_SNIPPET: &str = r#"    gitomicSessions() {
+        local c_red c_blu c_grn c_rst c_ylw c_bold
+        c_red=$'\033[31m'; c_grn=$'\033[32m'; c_ylw=$'\033[33m'
+        c_blu=$'\033[34m'; c_rst=$'\033[0m'; c_bold=$'\033[1m'
+        local active
+        active=$(gitomic active)
+        if [ "$active" ]; then
+            printf "\n%s%s%s\n%s\n\n" \
+                "$c_ylw$c_bold" "Active gitomic sessions:" "$c_rst" \
+                "$active"
+        fi
+    }"#;
 
 fn print_usage() {
     println!(
@@ -102,14 +279,73 @@ USAGE:
   gitomic <command> [options]     run inside a git repository (any subdirectory)
 
 COMMANDS:
-  init                 Mark HEAD as the session base and fork a background watcher. If a base already
-                       exists without a running watcher, resume that session. Aliases: start.
-  finish [options]     Stop the watcher and apply one message to every atomic commit in the session,
-                       then clear the session. Aliases: commit.
-  status               Show the session base, pending atomic-commit count, watcher state, and log path.
+                       Moving the origin branch out of band during a session (a pull, a push from another
+                       client, a direct-to-remote commit later fetched) is safe: recording happens on a
+                       private session branch, so an out-of-band move is never miscounted as session work,
+                       and finish integrates the two lines rather than letting one overwrite the other.
+
+  init [options]       Fork a private session branch '<branch>-<short base>' from HEAD, check it out, and
+                       fork a watcher that records each settled change onto it. Reported and treated as the
+                       branch you were on; the private branch is where commits actually land. If a session
+                       is already open, resume it. Sessions are independent per branch. Aliases: start.
+  finish [options]     Stop the watcher, apply one message to every atomic commit in the session, and
+                       integrate the batch back onto the origin branch: a straight commit when the origin
+                       branch has not moved, a replay on top when it advanced, or — if the work conflicts
+                       with an out-of-band change — left on the session branch for a manual merge or pull
+                       request while the origin branch is left untouched. Aliases: commit.
+  status               Show every open session (origin branch, base, pending atomic-commit count, watcher
+                       state, log path), the private session branch, and whether the origin branch has
+                       moved since the session began. A branch with no open session is omitted.
+  active               List every live gitomic watcher on this machine, across every repository — does not
+                       need to be run from inside a repository. Prints nothing when nothing is running, so
+                       it is quiet by default; meant to be called from a shell profile on new-terminal open.
+  diff [--stat]        Show the consolidated diff of the checked-out branch's pending batch (base..HEAD) —
+                       the atomic commits recorded so far this session, not the working tree. --stat prints
+                       a summary instead of the full patch. Requires an active session.
+  build-safe [-q]      Scriptable session gate for a build script. Prints 'true' when no session is open
+                       (exit 0), 'false' when one is (exit 1); exit 2 on error. -q/--quiet suppresses the
+                       word and returns the exit code only, e.g. 'gitomic build-safe -q || exit 1'.
+  exec [-c] <cmd...>   Run <cmd> in the work tree, then capture its full effect as one atomic commit,
+                       staging untracked files as well regardless of the configured stage mode. Requires an
+                       active session. Mainly for `stage = tracked`; under `stage = observed` a live watcher
+                       captures created files directly. `-c` runs a shell string (su-style); otherwise <cmd>
+                       is an argv run without a shell. Aliases: run.
+  drop [-n] [<hash>...] Delete individual unpublished commits from the checked-out branch: those in
+                       the open session's pending batch or, with no session, any commit not
+                       contained in a remote-tracking branch. Later commits are re-applied without
+                       them, and the files the dropped commits changed are removed or restored on
+                       disk; uncommitted edits to other files are kept. Refuses, changing nothing,
+                       when a later commit depends on a dropped change or an uncommitted edit
+                       blocks the update. -n/--dry-run only reports. Recover a drop with
+                       'git cherry-pick <full id>' (printed). With no hash, opens an interactive
+                       picker: commits on the left, the highlighted diff on the right, space to
+                       mark, Enter to drop the marked commits after a y/n confirmation. Aliases: rm.
+  cherry-pick [options] [<hash>...]
+                       Bring commits from another branch onto the checked-out one by way of a
+                       patch file, without rewriting history. The chosen commits are replayed onto
+                       the current HEAD and the result is applied to the work tree; with a session
+                       open it is recorded as one atomic commit (a live watcher is paused
+                       meanwhile), otherwise it is left uncommitted. With no hash, opens an
+                       interactive screen: commits on the left, what each would change on the
+                       right, space to mark, R to follow one file (marks the commit and every older
+                       commit that changes the same file, each applied for that file only), Tab to
+                       choose the branch, Enter to prepare. A conflict opens a decision screen: a
+                       keeps the tree copy, b takes the picked commit's, c keeps both, per conflict
+                       hunk; X restores the whole file from the newest R-marked commit instead.
+                       Options: --from <branch>, --only <path> (apply each named commit for that
+                       file only), -n/--dry-run (report only), -p/--patch-only (write the patch
+                       file, apply nothing). With hashes, conflicts are refused.
+                       Aliases: pick.
   stop                 Stop the watcher but keep the base and recorded commits for later finish/resume.
-  abort [--force]      Discard the session: reset the branch to the base and drop the atomic commits.
+  abort [--yes]        Discard the session: reset the branch to the base and drop the atomic commits.
+                       Alias: --force, -f, -y
   help, --version
+
+INIT OPTIONS:
+  -f, --foreground       Run the watcher in this process with diagnostics on the terminal instead of
+                         detaching it; Ctrl-C stops it and preserves the session. Implies --verbose.
+  -v, --verbose          Trace every file-system event (kind, paths, and whether it armed the debounce
+                         timer or was ignored as git-internal). Usable with the detached watcher too.
 
 FINISH OPTIONS:
   -m, --message <text>   Use <text> as the message and skip the editor.
@@ -118,7 +354,14 @@ FINISH OPTIONS:
 
 NOTES:
   All commits are local; run 'git push' yourself to publish. Atomic commits and the finalize rewrite
-  bypass git hooks. Config: ${{XDG_CONFIG_HOME:-~/.config}}/gitomic/gitomic.cfg.",
-        env!("CARGO_PKG_VERSION")
+  bypass git hooks. Config: ${{XDG_CONFIG_HOME:-~/.config}}/gitomic/gitomic.cfg.
+
+  Add the following to your .bashrc file to be reminded of running sessions, and call it where it should run
+  (for example, on its own line after the definition):
+
+{snippet}
+",
+        env!("CARGO_PKG_VERSION"),
+        snippet = BASHRC_SNIPPET
     );
 }

@@ -3,7 +3,7 @@ name = "gitomic"
 version = "0.1.0"
 edition = "2021"
 description = "Session-scoped helper that records atomic commits as a repository changes, then stamps one message across the batch"
-license = "MIT"
+license = "GPL-2"
 
 [[bin]]
 name = "gitomic"
@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 libc = "0.2"
 notify = "6"
+ratatui = "0.30.2"
 
 [profile.release]
 strip = true

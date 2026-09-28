@@ -1,12 +1,26 @@
 // Command implementations. Each entry point resolves the target repository from the working directory, then
-// operates through the git wrappers and process-control helpers. Session state is two artefacts per branch:
-// the ref refs/gitomic/base/<branch> marking where that branch's session began, and a pidfile under
-// <git-dir>/gitomic/<branch> identifying that branch's live watcher (issue #4). Their presence or absence
-// fully describes the session, so recovery after an unclean exit is a matter of inspecting them rather than
-// reconstructing hidden state. Every command below infers its target branch from the checked-out HEAD, so
-// `finish`/`stop`/`abort`/`exec`/`build-safe` act on the session for whichever branch is currently checked
-// out; `status` is the exception and reports every branch with an open session, since inspecting a session
-// that is not currently checked out is exactly the case per-branch scoping is meant to make safe.
+// operates through the git wrappers and process-control helpers.
+//
+// A session records onto a private branch rather than onto the branch the operator began on (issue #10). `init`
+// forks a session branch `<origin>-<short base>` from HEAD, checks it out, and the watcher's atomic commits land
+// there; `finish` integrates that batch back onto the origin branch and removes the session branch. Recording on
+// a separate ref means anything that moves the origin branch out-of-band during the session — a `git pull`, a
+// push from another client, a direct-to-remote commit later fetched — cannot be misattributed as session work,
+// because the origin branch and the session branch never share a ref. `finish` finalizes onto the origin branch's
+// current tip: unchanged since the session began, the batch replays straight on (identical to a plain commit);
+// advanced by a fast-forward, the batch is replayed on top of the new tip; diverged such that the batch does not
+// apply, the finalized work is left on the session branch for a manual merge or pull request while the origin
+// branch is left exactly as the out-of-band move left it — data is preserved either way rather than one line of
+// history silently rewriting the other.
+//
+// Session state is three artefacts per session branch: the ref refs/gitomic/base/<session-branch> marking the
+// fork point, a pidfile under <git-dir>/gitomic/<session-branch> identifying that session's live watcher (issue
+// #4), and an ORIGIN file beside the pidfile naming the branch the session was forked from. Their presence or
+// absence fully describes the session, so recovery after an unclean exit is a matter of inspecting them rather
+// than reconstructing hidden state. A session with a base ref but no ORIGIN file is a legacy in-place session
+// (created before issue #10); the commands below still finalize such a session on the branch itself. `status`
+// reports every open session and, for each, the origin branch the operator sees rather than the private branch,
+// noting whether that origin branch has moved since the session began.
 
 use std::fs;
 use std::path::Path;
@@ -30,29 +44,103 @@ pub(crate) fn live_watcher(git_dir: &Path, branch: &str) -> Option<i32> {
     }
 }
 
-// Begin or resume a session: plant the base marker at HEAD if absent, then detach a background watcher. A
-// second invocation while a watcher already runs is a no-op with a notice. When the base already exists but no
-// watcher runs (for example after `stop`), the existing base is preserved and watching resumes from it.
+// Name of the private branch a session records on: the origin branch plus the short base commit, so the branch
+// the operator believes they are on is never the branch recording actually happens on (issue #10). The base sha
+// is the fork point — the commit at which the session diverges from the origin branch — so the name identifies
+// exactly where an eventual manual reconciliation would begin.
+fn session_branch_name(origin: &str, base: &str) -> String {
+    format!("{origin}-{}", short(base))
+}
+
+// File under a session branch's state directory recording the origin branch it was forked from, so finish, abort,
+// and status can integrate back onto and report against the branch the operator started on rather than the
+// private session branch. Its absence marks a legacy in-place session (one created before issue #10), which the
+// same commands still handle on the branch itself.
+const ORIGIN_MARKER: &str = "ORIGIN";
+
+fn write_session_origin(git_dir: &Path, session_branch: &str, origin: &str) -> Res<()> {
+    let sdir = state_dir(git_dir, session_branch);
+    fs::create_dir_all(&sdir)?;
+    fs::write(sdir.join(ORIGIN_MARKER), format!("{origin}\n"))?;
+    Ok(())
+}
+
+fn read_session_origin(git_dir: &Path, session_branch: &str) -> Option<String> {
+    let s = fs::read_to_string(state_dir(git_dir, session_branch).join(ORIGIN_MARKER)).ok()?;
+    let s = s.trim().to_string();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
+}
+
+fn clear_session_origin(git_dir: &Path, session_branch: &str) {
+    let _ = fs::remove_file(state_dir(git_dir, session_branch).join(ORIGIN_MARKER));
+}
+
+// The session branch, if any, whose recorded origin is `origin`. Lets init/finish/abort/build_safe notice a
+// session that is open on its private branch while the operator has the origin branch itself checked out, rather
+// than starting a second session or reporting none. A legacy in-place session carries no ORIGIN file, so it is
+// never matched here and is found only when its own branch is checked out.
+fn find_session_for_origin(root: &Path, git_dir: &Path, origin: &str) -> Res<Option<String>> {
+    for sb in git::session_branches(root)? {
+        if read_session_origin(git_dir, &sb).as_deref() == Some(origin) {
+            return Ok(Some(sb));
+        }
+    }
+    Ok(None)
+}
+
+// Begin or resume a session. A fresh session forks a private branch `<origin>-<short base>` from HEAD, checks it
+// out, plants the base marker, and records the origin branch, then detaches a background watcher bound to the
+// session branch. Re-invoked while already on a session branch, it resumes that session (a no-op with a notice if
+// its watcher is already live; a restart if the watcher had been stopped). Re-invoked on an origin branch whose
+// session is open on its private branch, it directs the operator to that branch rather than opening a second
+// session.
 pub fn init(cwd: &Path, foreground: bool, verbose: bool) -> Res<()> {
     let root = git::work_tree(cwd)?;
     let git_dir = git::git_dir(cwd)?;
-    let branch = git::current_branch(&root)?; // rejects a detached HEAD before any state is written
+    let current = git::current_branch(&root)?; // rejects a detached HEAD before any state is written
+    reject_legacy_session(&root)?;
+
+    // Resolve which branch this session records on. Already on a session branch (its base marker exists): resume
+    // it. On an origin branch with a session open elsewhere: point there. Otherwise: fork a new session branch.
+    let (branch, resuming) = if git::rev_exists(&root, &git::base_ref(&current))? {
+        (current.clone(), true)
+    } else if let Some(existing) = find_session_for_origin(&root, &git_dir, &current)? {
+        println!(
+            "gitomic: a session for '{current}' is already open on '{existing}'.\n  \
+             Resume it with 'git checkout {existing}' then 'gitomic init', or finish/abort it first."
+        );
+        return Ok(());
+    } else {
+        let base = git::rev_parse(&root, "HEAD")?;
+        let sb = session_branch_name(&current, &base);
+        if git::branch_exists(&root, &sb)? {
+            return Err(format!(
+                "cannot start session: branch '{sb}' already exists; delete or rename it, then retry"
+            )
+            .into());
+        }
+        git::create_and_checkout(&root, &sb, &base)?;
+        git::update_ref(&root, &git::base_ref(&sb), &base, "gitomic init")?;
+        write_session_origin(&git_dir, &sb, &current)?;
+        (sb, false)
+    };
+
     let sdir = state_dir(&git_dir, &branch);
     let base_ref = git::base_ref(&branch);
-    reject_legacy_session(&root)?;
+    // The name presented to the operator: the origin branch for a session-branch session, the branch itself for a
+    // legacy in-place one. Also the name recorded in the cross-repo registry so `active` reports the origin.
+    let shown = display_origin(&git_dir, &branch);
 
     if let Some(pid) = live_watcher(&git_dir, &branch) {
         println!(
-            "gitomic: watcher already running (pid {pid}) for {} [{branch}]",
+            "gitomic: watcher already running (pid {pid}) for {} [{shown}]",
             root.display()
         );
         return Ok(());
-    }
-
-    let resuming = git::rev_exists(&root, &base_ref)?;
-    if !resuming {
-        let head = git::rev_parse(&root, "HEAD")?;
-        git::update_ref(&root, &base_ref, &head, "gitomic init")?;
     }
 
     let cfg = Config::load()?;
@@ -70,10 +158,13 @@ pub fn init(cwd: &Path, foreground: bool, verbose: bool) -> Res<()> {
         let base = git::rev_parse(&root, &base_ref)?;
         let verb = if resuming { "resumed" } else { "started" };
         println!(
-            "gitomic: foreground session {verb} for {} [{branch}]",
+            "gitomic: foreground session {verb} for {} [{shown}]",
             root.display()
         );
         println!("  base:  {}", short(&base));
+        if shown != branch {
+            println!("  recording on private branch {branch}");
+        }
         println!("  diagnostics stream to this terminal (not the log file) until Ctrl-C.");
         if verbose {
             println!(
@@ -83,9 +174,9 @@ pub fn init(cwd: &Path, foreground: bool, verbose: bool) -> Res<()> {
         println!("  Ctrl-C stops the watcher; the session and its commits are preserved.");
         proc::install_signal_handlers();
         proc::write_pid(&sdir)?;
-        proc::announce_active(&root, &branch);
+        proc::announce_active(&root, &shown);
         let res = watch::run(&root, &git_dir, &branch, &cfg, verbose);
-        proc::retire_active(&root, &branch);
+        proc::retire_active(&root, &shown);
         proc::clear_pid(&sdir);
         res?;
         return Ok(());
@@ -96,8 +187,11 @@ pub fn init(cwd: &Path, foreground: bool, verbose: bool) -> Res<()> {
             let started = wait_for_watcher(&git_dir, &branch, Duration::from_secs(3));
             let base = git::rev_parse(&root, &base_ref)?;
             let verb = if resuming { "resumed" } else { "started" };
-            println!("gitomic: session {verb} for {} [{branch}]", root.display());
+            println!("gitomic: session {verb} for {} [{shown}]", root.display());
             println!("  base:  {}", short(&base));
+            if shown != branch {
+                println!("  recording on private branch {branch}");
+            }
             if started {
                 if let Some(pid) = live_watcher(&git_dir, &branch) {
                     println!("  watcher pid: {pid}");
@@ -117,9 +211,9 @@ pub fn init(cwd: &Path, foreground: bool, verbose: bool) -> Res<()> {
             proc::redirect_stdio(&proc::logfile(&sdir))?;
             proc::install_signal_handlers();
             if proc::write_pid(&sdir).is_ok() {
-                proc::announce_active(&root, &branch);
+                proc::announce_active(&root, &shown);
                 let _ = watch::run(&root, &git_dir, &branch, &cfg, verbose);
-                proc::retire_active(&root, &branch);
+                proc::retire_active(&root, &shown);
             }
             proc::clear_pid(&sdir);
             std::process::exit(0);
@@ -146,7 +240,8 @@ pub fn exec(cwd: &Path, argv: &[String], shell: bool) -> Res<()> {
     }
     if !git::rev_exists(&root, &git::base_ref(&branch))? {
         return Err(format!(
-            "exec: no active session on '{branch}'; run 'gitomic init' first so the captured change joins a batch"
+            "exec: no active session on '{branch}'; run 'gitomic init' first so the captured \
+            change joins a batch"
         )
         .into());
     }
@@ -205,10 +300,25 @@ fn command_label(argv: &[String], _shell: bool) -> String {
 // maps the boolean to a process exit code.
 pub fn build_safe(cwd: &Path) -> Res<bool> {
     let root = git::work_tree(cwd)?;
+    let git_dir = git::git_dir(cwd)?;
     match git::current_branch(&root) {
-        Ok(branch) => Ok(!git::rev_exists(&root, &git::base_ref(&branch))?),
+        Ok(branch) => {
+            // Not safe if the checked-out branch is itself a session branch, nor if a session for it is open on a
+            // private branch — the operator is on the origin branch but its watcher is still bound to the session
+            // branch and will resume the moment it is checked back out, sweeping in whatever a build wrote to the
+            // shared work tree meanwhile. Both cases share one work tree, so both make a build unsafe.
+            if git::rev_exists(&root, &git::base_ref(&branch))? {
+                return Ok(false);
+            }
+            Ok(find_session_for_origin(&root, &git_dir, &branch)?.is_none())
+        }
         Err(_) => Ok(true),
     }
+}
+
+// The name to present to the operator for a session branch: its origin when recorded, else the branch itself.
+fn display_origin(git_dir: &Path, session_branch: &str) -> String {
+    read_session_origin(git_dir, session_branch).unwrap_or_else(|| session_branch.to_string())
 }
 
 // Report every branch holding an open session, without modifying anything. Unlike the other commands, status
@@ -234,16 +344,38 @@ pub fn status(cwd: &Path) -> Res<()> {
         for branch in &branches {
             let base_ref = git::base_ref(branch);
             let base = git::rev_parse(&root, &base_ref)?;
-            // The branch's own tip, not HEAD: a session's commits land there only while that branch is
-            // checked out, but this report must be meaningful for a branch that currently is not.
+            let origin = read_session_origin(&git_dir, branch); // None => legacy in-place session
+            let shown = origin.clone().unwrap_or_else(|| branch.clone());
+            // The session branch's own tip, not HEAD: a session's commits land there only while it is checked out,
+            // but this report must be meaningful for a session that currently is not.
             let pending = git::count(&root, &format!("{base_ref}..refs/heads/{branch}"))?;
-            let marker = if current.as_deref() == Some(branch.as_str()) {
-                " (current)"
-            } else {
-                ""
-            };
-            println!("  {branch}{marker}");
+            // Marked current when the session branch itself is checked out, or when the operator is on the origin
+            // branch this session records for.
+            let is_current = current.as_deref() == Some(branch.as_str())
+                || (origin.is_some() && current.as_deref() == origin.as_deref());
+            let marker = if is_current { " (current)" } else { "" };
+            println!("  {shown}{marker}");
             println!("    base:            {}", short(&base));
+            if let Some(ref origin_branch) = origin {
+                println!("    session branch:  {branch} (local)");
+                // Whether the origin branch has moved out-of-band since the session began — the desync this scoping
+                // is meant to surface rather than silently fold into the pending count.
+                if let Ok(origin_tip) =
+                    git::rev_parse(&root, &format!("refs/heads/{origin_branch}"))
+                {
+                    if origin_tip != base {
+                        let how = if git::is_ancestor(&root, &base, &origin_tip).unwrap_or(false) {
+                            "advanced; finish replays the batch on top, or keeps it on the session branch if it conflicts"
+                        } else {
+                            "diverged; finish keeps the batch on the session branch for a manual merge"
+                        };
+                        println!(
+                            "    origin moved:    '{origin_branch}' now at {} — {how}",
+                            short(&origin_tip)
+                        );
+                    }
+                }
+            }
             println!("    pending commits: {pending}");
             match live_watcher(&git_dir, branch) {
                 Some(pid) => println!("    watcher:         running (pid {pid})"),
@@ -343,7 +475,10 @@ pub fn stop(cwd: &Path) -> Res<()> {
     if git::rev_exists(&root, &base_ref)? {
         report_flush(&root, &git_dir, &branch, &cfg);
         let pending = git::count(&root, &format!("{base_ref}..HEAD"))?;
-        println!("  {pending} atomic commit(s) preserved; run 'gitomic finish' to finalize or 'gitomic init' to resume");
+        println!(
+            "  {pending} atomic commit(s) preserved; run 'gitomic finish' to finalize \
+            or 'gitomic init' to resume"
+        );
     }
     Ok(())
 }
@@ -363,21 +498,32 @@ pub fn abort(cwd: &Path, force: bool) -> Res<()> {
     let base_ref = git::base_ref(&branch);
 
     if !git::rev_exists(&root, &base_ref)? {
-        println!(
-            "gitomic: no active session for '{branch}' in {}",
-            root.display()
-        );
+        if let Some(sb) = find_session_for_origin(&root, &git_dir, &branch)? {
+            println!("gitomic: the session for '{branch}' is on '{sb}'; run 'git checkout {sb}' then 'gitomic abort'.");
+        } else {
+            println!(
+                "gitomic: no active session for '{branch}' in {}",
+                root.display()
+            );
+        }
         return Ok(());
     }
+    let origin = read_session_origin(&git_dir, &branch); // None => legacy in-place session
     let base = git::rev_parse(&root, &base_ref)?;
     let pending = git::count(&root, &format!("{base_ref}..HEAD"))?;
 
     if !force {
-        println!(
-            "gitomic: abort would move {} back to {} and discard {pending} atomic commit(s) on '{branch}'.",
-            root.display(),
-            short(&base)
-        );
+        match &origin {
+            Some(b) => println!(
+                "gitomic: abort would discard {pending} atomic commit(s) on session branch '{branch}', \
+                 return to '{b}', and remove '{branch}'."
+            ),
+            None => println!(
+                "gitomic: abort would move {} back to {} and discard {pending} atomic commit(s) on '{branch}'.",
+                root.display(),
+                short(&base)
+            ),
+        }
         println!(
             "  working-tree files are preserved; content from discarded commits reverts to unstaged/untracked. \
              Re-run with --yes to proceed."
@@ -386,18 +532,43 @@ pub fn abort(cwd: &Path, force: bool) -> Res<()> {
     }
 
     terminate_watcher(&git_dir, &branch)?;
-    // A mixed reset moves the branch and index to the base while leaving every working-tree file in place, so
-    // no file on disk is deleted by the abort. A hard reset would remove files that exist only in the
-    // discarded commits. No final capture is performed: the session is being discarded, so committing the
-    // last changes only to reset past them would be pointless.
+    let sdir = state_dir(&git_dir, &branch);
+    // A mixed reset moves the branch and index to the base while leaving every working-tree file in place, so no
+    // file on disk is deleted by the abort. A hard reset would remove files that exist only in the discarded
+    // commits. No final capture is performed: the session is being discarded, so committing the last changes only
+    // to reset past them would be pointless.
     git::run(&root, &["reset", "--mixed", &base])?;
-    git::delete_ref(&root, &base_ref)?;
-    proc::clear_pid(&state_dir(&git_dir, &branch));
-    println!(
-        "gitomic: session aborted; {} reset to {} on '{branch}'",
-        root.display(),
-        short(&base)
-    );
+    match origin {
+        Some(b) => {
+            // Return to the origin branch and drop the private session branch. The reset above left the discarded
+            // content on disk as unstaged/untracked, and the switch carries it across; a switch that would be
+            // blocked by that content is reported rather than forced, leaving the branch removable by hand.
+            if let Err(e) = git::checkout(&root, &b) {
+                git::delete_ref(&root, &base_ref)?;
+                proc::clear_pid(&sdir);
+                clear_session_origin(&git_dir, &branch);
+                println!(
+                    "gitomic: session commits discarded on '{branch}', but switching to '{b}' failed ({e})."
+                );
+                println!("  resolve the working tree, then 'git checkout {b}' and 'git branch -D {branch}'.");
+                return Ok(());
+            }
+            git::delete_branch(&root, &branch)?;
+            git::delete_ref(&root, &base_ref)?;
+            proc::clear_pid(&sdir);
+            clear_session_origin(&git_dir, &branch);
+            println!("gitomic: session aborted; back on '{b}', session branch '{branch}' removed");
+        }
+        None => {
+            git::delete_ref(&root, &base_ref)?;
+            proc::clear_pid(&sdir);
+            println!(
+                "gitomic: session aborted; {} reset to {} on '{branch}'",
+                root.display(),
+                short(&base)
+            );
+        }
+    }
     Ok(())
 }
 
@@ -669,12 +840,18 @@ pub fn finish(cwd: &Path, message: Option<String>, numbering_override: Option<bo
     let cfg = Config::load()?;
 
     if !git::rev_exists(&root, &base_ref)? {
-        println!(
-            "gitomic: no active session for '{branch}' in {}",
-            root.display()
-        );
+        if let Some(sb) = find_session_for_origin(&root, &git_dir, &branch)? {
+            println!("gitomic: the session for '{branch}' is on '{sb}'; run 'git checkout {sb}' then 'gitomic finish'.");
+        } else {
+            println!(
+                "gitomic: no active session for '{branch}' in {}",
+                root.display()
+            );
+        }
         return Ok(());
     }
+
+    let origin = read_session_origin(&git_dir, &branch); // None => legacy in-place session
 
     terminate_watcher(&git_dir, &branch)?;
     // Foreground capture before the batch is enumerated, so a change made after the watcher's last cycle is
@@ -689,7 +866,21 @@ pub fn finish(cwd: &Path, message: Option<String>, numbering_override: Option<bo
     if commits.is_empty() {
         git::delete_ref(&root, &base_ref)?;
         proc::clear_pid(&sdir);
-        println!("gitomic: no atomic commits recorded this session; session cleared");
+        match origin {
+            Some(origin_branch) => {
+                clear_session_origin(&git_dir, &branch);
+                // No work recorded: return to the origin branch and drop the empty session branch. A switch that
+                // is blocked by uncommitted content is reported rather than forced.
+                if let Err(e) = git::checkout(&root, &origin_branch) {
+                    println!("gitomic: no atomic commits recorded; session cleared, but switching to '{origin_branch}' failed ({e}).");
+                    println!("  'git checkout {origin_branch}' when ready, then 'git branch -D {branch}'.");
+                } else {
+                    git::delete_branch(&root, &branch)?;
+                    println!("gitomic: no atomic commits recorded this session; session cleared, back on '{origin_branch}'");
+                }
+            }
+            None => println!("gitomic: no atomic commits recorded this session; session cleared"),
+        }
         return Ok(());
     }
 
@@ -703,23 +894,214 @@ pub fn finish(cwd: &Path, message: Option<String>, numbering_override: Option<bo
     }
 
     let numbering = numbering_override.unwrap_or(cfg.finalize_numbering);
-    let new_head = replay(&root, &base, &commits, &message, numbering)?;
-    git::update_ref_cas(
-        &root,
-        &format!("refs/heads/{branch}"),
-        &new_head,
-        &head,
-        "gitomic finalize",
-    )?;
-    git::delete_ref(&root, &base_ref)?;
-    proc::clear_pid(&sdir);
 
-    println!(
-        "gitomic: finalized {} atomic commit(s) on {branch}",
-        commits.len()
-    );
-    println!("  {} -> {}", short(&base), short(&new_head));
+    match origin {
+        None => {
+            // Legacy in-place session (no ORIGIN marker): replay onto the base and advance this branch in place,
+            // exactly as before the session-branch model.
+            let new_head = replay(&root, &base, &commits, &message, numbering)?;
+            git::update_ref_cas(
+                &root,
+                &format!("refs/heads/{branch}"),
+                &new_head,
+                &head,
+                "gitomic finalize",
+            )?;
+            git::delete_ref(&root, &base_ref)?;
+            proc::clear_pid(&sdir);
+            println!(
+                "gitomic: finalized {} atomic commit(s) on {branch}",
+                commits.len()
+            );
+            println!("  {} -> {}", short(&base), short(&new_head));
+        }
+        Some(origin_branch) => finish_session_branch(
+            &root,
+            &git_dir,
+            &branch,
+            &origin_branch,
+            &base,
+            &head,
+            &commits,
+            &message,
+            numbering,
+            &sdir,
+        )?,
+    }
     Ok(())
+}
+
+// Integrate a session branch's finalized batch back onto its origin branch (issue #10). The origin branch's
+// current tip decides the path: unmoved since the session began, the batch replays straight on and the origin
+// branch advances to it; moved but still able to carry the batch, the batch is rebased on top; moved such that the
+// batch does not apply cleanly, the finalized work is left on the session branch for a manual merge or pull
+// request and the origin branch is untouched. The first two paths return to the origin branch and remove the
+// session branch; the third leaves the operator on the session branch.
+#[allow(clippy::too_many_arguments)]
+fn finish_session_branch(
+    root: &Path,
+    git_dir: &Path,
+    session_branch: &str,
+    origin_branch: &str,
+    base: &str,
+    head: &str,
+    commits: &[String],
+    message: &str,
+    numbering: bool,
+    sdir: &Path,
+) -> Res<()> {
+    let base_ref = git::base_ref(session_branch);
+    let origin_ref = format!("refs/heads/{origin_branch}");
+    let origin_tip = git::rev_parse(root, &origin_ref)?;
+
+    // The origin branch has not moved: the batch's own trees are valid on top of the base, so replay reuses them
+    // and the result is identical to a plain commit onto the origin branch.
+    if origin_tip == *base {
+        let new_head = replay(root, base, commits, message, numbering)?;
+        git::update_ref_cas(
+            root,
+            &origin_ref,
+            &new_head,
+            &origin_tip,
+            "gitomic finalize",
+        )?;
+        finalize_teardown(
+            root,
+            git_dir,
+            session_branch,
+            origin_branch,
+            &base_ref,
+            sdir,
+        );
+        println!(
+            "gitomic: finalized {} atomic commit(s) on {origin_branch}",
+            commits.len()
+        );
+        println!("  {} -> {}", short(base), short(&new_head));
+        return Ok(());
+    }
+
+    // The origin branch moved out-of-band during the session. Rebasing each commit's change onto the new tip via a
+    // three-way merge (in the object database only) both integrates the movement and detects a conflict without
+    // touching the work tree.
+    match rebase_batch(root, &origin_tip, commits, message, numbering)? {
+        Rebase::Done(new_head) => {
+            git::update_ref_cas(
+                root,
+                &origin_ref,
+                &new_head,
+                &origin_tip,
+                "gitomic finalize",
+            )?;
+            finalize_teardown(
+                root,
+                git_dir,
+                session_branch,
+                origin_branch,
+                &base_ref,
+                sdir,
+            );
+            println!(
+                "gitomic: '{origin_branch}' advanced to {} during the session; integrated {} atomic commit(s) on top",
+                short(&origin_tip),
+                commits.len()
+            );
+            println!("  {} -> {}", short(&origin_tip), short(&new_head));
+        }
+        Rebase::Conflict(conflicted) => {
+            // The batch cannot be replayed cleanly onto the moved origin tip. Finalize the messages onto the
+            // session branch so it carries a clean, integrable history, then hand it over: the origin branch is
+            // left exactly as the out-of-band move left it, and the session work survives on its own branch for a
+            // manual merge or a pull request. Nothing is rewritten on the origin branch.
+            let finalized = replay(root, base, commits, message, numbering)?;
+            git::update_ref_cas(
+                root,
+                &format!("refs/heads/{session_branch}"),
+                &finalized,
+                head,
+                "gitomic finalize",
+            )?;
+            git::delete_ref(root, &base_ref)?;
+            proc::clear_pid(sdir);
+            clear_session_origin(git_dir, session_branch);
+            println!(
+                "gitomic: '{origin_branch}' advanced to {} and the session's changes conflict with it (at {}).",
+                short(&origin_tip),
+                short(&conflicted)
+            );
+            println!(
+                "  '{origin_branch}' is unchanged. The finalized session work ({} commit(s)) is on branch '{session_branch}'.",
+                commits.len()
+            );
+            println!("  Reconcile it when ready, for example:");
+            println!("    git checkout {session_branch} && git merge {origin_branch}");
+            println!(
+                "  or open a pull request from '{session_branch}' into '{origin_branch}', then delete '{session_branch}' once merged."
+            );
+        }
+    }
+    Ok(())
+}
+
+// Return to the origin branch and remove the now-integrated session branch, clearing the session's state. The
+// work tree already holds the finalized content, so where the origin branch was unchanged the switch moves refs
+// without touching files; where it advanced, the switch brings the integrated result onto disk. A switch blocked
+// by uncommitted work-tree content is reported rather than forced, and the session artefacts are left in place so
+// nothing is lost and the operator can complete the move by hand.
+fn finalize_teardown(
+    root: &Path,
+    git_dir: &Path,
+    session_branch: &str,
+    origin_branch: &str,
+    base_ref: &str,
+    sdir: &Path,
+) {
+    if let Err(e) = git::checkout(root, origin_branch) {
+        println!("  note: '{origin_branch}' was updated, but switching to it failed ({e}).");
+        println!("        'git checkout {origin_branch}' when ready, then 'git branch -D {session_branch}'.");
+        return;
+    }
+    let _ = git::delete_branch(root, session_branch);
+    let _ = git::delete_ref(root, base_ref);
+    proc::clear_pid(sdir);
+    clear_session_origin(git_dir, session_branch);
+}
+
+// Outcome of replaying a finalized batch onto a moved origin tip.
+enum Rebase {
+    // Every commit applied cleanly; carries the new batch head on top of the moved tip.
+    Done(String),
+    // A commit did not apply without conflict; carries that commit's id.
+    Conflict(String),
+}
+
+// Replay each atomic commit's own change onto `onto`, oldest first, giving each the finalized message while
+// preserving its authorship. The three-way merge runs entirely in the object database (see git::cherry_pick_tree),
+// so the work tree and index are never touched and a conflict is detected without leaving a half-applied state.
+fn rebase_batch(
+    root: &Path,
+    onto: &str,
+    commits: &[String],
+    message: &str,
+    numbering: bool,
+) -> Res<Rebase> {
+    let n = commits.len();
+    let mut parent = onto.to_string();
+    for (i, commit) in commits.iter().enumerate() {
+        match git::cherry_pick_tree(root, &parent, commit)? {
+            git::Pick::Tree(tree) => {
+                let (an, ae, ad) = git::author_of(root, commit)?;
+                let msg = if numbering {
+                    numbered(message, i + 1, n)
+                } else {
+                    message.to_string()
+                };
+                parent = git::commit_tree(root, &tree, &parent, &msg, &an, &ae, &ad)?;
+            }
+            git::Pick::Conflict => return Ok(Rebase::Conflict(commit.clone())),
+        }
+    }
+    Ok(Rebase::Done(parent))
 }
 
 // Rebuild the batch onto the base, giving each commit the finalized message while preserving its original tree
@@ -775,7 +1157,10 @@ fn template(commits: &[String]) -> String {
     t.push_str(
         "# Enter one commit message to apply to every atomic commit recorded this session.\n",
     );
-    t.push_str("# Lines starting with '#' are ignored. An empty message aborts finalize and preserves the session.\n");
+    t.push_str(
+        "# Lines starting with '#' are ignored. An empty message aborts \
+        finalize and preserves the session.\n",
+    );
     t.push_str("#\n");
     t.push_str(&format!(
         "# {} commit(s) to finalize (oldest first):\n",
@@ -874,9 +1259,10 @@ fn reject_legacy_session(root: &Path) -> Res<()> {
     let base = git::rev_parse(root, git::LEGACY_BASE_REF)?;
     let pending = git::count(root, &format!("{}..HEAD", git::LEGACY_BASE_REF))?;
     Err(format!(
-        "a pre-branch-scoped session marker exists ({}, base {}, {pending} pending commit(s) against the \
-         branch it was recorded on). Recover any pending work — 'git log {}..HEAD' shows the commits — then \
-         remove the marker with 'git update-ref -d {}' before starting a new session.",
+        "a pre-branch-scoped session marker exists ({}, base {}, {pending} pending commit(s) \
+         against the branch it was recorded on). Recover any pending work — 'git log {}..HEAD' \
+         shows the commits — then remove the marker with 'git update-ref -d {}' before starting \
+         a new session.",
         git::LEGACY_BASE_REF,
         short(&base),
         git::LEGACY_BASE_REF,
@@ -1161,5 +1547,209 @@ mod drop_tests {
         r.drop(&[&three], false).unwrap();
         assert_eq!(r.subjects(), ["one", "two"]);
         assert_eq!(r.git(&["rev-parse", &git::base_ref("main")]), head);
+    }
+}
+
+// Tests for the session-branch integration path of `finish` (issue #10). Each test builds a repository, forks a
+// session branch by hand (mirroring what `init` plants: the base ref plus the ORIGIN marker), records atomic
+// commits on it, and then drives `finish` directly, so the daemonized watcher is never involved.
+#[cfg(test)]
+mod session_branch_tests {
+    use super::*;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+
+    struct Repo(PathBuf);
+
+    impl Repo {
+        fn new() -> Repo {
+            let n = NEXT.fetch_add(1, Ordering::SeqCst);
+            let dir = std::env::temp_dir().join(format!("gitomic-sb-{}-{n}", std::process::id()));
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(&dir).unwrap();
+            let r = Repo(dir);
+            r.git(&["init", "-q", "-b", "main"]);
+            r.git(&["config", "user.name", "Test"]);
+            r.git(&["config", "user.email", "test@example.invalid"]);
+            r
+        }
+
+        fn git(&self, args: &[&str]) -> String {
+            git::run(&self.0, args).unwrap()
+        }
+
+        fn git_dir(&self) -> PathBuf {
+            self.0.join(".git")
+        }
+
+        // Commit a file with an explicit message (used for real commits on the origin branch).
+        fn commit_file(&self, name: &str, content: &str, msg: &str) -> String {
+            fs::write(self.0.join(name), content).unwrap();
+            self.git(&["add", name]);
+            self.git(&["commit", "-q", "-m", msg]);
+            self.git(&["rev-parse", "HEAD"])
+        }
+
+        // Commit a file with an empty message, matching what the watcher records as an atomic commit.
+        fn atomic(&self, name: &str, content: &str) -> String {
+            fs::write(self.0.join(name), content).unwrap();
+            self.git(&["add", name]);
+            self.git(&["commit", "-q", "--allow-empty-message", "-m", ""]);
+            self.git(&["rev-parse", "HEAD"])
+        }
+
+        // Plant the session artefacts `init` would leave: the base ref for the session branch and the ORIGIN
+        // marker recording the origin branch. The session branch itself is created by the caller.
+        fn plant_session(&self, session_branch: &str, origin: &str, base: &str) {
+            self.git(&["update-ref", &git::base_ref(session_branch), base]);
+            write_session_origin(&self.git_dir(), session_branch, origin).unwrap();
+        }
+
+        fn current_branch(&self) -> String {
+            self.git(&["symbolic-ref", "--short", "HEAD"])
+        }
+
+        fn subjects_of(&self, refname: &str) -> Vec<String> {
+            self.git(&["log", "--format=%s", "--reverse", refname])
+                .lines()
+                .map(str::to_string)
+                .collect()
+        }
+
+        fn finish(&self, msg: &str) -> Res<()> {
+            finish(&self.0, Some(msg.to_string()), Some(false))
+        }
+    }
+
+    impl Drop for Repo {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    // The origin branch has not moved: the session's two atomic commits land on it as a straight, message-bearing
+    // batch, the operator ends on the origin branch, and the session branch and its artefacts are gone.
+    #[test]
+    fn finish_integrates_onto_unmoved_origin_and_returns() {
+        let r = Repo::new();
+        let base = r.commit_file("root.txt", "root\n", "root");
+        let sb = session_branch_name("main", &base);
+        r.git(&["checkout", "-q", "-b", &sb, &base]);
+        r.atomic("s.txt", "one\n");
+        r.atomic("s.txt", "one\ntwo\n");
+        r.plant_session(&sb, "main", &base);
+
+        r.finish("finalized work").unwrap();
+
+        assert_eq!(r.current_branch(), "main");
+        assert_eq!(
+            r.subjects_of("main"),
+            ["root", "finalized work", "finalized work"]
+        );
+        assert!(!git::branch_exists(&r.0, &sb).unwrap());
+        assert!(!git::rev_exists(&r.0, &git::base_ref(&sb)).unwrap());
+        assert!(read_session_origin(&r.git_dir(), &sb).is_none());
+        assert_eq!(fs::read_to_string(r.0.join("s.txt")).unwrap(), "one\ntwo\n");
+    }
+
+    // The origin branch advanced with a non-conflicting commit during the session: the batch is rebased on top of
+    // the new tip, preserving one commit per atomic step, and the operator ends on the origin branch.
+    #[test]
+    fn finish_rebases_onto_advanced_origin_without_conflict() {
+        let r = Repo::new();
+        let base = r.commit_file("root.txt", "root\n", "root");
+        let sb = session_branch_name("main", &base);
+        r.git(&["checkout", "-q", "-b", &sb, &base]);
+        r.atomic("s.txt", "session\n");
+        // Origin advances with an unrelated file, out of band from the session.
+        r.git(&["checkout", "-q", "main"]);
+        r.commit_file("o.txt", "origin\n", "origin advance");
+        r.git(&["checkout", "-q", &sb]);
+        r.plant_session(&sb, "main", &base);
+
+        r.finish("session change").unwrap();
+
+        assert_eq!(r.current_branch(), "main");
+        assert_eq!(
+            r.subjects_of("main"),
+            ["root", "origin advance", "session change"]
+        );
+        // Both the out-of-band file and the session's file are present on the integrated branch.
+        assert_eq!(fs::read_to_string(r.0.join("o.txt")).unwrap(), "origin\n");
+        assert_eq!(fs::read_to_string(r.0.join("s.txt")).unwrap(), "session\n");
+        assert!(!git::branch_exists(&r.0, &sb).unwrap());
+    }
+
+    // The origin branch advanced with a commit that conflicts with the session's change: nothing is rewritten on
+    // the origin branch, the finalized work is left on the session branch, and the operator stays there.
+    #[test]
+    fn finish_leaves_work_on_session_branch_on_conflict() {
+        let r = Repo::new();
+        let base = r.commit_file("shared.txt", "base\n", "root");
+        let sb = session_branch_name("main", &base);
+        r.git(&["checkout", "-q", "-b", &sb, &base]);
+        r.atomic("shared.txt", "session edit\n");
+        // Origin advances by editing the very same file to a different value.
+        r.git(&["checkout", "-q", "main"]);
+        let origin_tip = r.commit_file("shared.txt", "origin edit\n", "origin advance");
+        r.git(&["checkout", "-q", &sb]);
+        r.plant_session(&sb, "main", &base);
+
+        r.finish("session change").unwrap();
+
+        // Origin branch is exactly where the out-of-band commit left it — untouched by finish.
+        assert_eq!(r.git(&["rev-parse", "main"]), origin_tip);
+        assert_eq!(r.subjects_of("main"), ["root", "origin advance"]);
+        // The operator remains on the session branch, which now carries the finalized message.
+        assert_eq!(r.current_branch(), sb);
+        assert_eq!(r.subjects_of(&sb), ["root", "session change"]);
+        // The session is closed out: base ref and ORIGIN marker removed, so gitomic no longer manages the branch.
+        assert!(!git::rev_exists(&r.0, &git::base_ref(&sb)).unwrap());
+        assert!(read_session_origin(&r.git_dir(), &sb).is_none());
+    }
+
+    // A session with no recorded atomic commits clears cleanly and returns to the origin branch.
+    #[test]
+    fn finish_with_no_commits_returns_to_origin() {
+        let r = Repo::new();
+        let base = r.commit_file("root.txt", "root\n", "root");
+        let sb = session_branch_name("main", &base);
+        r.git(&["checkout", "-q", "-b", &sb, &base]);
+        r.plant_session(&sb, "main", &base);
+
+        r.finish("unused").unwrap();
+
+        assert_eq!(r.current_branch(), "main");
+        assert!(!git::branch_exists(&r.0, &sb).unwrap());
+        assert!(read_session_origin(&r.git_dir(), &sb).is_none());
+    }
+
+    // abort on a session branch discards the atomic commits, returns to the origin branch, removes the session
+    // branch, and preserves the work-tree content as uncommitted.
+    #[test]
+    fn abort_returns_to_origin_and_preserves_files() {
+        let r = Repo::new();
+        let base = r.commit_file("root.txt", "root\n", "root");
+        let sb = session_branch_name("main", &base);
+        r.git(&["checkout", "-q", "-b", &sb, &base]);
+        r.atomic("s.txt", "work\n");
+        r.plant_session(&sb, "main", &base);
+
+        abort(&r.0, true).unwrap();
+
+        assert_eq!(r.current_branch(), "main");
+        assert!(!git::branch_exists(&r.0, &sb).unwrap());
+        assert!(!git::rev_exists(&r.0, &git::base_ref(&sb)).unwrap());
+        // The file the atomic commit recorded survives on disk, now untracked rather than committed.
+        assert_eq!(fs::read_to_string(r.0.join("s.txt")).unwrap(), "work\n");
+        assert_eq!(r.subjects_of("main"), ["root"]);
+    }
+
+    #[test]
+    fn session_branch_name_appends_short_base() {
+        let name = session_branch_name("feature/x", "0123456789abcdef0123");
+        assert_eq!(name, "feature/x-0123456789ab");
     }
 }

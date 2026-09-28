@@ -109,7 +109,12 @@ fn dispatch(args: &[String]) -> Res<()> {
         }
         "cherry-pick" | "pick" => cherry::run(&cwd, parse_cherry(&args[1..])?),
         "stop" => commands::stop(&cwd),
-        "abort" => commands::abort(&cwd, args[1..].iter().any(|a| a == "--force" || a == "-f" || a == "--yes" || a == "-y")),
+        "abort" => commands::abort(
+            &cwd,
+            args[1..]
+                .iter()
+                .any(|a| a == "--force" || a == "-f" || a == "--yes" || a == "-y"),
+        ),
         "-h" | "--help" | "help" | "" => {
             print_usage();
             Ok(())

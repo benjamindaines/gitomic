@@ -360,7 +360,9 @@ pub fn status(cwd: &Path) -> Res<()> {
                 println!("    session branch:  {branch} (local)");
                 // Whether the origin branch has moved out-of-band since the session began — the desync this scoping
                 // is meant to surface rather than silently fold into the pending count.
-                if let Ok(origin_tip) = git::rev_parse(&root, &format!("refs/heads/{origin_branch}")) {
+                if let Ok(origin_tip) =
+                    git::rev_parse(&root, &format!("refs/heads/{origin_branch}"))
+                {
                     if origin_tip != base {
                         let how = if git::is_ancestor(&root, &base, &origin_tip).unwrap_or(false) {
                             "advanced; finish replays the batch on top, or keeps it on the session branch if it conflicts"
@@ -473,8 +475,10 @@ pub fn stop(cwd: &Path) -> Res<()> {
     if git::rev_exists(&root, &base_ref)? {
         report_flush(&root, &git_dir, &branch, &cfg);
         let pending = git::count(&root, &format!("{base_ref}..HEAD"))?;
-        println!("  {pending} atomic commit(s) preserved; run 'gitomic finish' to finalize \
-            or 'gitomic init' to resume");
+        println!(
+            "  {pending} atomic commit(s) preserved; run 'gitomic finish' to finalize \
+            or 'gitomic init' to resume"
+        );
     }
     Ok(())
 }
@@ -954,8 +958,21 @@ fn finish_session_branch(
     // and the result is identical to a plain commit onto the origin branch.
     if origin_tip == *base {
         let new_head = replay(root, base, commits, message, numbering)?;
-        git::update_ref_cas(root, &origin_ref, &new_head, &origin_tip, "gitomic finalize")?;
-        finalize_teardown(root, git_dir, session_branch, origin_branch, &base_ref, sdir);
+        git::update_ref_cas(
+            root,
+            &origin_ref,
+            &new_head,
+            &origin_tip,
+            "gitomic finalize",
+        )?;
+        finalize_teardown(
+            root,
+            git_dir,
+            session_branch,
+            origin_branch,
+            &base_ref,
+            sdir,
+        );
         println!(
             "gitomic: finalized {} atomic commit(s) on {origin_branch}",
             commits.len()
@@ -969,8 +986,21 @@ fn finish_session_branch(
     // touching the work tree.
     match rebase_batch(root, &origin_tip, commits, message, numbering)? {
         Rebase::Done(new_head) => {
-            git::update_ref_cas(root, &origin_ref, &new_head, &origin_tip, "gitomic finalize")?;
-            finalize_teardown(root, git_dir, session_branch, origin_branch, &base_ref, sdir);
+            git::update_ref_cas(
+                root,
+                &origin_ref,
+                &new_head,
+                &origin_tip,
+                "gitomic finalize",
+            )?;
+            finalize_teardown(
+                root,
+                git_dir,
+                session_branch,
+                origin_branch,
+                &base_ref,
+                sdir,
+            );
             println!(
                 "gitomic: '{origin_branch}' advanced to {} during the session; integrated {} atomic commit(s) on top",
                 short(&origin_tip),
@@ -1127,8 +1157,10 @@ fn template(commits: &[String]) -> String {
     t.push_str(
         "# Enter one commit message to apply to every atomic commit recorded this session.\n",
     );
-    t.push_str("# Lines starting with '#' are ignored. An empty message aborts \
-        finalize and preserves the session.\n");
+    t.push_str(
+        "# Lines starting with '#' are ignored. An empty message aborts \
+        finalize and preserves the session.\n",
+    );
     t.push_str("#\n");
     t.push_str(&format!(
         "# {} commit(s) to finalize (oldest first):\n",

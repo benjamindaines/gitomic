@@ -109,7 +109,7 @@ fn dispatch(args: &[String]) -> Res<()> {
         }
         "cherry-pick" | "pick" => cherry::run(&cwd, parse_cherry(&args[1..])?),
         "stop" => commands::stop(&cwd),
-        "abort" => commands::abort(&cwd, args[1..].iter().any(|a| a == "--force" || a == "-f")),
+        "abort" => commands::abort(&cwd, args[1..].iter().any(|a| a == "--force" || a == "-f" || a == "--yes" || a == "-y")),
         "-h" | "--help" | "help" | "" => {
             print_usage();
             Ok(())
@@ -331,8 +331,8 @@ COMMANDS:
                        file, apply nothing). With hashes, conflicts are refused.
                        Aliases: pick.
   stop                 Stop the watcher but keep the base and recorded commits for later finish/resume.
-  abort [--force]      Discard the session: drop the atomic commits, return to the origin branch, and remove
-                       the session branch. Working-tree files are preserved as uncommitted.
+  abort [--yes]        Discard the session: reset the branch to the base and drop the atomic commits.
+                       Alias: --force, -f, -y
   help, --version
 
 INIT OPTIONS:

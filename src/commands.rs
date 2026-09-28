@@ -240,7 +240,8 @@ pub fn exec(cwd: &Path, argv: &[String], shell: bool) -> Res<()> {
     }
     if !git::rev_exists(&root, &git::base_ref(&branch))? {
         return Err(format!(
-            "exec: no active session on '{branch}'; run 'gitomic init' first so the captured change joins a batch"
+            "exec: no active session on '{branch}'; run 'gitomic init' first so the captured \
+            change joins a batch"
         )
         .into());
     }
@@ -472,7 +473,8 @@ pub fn stop(cwd: &Path) -> Res<()> {
     if git::rev_exists(&root, &base_ref)? {
         report_flush(&root, &git_dir, &branch, &cfg);
         let pending = git::count(&root, &format!("{base_ref}..HEAD"))?;
-        println!("  {pending} atomic commit(s) preserved; run 'gitomic finish' to finalize or 'gitomic init' to resume");
+        println!("  {pending} atomic commit(s) preserved; run 'gitomic finish' to finalize \
+            or 'gitomic init' to resume");
     }
     Ok(())
 }
@@ -1125,7 +1127,8 @@ fn template(commits: &[String]) -> String {
     t.push_str(
         "# Enter one commit message to apply to every atomic commit recorded this session.\n",
     );
-    t.push_str("# Lines starting with '#' are ignored. An empty message aborts finalize and preserves the session.\n");
+    t.push_str("# Lines starting with '#' are ignored. An empty message aborts \
+        finalize and preserves the session.\n");
     t.push_str("#\n");
     t.push_str(&format!(
         "# {} commit(s) to finalize (oldest first):\n",
@@ -1224,9 +1227,10 @@ fn reject_legacy_session(root: &Path) -> Res<()> {
     let base = git::rev_parse(root, git::LEGACY_BASE_REF)?;
     let pending = git::count(root, &format!("{}..HEAD", git::LEGACY_BASE_REF))?;
     Err(format!(
-        "a pre-branch-scoped session marker exists ({}, base {}, {pending} pending commit(s) against the \
-         branch it was recorded on). Recover any pending work — 'git log {}..HEAD' shows the commits — then \
-         remove the marker with 'git update-ref -d {}' before starting a new session.",
+        "a pre-branch-scoped session marker exists ({}, base {}, {pending} pending commit(s) \
+         against the branch it was recorded on). Recover any pending work — 'git log {}..HEAD' \
+         shows the commits — then remove the marker with 'git update-ref -d {}' before starting \
+         a new session.",
         git::LEGACY_BASE_REF,
         short(&base),
         git::LEGACY_BASE_REF,

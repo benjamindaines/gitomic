@@ -101,6 +101,9 @@ pub fn run(root: &Path, git_dir: &Path, branch: &str, cfg: &Config, verbose: boo
         cfg.debounce_ms
     ));
 
+    // The watch is armed before the sweep, so an edit made while the sweep runs is observed as well.
+    startup_sweep(root, &git_dir, branch);
+
     let mut last_event: Option<Instant> = None;
     // Paths observed changing since the last commit cycle, accumulated for observed staging. Cleared after
     // each cycle; persisted on shutdown so a change made after the last cycle is not lost to the foreground
@@ -254,6 +257,8 @@ pub(crate) enum Flush {
 enum Breadth<'a> {
     Observed(&'a BTreeSet<String>),
     Tracked,
+    // Tracked files only, with submodules left out entirely (see `stage_tracked_files`).
+    TrackedFiles,
     All,
 }
 
@@ -306,6 +311,78 @@ pub(crate) fn flush_all(root: &Path, git_dir: &Path) -> Flush {
     flush_staged(root, git_dir, "", Breadth::All, false)
 }
 
+// Record, as one atomic commit, the changes to tracked files that were made while no watcher ran
+// (issue #24). The observed set only holds paths seen changing since the watch was armed, so an edit
+// made before a session started or resumed would otherwise wait for its file to change again, and a
+// restore would overwrite it unrecorded. The sweep stages what `git add -u` stages: modifications
+// and deletions of tracked files. Untracked files are left to the watcher, because sweeping them
+// would pull build output into the session. It does nothing when the branch checked out is not the
+// session's, or when the session has no base marker to commit on top of.
+fn startup_sweep(root: &Path, git_dir: &Path, branch: &str) {
+    if git::current_branch(root)
+        .map(|c| c != branch)
+        .unwrap_or(true)
+    {
+        return;
+    }
+    if git::rev_parse(root, &git::base_ref(branch)).is_err() {
+        return;
+    }
+    match flush_tracked(root, git_dir) {
+        Flush::Committed(sha) if !sha.is_empty() => {
+            log(&format!("start-up sweep: recorded earlier edits as {sha}"))
+        }
+        Flush::Committed(_) => log("start-up sweep: recorded earlier edits"),
+        Flush::Nothing => {}
+        Flush::Skipped(why) => log(&format!("start-up sweep skipped: {why}")),
+        Flush::Failed(msg) => log(&format!("start-up sweep: {msg}")),
+    }
+}
+
+// Capture one atomic commit staging every change to files git already tracks (`git add -u`),
+// irrespective of the configured staging policy and of what the watcher observed. Used before a
+// restore (issue #24) so that edits made while no watcher ran are recorded before they are
+// overwritten. Untracked files are left alone, and so are submodules. Coalescing is off: the capture stands as its own
+// step, which keeps the pre-restore state one `drop` away.
+pub(crate) fn flush_tracked(root: &Path, git_dir: &Path) -> Flush {
+    flush_staged(root, git_dir, "", Breadth::TrackedFiles, false)
+}
+
+// Paths of the submodules (gitlinks) in the index.
+fn gitlinks(root: &Path) -> Res<Vec<String>> {
+    let out = git::run(root, &["ls-files", "--stage", "-z"])?;
+    Ok(out
+        .split('\0')
+        .filter_map(|rec| rec.strip_prefix("160000 "))
+        .filter_map(|rec| rec.split_once('\t').map(|(_, path)| path.to_string()))
+        .collect())
+}
+
+// Stage modifications and deletions of tracked files (`git add -u`) without touching any submodule.
+// A submodule checked out at another commit than the one recorded shows up as a modified path, and
+// `git add -u` would record the move; a submodule is the operator's to update deliberately, so its
+// pointer is excluded from the pathspec. A pointer the operator already staged would still enter
+// the commit, so the capture is refused in that case and the index is left as it is.
+fn stage_tracked_files(root: &Path) -> Res<()> {
+    let links = gitlinks(root)?;
+    if links.is_empty() {
+        return git::run(root, &["add", "-u"]).map(|_| ());
+    }
+    let excludes: Vec<String> = links
+        .iter()
+        .map(|p| format!(":(exclude,literal){p}"))
+        .collect();
+    let mut add: Vec<&str> = vec!["add", "-u", "--", "."];
+    add.extend(excludes.iter().map(String::as_str));
+    git::run(root, &add)?;
+    let mut staged: Vec<&str> = vec!["diff", "--cached", "--name-only", "--"];
+    staged.extend(links.iter().map(String::as_str));
+    if !git::run(root, &staged)?.trim().is_empty() {
+        return Err("a submodule pointer is staged; stage or reset it first".into());
+    }
+    Ok(())
+}
+
 // Stage the paths the watcher observed changing this cycle, intersected with the paths git reports as actually
 // changed. The intersection is what makes observed staging both precise and robust: ignored files, paths with
 // no real change, and stale events for paths that have since vanished all drop out, so a single disappeared
@@ -355,6 +432,7 @@ fn flush_staged(
     let staged = match breadth {
         Breadth::Observed(obs) => stage_observed(root, obs),
         Breadth::Tracked => git::run(root, &["add", "-u"]).map(|_| ()),
+        Breadth::TrackedFiles => stage_tracked_files(root),
         Breadth::All => git::run(root, &["add", "-A"]).map(|_| ()),
     };
     if let Err(e) = staged {
@@ -563,6 +641,109 @@ mod tests {
             Path::new("/repo/foo.kate-swp/real_file.rs"),
             &patterns
         ));
+    }
+
+    fn session() -> crate::testrepo::Repo {
+        let r = crate::testrepo::Repo::new();
+        r.write("a.txt", "a\n");
+        r.write("b.txt", "b\n");
+        r.git(&["add", "."]);
+        r.git(&["commit", "-q", "-m", "base"]);
+        r.git(&["update-ref", &git::base_ref("main"), "HEAD"]);
+        r
+    }
+
+    #[test]
+    fn the_sweep_records_edits_and_deletions_of_tracked_files_as_one_commit() {
+        let r = session();
+        let base = r.head();
+        r.write("a.txt", "edited while no watcher ran\n");
+        std::fs::remove_file(r.0.join("b.txt")).unwrap();
+        r.write("new.txt", "untracked\n");
+        let git_dir = git::git_dir(&r.0).unwrap();
+        startup_sweep(&r.0, &git_dir, "main");
+        assert_ne!(r.head(), base);
+        assert_eq!(
+            r.git(&["rev-list", "--count", &format!("{base}..HEAD")]),
+            "1"
+        );
+        assert_eq!(r.git(&["log", "-1", "--format=%s"]), "");
+        assert_eq!(
+            r.git(&["show", "HEAD:a.txt"]),
+            "edited while no watcher ran"
+        );
+        assert!(r
+            .git(&["ls-tree", "--name-only", "HEAD"])
+            .lines()
+            .all(|f| f != "b.txt"));
+        assert_eq!(r.git(&["status", "--porcelain"]), "?? new.txt");
+    }
+
+    #[test]
+    fn the_sweep_leaves_a_moved_submodule_pointer_alone_and_refuses_a_staged_one() {
+        let sub = crate::testrepo::Repo::new();
+        sub.write("f", "1\n");
+        sub.git(&["add", "."]);
+        sub.git(&["commit", "-q", "-m", "one"]);
+        sub.commit_file("f", "2\n", "two");
+        let r = crate::testrepo::Repo::new();
+        r.write("a.txt", "a\n");
+        r.git(&["add", "."]);
+        r.git(&["commit", "-q", "-m", "base"]);
+        let url = sub.0.to_string_lossy().to_string();
+        r.git(&[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "-q",
+            &url,
+            "sub",
+        ]);
+        r.git(&["commit", "-q", "-m", "add submodule"]);
+        r.git(&["update-ref", &git::base_ref("main"), "HEAD"]);
+        let base = r.head();
+        let git_dir = git::git_dir(&r.0).unwrap();
+        // The submodule moves to another commit and a tracked file is edited.
+        r.git(&["-C", "sub", "checkout", "-q", "HEAD~1"]);
+        r.write("a.txt", "edited\n");
+        startup_sweep(&r.0, &git_dir, "main");
+        assert_ne!(r.head(), base);
+        assert_eq!(r.git(&["show", "HEAD:a.txt"]), "edited");
+        assert_eq!(
+            r.git(&["diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"]),
+            "a.txt"
+        );
+        assert_eq!(
+            r.git(&["status", "--porcelain"]),
+            " M sub",
+            "the pointer stays a local edit"
+        );
+        // A pointer the operator staged is not swept in; nothing is committed.
+        r.git(&["add", "sub"]);
+        r.write("a.txt", "edited again\n");
+        let head = r.head();
+        startup_sweep(&r.0, &git_dir, "main");
+        assert_eq!(r.head(), head);
+    }
+
+    #[test]
+    fn the_sweep_does_nothing_on_a_clean_tree_another_branch_or_without_a_session() {
+        let r = session();
+        let head = r.head();
+        let git_dir = git::git_dir(&r.0).unwrap();
+        startup_sweep(&r.0, &git_dir, "main");
+        assert_eq!(r.head(), head, "clean tree");
+        r.write("a.txt", "edit\n");
+        startup_sweep(&r.0, &git_dir, "other");
+        assert_eq!(
+            r.head(),
+            head,
+            "the branch checked out is not the session's"
+        );
+        r.git(&["update-ref", "-d", &git::base_ref("main")]);
+        startup_sweep(&r.0, &git_dir, "main");
+        assert_eq!(r.head(), head, "no session base");
     }
 
     #[test]

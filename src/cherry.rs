@@ -29,7 +29,7 @@ use std::sync::{Arc, Mutex};
 use crate::commands::{live_watcher, report_flush, short, terminate_watcher};
 use crate::config::Config;
 use crate::patch::{self, Built, Merged, Spec};
-use crate::{commands, git, Res};
+use crate::{commands, git, watch, Res};
 
 // Cap on the commits offered from one branch, so a branch with a long history does not make the
 // listing slow. The picker states when the cap was reached.
@@ -42,6 +42,8 @@ pub struct Opts {
     pub hashes: Vec<String>,
     pub dry_run: bool,
     pub patch_only: bool,
+    // `-s/--stash`: the words are paths, taken out of a stash by the restore pipeline.
+    pub stash: bool,
 }
 
 // Branches a commit can be picked from: local branches, then remote-tracking ones, most recently
@@ -548,25 +550,40 @@ impl Reader {
 
 // Entry point for the command.
 pub fn run(cwd: &Path, opts: Opts) -> Res<()> {
-    let root = git::work_tree(cwd)?;
-    let git_dir = git::git_dir(cwd)?;
-    if git::operation_in_progress(&git_dir) {
-        return Err(
-            "cherry-pick: a merge, rebase, cherry-pick, revert, or bisect is in progress".into(),
+    // A stash holds a snapshot, not commits to replay, so its files go through `restore`, which
+    // overwrites them from the stash and leaves the stash itself alone.
+    if opts.stash {
+        if opts.only.is_some() {
+            return Err("cherry-pick: --only does not apply with --stash".into());
+        }
+        return crate::restore::run(
+            cwd,
+            crate::restore::Opts {
+                from: opts.from,
+                paths: opts.hashes,
+                dry_run: opts.dry_run,
+                patch_only: opts.patch_only,
+                stash: true,
+            },
         );
     }
-    let spec = if opts.hashes.is_empty() {
+    let root = git::work_tree(cwd)?;
+    let git_dir = git::git_dir(cwd)?;
+    if let Some(op) = git::operation_kind(&git_dir) {
+        return Err(crate::commands::blocked_by("cherry-pick", op).into());
+    }
+    let specs = if opts.hashes.is_empty() {
         match crate::cherry_ui::run(cwd, opts.from.as_deref())? {
-            Some(spec) => spec,
+            Some(specs) => specs,
             None => {
                 println!("gitomic: nothing picked");
                 return Ok(());
             }
         }
     } else {
-        spec_from_hashes(&root, &opts.hashes, opts.only.as_deref())?
+        vec![spec_from_hashes(&root, &opts.hashes, opts.only.as_deref())?]
     };
-    apply_spec(cwd, spec, opts.dry_run, opts.patch_only)
+    apply_specs(cwd, specs, opts.dry_run, opts.patch_only)
 }
 
 // Resolve command-line selectors into a spec against the current HEAD. The order given is the order
@@ -614,17 +631,37 @@ fn spec_from_hashes(root: &Path, hashes: &[String], only: Option<&str>) -> Res<S
     })
 }
 
-// Apply `spec` to the checked-out branch: stop a live watcher, build (or rebuild) the patch against
-// the HEAD that exists once the watcher is quiet, write and apply it, record it when a session is
-// open, and restart the watcher.
+// Apply one `spec` to the checked-out branch; see `apply_specs`.
+#[cfg(test)]
 pub fn apply_spec(cwd: &Path, spec: Spec, dry_run: bool, patch_only: bool) -> Res<()> {
+    apply_specs(cwd, vec![spec], dry_run, patch_only)
+}
+
+// A spec that only restores whole files. Such a patch names the content it wants, so it does not
+// depend on the HEAD it was prepared against.
+fn is_pure_restore(spec: &Spec) -> bool {
+    spec.picks.is_empty() && !spec.restore.is_empty()
+}
+
+// What a failure of `spec` is reported under.
+fn label(spec: &Spec) -> String {
+    match spec.restore.as_slice() {
+        [(_, path)] if is_pure_restore(spec) => path.clone(),
+        _ => "the selection".to_string(),
+    }
+}
+
+// Apply several specs, each as a patch of its own. The watcher is stopped and restarted once for
+// the whole batch, and, for restores in a session, pending changes to tracked files are captured
+// once before the first. A spec that fails is reported and the others still run; with more than
+// one spec the result is an error naming how many failed. With one spec the error is that spec's
+// own.
+pub fn apply_specs(cwd: &Path, specs: Vec<Spec>, dry_run: bool, patch_only: bool) -> Res<()> {
     let root = git::work_tree(cwd)?;
     let git_dir = git::git_dir(cwd)?;
     let branch = git::current_branch(&root).ok();
-    if git::operation_in_progress(&git_dir) {
-        return Err(
-            "cherry-pick: a merge, rebase, cherry-pick, revert, or bisect is in progress".into(),
-        );
+    if let Some(op) = git::operation_kind(&git_dir) {
+        return Err(crate::commands::blocked_by("cherry-pick", op).into());
     }
 
     let writes = !dry_run && !patch_only;
@@ -639,21 +676,77 @@ pub fn apply_spec(cwd: &Path, spec: Spec, dry_run: bool, patch_only: bool) -> Re
         report_flush(&root, &git_dir, branch, &cfg);
     }
 
-    let result = apply_locked(
-        &root,
-        &git_dir,
-        branch.as_deref(),
-        spec,
-        dry_run,
-        patch_only,
-    );
+    // Restores overwrite files, so the state they overwrite is recorded first when a session is
+    // open.
+    if writes && !specs.is_empty() && specs.iter().all(is_pure_restore) {
+        if let Some(b) = branch.as_deref() {
+            if git::rev_exists(&root, &git::base_ref(b))? {
+                capture_tracked(&root, &git_dir);
+            }
+        }
+    }
+
+    let total = specs.len();
+    let mut failed: Vec<(String, String)> = Vec::new();
+    let mut single: Option<Box<dyn std::error::Error>> = None;
+    for mut spec in specs {
+        if is_pure_restore(&spec) {
+            // Earlier files of the batch, and the capture above, moved HEAD on purpose.
+            spec.base = git::rev_parse(&root, "HEAD")?;
+        }
+        let name = label(&spec);
+        if let Err(e) = apply_locked(
+            &root,
+            &git_dir,
+            branch.as_deref(),
+            spec,
+            dry_run,
+            patch_only,
+        ) {
+            if total > 1 {
+                println!("gitomic: {name} was not applied: {e}");
+                failed.push((name, e.to_string()));
+            } else {
+                single = Some(e);
+            }
+        }
+    }
 
     if was_live {
         if let Err(e) = commands::init(cwd, false, false) {
             eprintln!("gitomic: cherry-pick: watcher could not be restarted: {e}");
         }
     }
-    result
+    if let Some(e) = single {
+        return Err(e);
+    }
+    if failed.is_empty() {
+        return Ok(());
+    }
+    let names: Vec<String> = failed.into_iter().map(|(n, _)| n).collect();
+    Err(format!(
+        "{} of {total} were not applied ({}); the others were",
+        names.len(),
+        names.join(", ")
+    )
+    .into())
+}
+
+// Record pending changes to tracked files as one atomic commit. A capture that is skipped or fails
+// is reported and the restore goes on: the patch check refuses whatever would still be overwritten.
+fn capture_tracked(root: &Path, git_dir: &Path) {
+    match watch::flush_tracked(root, git_dir) {
+        watch::Flush::Committed(sha) => {
+            println!("gitomic: pending changes to tracked files captured as {sha}")
+        }
+        watch::Flush::Nothing => {}
+        watch::Flush::Skipped(why) => {
+            println!("gitomic: capture of pending changes skipped: {why}")
+        }
+        watch::Flush::Failed(msg) => {
+            println!("gitomic: capture of pending changes failed: {msg}")
+        }
+    }
 }
 
 fn apply_locked(
@@ -768,6 +861,7 @@ mod tests {
             hashes: hashes.iter().map(|h| h.to_string()).collect(),
             dry_run: false,
             patch_only: false,
+            stash: false,
         }
     }
 

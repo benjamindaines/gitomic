@@ -49,6 +49,9 @@ gitomic stop                 # stop watching, keep the base and commits for late
 gitomic abort --force        # discard the session: reset the branch to the base
 gitomic drop <hash>...       # delete individual unpublished commits (alias: rm)
 gitomic cherry-pick [<hash>...]  # bring commits from another branch, via a patch file (alias: pick)
+gitomic restore [<path>...]      # bring files from other branches into the work tree as they are there
+gitomic pick --stash [<path>...] # the same, out of a stash; the stash keeps the file (alias: restore --stash)
+gitomic history <path>           # the commits that changed one file, each with its change; Enter restores a version
 ```
 
 Running `init` again when a base already exists but no watcher is live **resumes** that session rather than
@@ -150,7 +153,8 @@ a live session.
 vim-style keys, `space` to mark and the same rule that only `y`/`n` answer a prompt. What differs:
 
 - `Tab` opens an overlay listing the other local and remote-tracking branches, most recently updated first.
-  `j`/`k` move, `Enter` uses the branch (marks are cleared), `Esc` closes it. Without `--from` the overlay is
+  `j`/`k` move (`PgUp`/`PgDn` a page), `h`/`l` scroll a name wider than the box, `Enter` uses the branch
+  (marks are cleared), `Esc` closes it. Without `--from` the overlay is
   the first thing shown.
 - The right pane shows what each commit would change relative to the `HEAD` that was current when the screen
   opened, not the commit's own diff. A commit that would conflict is announced above its diff.
@@ -201,6 +205,87 @@ vim-style keys, `space` to mark and the same rule that only `y`/`n` answer a pro
 - Conflicts with no A/B meaning (a file renamed differently on both sides, a file/directory clash) are
   reported and the selection is refused; `git cherry-pick` handles those.
 
+### restore
+
+`gitomic restore` brings files from other branches into the work tree exactly as they are at the tip of
+those branches, overwriting the local copy. It is an overwrite, not a merge, so there is nothing to
+decide; the operation runs on the same patch pipeline as `cherry-pick` (a patch file computed against
+HEAD, checked, then applied). Every file is its own patch, so a file that cannot be applied (an
+untracked file in the way, say) is reported and the others still go through.
+
+- **Outcome.** With a session open (live or stopped), pending changes to tracked files are recorded first
+  as one atomic commit, then each restored file is recorded as one more, so the overwritten state is
+  always a commit and `gitomic drop` undoes any of them. A live watcher is paused meanwhile. Without a session the
+  change is left in the work tree, uncommitted, and a local edit to a file involved refuses the restore;
+  `git apply -R <patch file>` undoes it. Untracked files in the way always refuse it.
+- **Command line.** `gitomic restore [--from <rev>] [-n] [-p] <path>...`. Paths are relative to the
+  current directory. `--from` takes a branch, tag or commit; without it the local branches must agree
+  about each file, and a disagreement is refused with the branches listed. `-n/--dry-run` reports,
+  `-p/--patch-only` writes the patch file and stops.
+- **Interactive** (no path, needs a terminal; also `F` from the cherry-pick screen, `Esc`/`q` returns).
+  Files on the left, what restoring the highlighted file would change on HEAD on the right (loaded on a
+  worker thread after the selection has rested for 150 ms, as in the cherry-pick screen). `Tab` chooses
+  the branches (local ones at first; space selects, `a` all/none). `/` filters by name: every word must
+  occur, case ignored, and a word with `*` or `?` is a glob matched against the file name (against the
+  whole path when it contains a `/`), so `*.img` and `boot/*` work; `Esc` clears. `B` shows only binary
+  files. `space` marks and moves to the next file, so a run of presses marks a run of files. A file whose content
+  differs between the selected branches is starred and asks which branch to take it from (`v` does the
+  same on demand). Only files that differ from HEAD are listed (a file identical to HEAD has nothing to restore, and leaving
+  it out keeps the memory and time to open the screen proportional to the change, not to the size of the
+  tree); files HEAD lacks are cyan. A path named on the command line that already matches is reported and left alone.
+  `H` opens the history of the highlighted file: every commit on the selected branches that changed it
+  (short id, date, branch, subject), read on a worker thread the first time and kept; the right pane shows
+  each version against HEAD as the cursor moves and `Enter` marks that version. `D` also lists files that
+  were deleted in the history of the selected branches and are gone from HEAD and from those tips, marked
+  `(deleted)`, each restorable at the version its deleting commit's parent held; the scan runs on a worker
+  thread, stops when the branches change, and is kept while the mode is toggled. A historic mark shows as
+  `<- branch@commit`. `--from <commit>` on the command line reaches any commit the same way.
+  `P` lists the patch files kept in `.git/gitomic-picks` (newest first, with what each does and its text
+  on the right); `space` marks, `d` deletes the marked ones, or the highlighted one when none is marked,
+  after a `y`/`n`.
+  `Enter` asks for confirmation, answered by `y`/`n` only.
+- **Stashes.** Each stash is listed after the branches in the `Tab` overlay as `stash@{N}` with its message,
+  unselected unless asked for. A stash offers only what it changed itself: the paths in which its work-tree
+  state differs from the commit it was made on, plus the files of an untracked-files commit (`stash push -u`),
+  each compared with HEAD, so the commits HEAD has gained since do not crowd the list. A file is taken whole,
+  as the stash holds it; the stash is read and never changed, so the entry stays where it was. `S` in the
+  cherry-pick screen, `gitomic pick --stash` and `gitomic restore --stash` open this screen with every stash
+  selected. With paths, `--stash` takes them from `stash@{0}`, or from the stash named by `--from`, written
+  `stash@{N}` or just `N` (`gitomic pick --stash --from 1 src/main.rs`). History (`H`) and the deleted-file
+  scan (`D`) cover branches only; a stash has no history of its own. Files over `cherry_size_limit_mb` are
+  restored but not previewed, as for branches.
+- **Keys.** `PgUp`/`PgDn` move a page in the file list (and scroll a page in the diff pane when it has the
+  focus); in every overlay `h`/`l` (or the arrow keys) scroll the rows sideways, which matters for long branch
+  and stash names, the `[x]` marker staying in place. The same keys work in the `drop` and cherry-pick screens.
+- **Limits.** Only the current state (tip) of each branch is offered. Renames are not followed: a file is
+  looked up under one path. Submodules are left out. Files over `cherry_size_limit_mb` are restored but
+  not previewed.
+
+### history
+
+`gitomic history <path>` lists the commits of the checked-out branch that changed one file, newest first, and
+shows what each did to it. Enter restores the highlighted version.
+
+- **The list** is the same reading as `H` in the restore screen (`git log` restricted to the path), applied to
+  the checked-out branch instead of the others, and it does not require the file to differ from HEAD. A commit
+  that deleted the file is not listed, since it left nothing to look at; the version before it is, so a file
+  that is gone can still be recovered. The atomic commits of an open session are listed like any other, their
+  placeholder message showing as `(no message)` until `finish`. At most 300 commits are read, and the title
+  shows a `+` when older ones were left out. Renames are not followed.
+- **The right pane** shows what the highlighted commit did to the file: its header and message and its diff
+  restricted to the path. `v` switches it to what restoring that version would change on HEAD (the text the
+  restore screen shows); the newest version then says that restoring it changes nothing.
+- **Keys.** `j`/`k` move (`PgUp`/`PgDn` a page, `g`/`G` the ends), `l` opens the diff pane (`j`/`k`, `h`/`l`,
+  `Ctrl-d`/`Ctrl-u` and `PgUp`/`PgDn` scroll it, `n`/`N` step to the older and newer commit, `Esc` returns),
+  `Enter` or `r` restore after a `y`/`n` that only `y` and `n` answer, `q` quits.
+- **Restoring** takes the file whole as it was after that commit and goes through the same pipeline as
+  `restore`: with a session open (live or stopped) the pending changes are recorded first and the restore is one
+  atomic commit that `gitomic drop` undoes; otherwise the change is left uncommitted and a local edit to the
+  file refuses it. `-n/--dry-run` reports and `-p/--patch-only` writes the patch file and stops.
+- **No terminal.** The command prints one line per commit (short id, date, subject), which is also what scripts
+  can read; `gitomic restore --from <id> <path>` takes any of those ids.
+- The path is relative to the current directory, and exactly one file is taken.
+
 ## Configuration
 
 `${XDG_CONFIG_HOME:-~/.config}/gitomic/gitomic.cfg`, a flat `key = value` file. Every key has a compiled-in
@@ -212,7 +297,7 @@ default, so the file is optional. See `gitomic.cfg.example`.
 | `finalize_numbering` | `false` | Append ` [i/N]` to each finalized message.                              |
 | `stage`              | `observed` | Staging breadth: `observed` (only the paths the watcher saw change, new/renamed/copy-over included), `tracked` (`git add -u`), or `all` (`git add -A`). |
 | `coalesce_same_file` | `true`  | Extend the prior atomic commit instead of starting a new one when a capture's paths exactly match it. |
-| `cherry_size_limit_mb` | `32`  | Size in MiB above which `cherry-pick`'s screen does not read a changed file for its preview (see below). `0` turns the limit off. |
+| `cherry_size_limit_mb` | `32`  | Size in MiB above which the `cherry-pick` and `restore` screens do not read a changed file for its preview (see below). `0` turns the limit off. |
 
 ## Behaviour and ~~guarantees~~ Intentions
 (guarantees is a very strong word)
@@ -225,6 +310,14 @@ default, so the file is optional. See `gitomic.cfg.example`.
   overwrites a tracked file is captured, because the watcher observed it; an untracked file the watcher never
   touched is left alone rather than swept into the session. `stage = tracked` restricts staging to already-
   tracked paths (`git add -u`), and `stage = all` stages every change including untracked files (`git add -A`).
+- **Edits made while no watcher ran are swept in at start** — when a watcher starts or resumes, once the watch
+  is armed it records the modifications and deletions of tracked files (`git add -u`) as one atomic commit, so
+  work done before `gitomic init` or between a `stop` and a resume is part of the session instead of waiting
+  for its file to change again. Untracked files are not swept (they are captured once the watcher sees them
+  change), and submodules are left out entirely: a submodule checked out at another commit than the recorded
+  one stays a local edit, and a pointer the operator already staged makes the sweep decline rather than commit
+  it. The same applies to the capture made before a restore. Nothing is done when the checked-out branch is
+  not the session's or the tree is clean.
 - **Consecutive captures of the same file(s) share one commit** — when a debounce cycle's staged paths exactly
   match the paths of the session's most recent atomic commit, the capture amends that commit rather than
   starting a new one (`coalesce_same_file`, on by default). Editing a different file, or returning to an

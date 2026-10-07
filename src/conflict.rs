@@ -178,6 +178,42 @@ pub fn unresolved_count(segments: &[Segment]) -> usize {
         .count()
 }
 
+// The conflict hunks of a segment list, in file order. Callers index decisions by position among hunks
+// rather than among segments, since the plain text between them is not something to decide about.
+pub fn hunks(segments: &[Segment]) -> Vec<&Hunk> {
+    segments
+        .iter()
+        .filter_map(|s| match s {
+            Segment::Hunk(h) => Some(h),
+            Segment::Text(_) => None,
+        })
+        .collect()
+}
+
+// Record (or, with None, withdraw) the decision for the `n`th hunk. Out-of-range indices are ignored rather
+// than panicking, so a stale selection carried across a reparse cannot abort the process.
+pub fn decide(segments: &mut [Segment], n: usize, choice: Option<Side>) {
+    if let Some(h) = segments
+        .iter_mut()
+        .filter_map(|s| match s {
+            Segment::Hunk(h) => Some(h),
+            Segment::Text(_) => None,
+        })
+        .nth(n)
+    {
+        h.choice = choice;
+    }
+}
+
+// Answer every hunk the same way. Backs the non-interactive whole-side resolution.
+pub fn decide_all(segments: &mut [Segment], choice: Side) {
+    for s in segments.iter_mut() {
+        if let Segment::Hunk(h) = s {
+            h.choice = Some(choice);
+        }
+    }
+}
+
 // The file as it stands under the current decisions, or None while any hunk is undecided.
 pub fn render(segments: &[Segment]) -> Option<Vec<u8>> {
     let mut out = Vec::new();

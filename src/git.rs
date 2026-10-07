@@ -207,6 +207,53 @@ pub fn output_cancellable(mut cmd: Command, cancel: Option<&Cancel>) -> Res<std:
     Ok(out?)
 }
 
+// For each spec (`<commit>:<path>`, `<commit>^`, ...) the id of the object it names and its type
+// (`blob`, `commit`, ...), or None when it names nothing. One `cat-file --batch-check` process
+// answers for all of them, in order.
+pub fn resolve_objects(dir: &Path, specs: &[String]) -> Res<Vec<Option<(String, String)>>> {
+    if specs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["cat-file", "--batch-check=%(objectname) %(objecttype)"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let mut stdin = child.stdin.take().ok_or("git cat-file: no stdin pipe")?;
+    // A spec holding a line break could not be told apart from two specs; it names nothing.
+    let input: String = specs
+        .iter()
+        .map(|s| format!("{}\n", s.replace('\n', " ")))
+        .collect();
+    let writer = std::thread::spawn(move || {
+        let _ = stdin.write_all(input.as_bytes());
+    });
+    let out = child.wait_with_output()?;
+    let _ = writer.join();
+    let text = String::from_utf8_lossy(&out.stdout);
+    let answers: Vec<Option<(String, String)>> = text
+        .lines()
+        .map(|l| {
+            let mut f = l.split(' ');
+            match (f.next(), f.next(), f.next()) {
+                (Some(id), Some(kind), None)
+                    if kind != "missing" && id.bytes().all(|b| b.is_ascii_hexdigit()) =>
+                {
+                    Some((id.to_string(), kind.to_string()))
+                }
+                _ => None,
+            }
+        })
+        .collect();
+    if answers.len() != specs.len() {
+        return Err("git cat-file: unexpected number of answers".into());
+    }
+    Ok(answers)
+}
+
 // Sizes in bytes of the objects `ids`, in the same order, read from their headers alone; None for an
 // id that names no object. One `cat-file --batch-check` process answers for all of them.
 pub fn blob_sizes(dir: &Path, ids: &[String]) -> Res<Vec<Option<u64>>> {
@@ -492,17 +539,75 @@ pub fn editor(dir: &Path) -> Res<String> {
     run(dir, &["var", "GIT_EDITOR"])
 }
 
+// The interrupted multi-step git operation a repository is currently sitting in the middle of. Carried as a
+// value rather than a bare boolean so callers can name the operation in diagnostics and select the git
+// invocation that clears it; the two were previously collapsed into one predicate, which forced every message
+// to list all five possibilities and left no way to act on the state.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum InProgress {
+    Merge,
+    Rebase,
+    CherryPick,
+    Revert,
+    Bisect,
+}
+
+impl InProgress {
+    // Operation name as git itself spells it, for diagnostics.
+    pub fn name(self) -> &'static str {
+        match self {
+            InProgress::Merge => "merge",
+            InProgress::Rebase => "rebase",
+            InProgress::CherryPick => "cherry-pick",
+            InProgress::Revert => "revert",
+            InProgress::Bisect => "bisect",
+        }
+    }
+
+    // Argument vector that abandons the operation and returns the repository to the state preceding it.
+    // Bisect is the outlier: it has no --abort, its equivalent being `bisect reset`.
+    pub fn abort_args(self) -> &'static [&'static str] {
+        match self {
+            InProgress::Merge => &["merge", "--abort"],
+            InProgress::Rebase => &["rebase", "--abort"],
+            InProgress::CherryPick => &["cherry-pick", "--abort"],
+            InProgress::Revert => &["revert", "--abort"],
+            InProgress::Bisect => &["bisect", "reset"],
+        }
+    }
+
+    // The same invocation as a command line, for printing.
+    pub fn abort_command(self) -> String {
+        format!("git {}", self.abort_args().join(" "))
+    }
+}
+
+// Which interrupted multi-step operation is in progress, if any, identified by the marker git leaves in the
+// git directory. Order matters: a rebase that stops on a conflict leaves rebase-merge/rebase-apply and may
+// additionally leave CHERRY_PICK_HEAD or REVERT_HEAD behind, and `git cherry-pick --abort` is not the command
+// that clears a rebase, so the rebase markers are tested first. BISECT_LOG is included because a bisect is a
+// multi-step operation on the same footing as the others, and its absence from the marker set meant a bisect
+// went undetected while the resulting diagnostics claimed to cover it.
+pub fn operation_kind(git_dir: &Path) -> Option<InProgress> {
+    const MARKERS: [(&str, InProgress); 7] = [
+        ("rebase-merge", InProgress::Rebase),
+        ("rebase-apply", InProgress::Rebase),
+        ("CHERRY_PICK_HEAD", InProgress::CherryPick),
+        ("sequencer", InProgress::CherryPick),
+        ("REVERT_HEAD", InProgress::Revert),
+        ("MERGE_HEAD", InProgress::Merge),
+        ("BISECT_LOG", InProgress::Bisect),
+    ];
+    MARKERS
+        .iter()
+        .find(|(m, _)| git_dir.join(m).exists())
+        .map(|(_, kind)| *kind)
+}
+
 // True when an interrupted multi-step operation is in progress. Auto-committing during a merge, rebase,
 // cherry-pick, revert, or bisect would corrupt the operation's expected state, so the watcher stands down.
 pub fn operation_in_progress(git_dir: &Path) -> bool {
-    const MARKERS: [&str; 5] = [
-        "MERGE_HEAD",
-        "CHERRY_PICK_HEAD",
-        "REVERT_HEAD",
-        "rebase-merge",
-        "rebase-apply",
-    ];
-    MARKERS.iter().any(|m| git_dir.join(m).exists())
+    operation_kind(git_dir).is_some()
 }
 
 // Paths (relative to the work tree) changed by `commit` against its first parent. Used to compare a

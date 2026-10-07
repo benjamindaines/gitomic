@@ -20,9 +20,14 @@ mod commands;
 mod config;
 mod conflict;
 mod git;
+mod history;
 mod patch;
 mod pick;
 mod proc;
+mod pull;
+mod resolve;
+mod restore;
+mod restore_ui;
 #[cfg(test)]
 mod testrepo;
 mod watch;
@@ -110,7 +115,23 @@ fn dispatch(args: &[String]) -> Res<()> {
             }
         }
         "cherry-pick" | "pick" => cherry::run(&cwd, parse_cherry(&args[1..])?),
+        "restore" => restore::run(&cwd, parse_restore(&args[1..])?),
+        "history" => history::run(&cwd, parse_history(&args[1..])?),
+        "resolve" => {
+            let opts = ResolveOpts::parse(&args[1..])?;
+            resolve::run(&cwd, opts.decide, opts.finish)
+        }
+        "pull" => {
+            let opts = PullOpts::parse(&args[1..])?;
+            pull::run(&cwd, opts.action, !opts.no_fetch)
+        }
         "stop" => commands::stop(&cwd),
+        "unstick" => commands::unstick(
+            &cwd,
+            args[1..]
+                .iter()
+                .any(|a| a == "--force" || a == "-f" || a == "--yes" || a == "-y"),
+        ),
         "abort" => commands::abort(
             &cwd,
             args[1..]
@@ -188,7 +209,8 @@ impl DropOpts {
 // Parse cherry-pick arguments. Every positional word is a commit (abbreviated or full), replayed in
 // the order given; with none, the interactive screen opens. `--from <branch>` names the branch that
 // screen lists first; `-n/--dry-run` reports the patch without writing or applying it;
-// `-p/--patch-only` writes the patch file and stops.
+// `-p/--patch-only` writes the patch file and stops. `-s/--stash` takes single files out of a stash
+// instead of commits from a branch (see `cherry::run`).
 fn parse_cherry(rest: &[String]) -> Res<cherry::Opts> {
     let mut opts = cherry::Opts {
         only: None,
@@ -196,12 +218,14 @@ fn parse_cherry(rest: &[String]) -> Res<cherry::Opts> {
         hashes: Vec::new(),
         dry_run: false,
         patch_only: false,
+        stash: false,
     };
     let mut it = rest.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "-n" | "--dry-run" => opts.dry_run = true,
             "-p" | "--patch-only" => opts.patch_only = true,
+            "-s" | "--stash" => opts.stash = true,
             "--only" => {
                 let value = it.next().ok_or("expected a path after --only")?;
                 opts.only = Some(value.clone());
@@ -220,6 +244,122 @@ fn parse_cherry(rest: &[String]) -> Res<cherry::Opts> {
         }
     }
     Ok(opts)
+}
+
+// Parse history arguments: exactly one path (relative to the current directory); `-n/--dry-run` and
+// `-p/--patch-only` apply to the restore of a version chosen on the screen, as for `restore`.
+fn parse_history(rest: &[String]) -> Res<history::Opts> {
+    let mut opts = history::Opts {
+        path: String::new(),
+        dry_run: false,
+        patch_only: false,
+    };
+    let mut named = false;
+    for arg in rest {
+        match arg.as_str() {
+            "-n" | "--dry-run" => opts.dry_run = true,
+            "-p" | "--patch-only" => opts.patch_only = true,
+            flag if flag.starts_with('-') => {
+                return Err(format!("unexpected option '{flag}' for history").into())
+            }
+            path if !named => {
+                opts.path = path.to_string();
+                named = true;
+            }
+            _ => return Err("history takes one file".into()),
+        }
+    }
+    if !named {
+        return Err("history: name a file".into());
+    }
+    Ok(opts)
+}
+
+// Parse restore arguments. Every positional word is a path (relative to the current directory);
+// `--from <rev>` names the branch, tag or commit the files are taken from; `-n/--dry-run` reports
+// the patch without writing or applying it; `-p/--patch-only` writes the patch file and stops.
+// `-s/--stash` takes the files from a stash. With no path, the interactive screen opens.
+fn parse_restore(rest: &[String]) -> Res<restore::Opts> {
+    let mut opts = restore::Opts {
+        from: None,
+        paths: Vec::new(),
+        dry_run: false,
+        patch_only: false,
+        stash: false,
+    };
+    let mut it = rest.iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "-n" | "--dry-run" => opts.dry_run = true,
+            "-p" | "--patch-only" => opts.patch_only = true,
+            "-s" | "--stash" => opts.stash = true,
+            "--from" => {
+                let value = it.next().ok_or("expected a branch after --from")?;
+                opts.from = Some(value.clone());
+            }
+            flag if flag.starts_with("--from=") => {
+                opts.from = Some(flag["--from=".len()..].to_string());
+            }
+            flag if flag.starts_with('-') => {
+                return Err(format!("unexpected option '{flag}' for restore").into())
+            }
+            path => opts.paths.push(path.to_string()),
+        }
+    }
+    Ok(opts)
+}
+
+// Parsed options for the pull command.
+struct PullOpts {
+    action: pull::Action,
+    no_fetch: bool,
+}
+
+impl PullOpts {
+    // Parse pull arguments. With no outcome named the report is printed and nothing is changed, which is the
+    // point of the command: the choice is made from the report rather than from a configuration setting fixed
+    // in advance. `--no-fetch` reports against the remote-tracking refs as they stand, for a repository with
+    // no network reachable.
+    fn parse(rest: &[String]) -> Res<PullOpts> {
+        let mut action = pull::Action::Report;
+        let mut no_fetch = false;
+        for arg in rest {
+            match arg.as_str() {
+                "--rebase" => action = pull::Action::Rebase,
+                "--merge" => action = pull::Action::Merge,
+                "--take-remote" => action = pull::Action::TakeRemote,
+                "--no-fetch" => no_fetch = true,
+                other => return Err(format!("unexpected argument '{other}' for pull").into()),
+            }
+        }
+        Ok(PullOpts { action, no_fetch })
+    }
+}
+
+// Parsed options for the resolve command.
+struct ResolveOpts {
+    decide: resolve::Decide,
+    finish: bool,
+}
+
+impl ResolveOpts {
+    // Parse resolve arguments. `--ours`/`--theirs` answer every conflict one way without opening the screen
+    // and are mutually exclusive; `--continue` completes the operation once every path is staged. Completing
+    // is not the default: the next step of a rebase may conflict again, and stopping with the result staged
+    // leaves that decision with the operator.
+    fn parse(rest: &[String]) -> Res<ResolveOpts> {
+        let mut decide = resolve::Decide::Interactive;
+        let mut finish = false;
+        for arg in rest {
+            match arg.as_str() {
+                "--ours" => decide = resolve::Decide::Ours,
+                "--theirs" => decide = resolve::Decide::Theirs,
+                "--continue" => finish = true,
+                other => return Err(format!("unexpected argument '{other}' for resolve").into()),
+            }
+        }
+        Ok(ResolveOpts { decide, finish })
+    }
 }
 
 // Parsed options for the init command.
@@ -314,8 +454,14 @@ const BASHRC_SNIPPET: &str = r#"    gitomicSessions() {
         command gitomic "$@"
     }"#;
 
+// Print the command reference, through a pager when stdout is a terminal.
 fn print_usage() {
-    println!(
+    proc::page(&usage_text());
+}
+
+// The command reference as a string.
+fn usage_text() -> String {
+    format!(
         "gitomic {} — record atomic commits as a repository changes, then stamp one message across the batch
 
 USAGE:
@@ -387,9 +533,63 @@ COMMANDS:
                        hunk; X restores the whole file from the newest R-marked commit instead.
                        Options: --from <branch>, --only <path> (apply each named commit for that
                        file only), -n/--dry-run (report only), -p/--patch-only (write the patch
-                       file, apply nothing). With hashes, conflicts are refused.
-                       Aliases: pick.
+                       file, apply nothing). With hashes, conflicts are refused. S in the screen,
+                       or -s/--stash, switches to single files out of the stashes (see restore);
+                       the stash keeps them. Aliases: pick.
+  restore [options] [<path>...]
+                       Bring files from other branches into the work tree exactly as they are
+                       there (the tip of the branch), overwriting the local copy. Paths are
+                       relative to the current directory. --from <rev> names the branch, tag or
+                       commit; without it the local branches must agree about each file. With a
+                       session open, pending changes to tracked files are recorded first and the
+                       restore is one atomic commit; otherwise it is left uncommitted and refused
+                       when a local edit is in the way. With no path, opens an interactive
+                       screen: files of every local branch on the left (Tab chooses the branches,
+                       / filters by name or glob such as *.img, B shows only binary files), the
+                       change each would make on the right, space to mark and move down, v to
+                       choose between differing versions, P to view and delete the patch files
+                       kept in .git/gitomic-picks, Enter to restore. Each file is its own patch; a
+                       failure does not stop the others. Also reachable with F from the cherry-pick
+                       screen. The stashes are listed after the branches (Tab) and offer only the
+                       files the stash itself changed, untracked ones included; taking a file
+                       leaves the stash as it was. PgUp/PgDn page the lists, h/l scroll an overlay.
+                       Options: -n/--dry-run, -p/--patch-only, -s/--stash (start with the stashes
+                       selected; with paths, take them from stash@{{0}}, or from the stash named
+                       by --from, as stash@{{N}} or just N).
+  history [options] <path>
+                       The commits of the checked-out branch that changed one file, newest first,
+                       each with the change it made to that file (v switches the right pane to what
+                       restoring that version would change on HEAD). Enter restores the highlighted
+                       version after a y/n, through the same pipeline as restore: with a session
+                       open it is one atomic commit, otherwise it is left uncommitted. Works for a
+                       file that matches HEAD and for one that has been deleted (the version before
+                       its deletion is listed); renames are not followed. Without a terminal it
+                       prints the list (short id, date, subject), and 'gitomic restore --from <id>
+                       <path>' takes any of those ids. Options: -n/--dry-run, -p/--patch-only.
+  pull [options]       Report how the checked-out branch and its upstream differ, then integrate on request.
+                       The report leads with the fact git withholds until a strategy has already been
+                       chosen: how many of your commits are already upstream under a different hash (the
+                       residue of a force-push or a restored branch), and how many are genuinely new.
+                       With no option it reports and changes nothing. Options: --rebase (replay your new
+                       commits onto the upstream), --merge (join both lines), --take-remote (discard yours;
+                       a backup/<branch>-<time> branch is made first), --no-fetch (report against the
+                       remote-tracking refs as they stand). A conflict stops with a pointer to
+                       'gitomic resolve'. No pull.rebase configuration is read or written.
+  resolve [options]    Decide the conflicts of an interrupted merge, rebase, cherry-pick, or revert and
+                       stage the result. With no option, opens the decision screen: unmerged paths on the
+                       left, the selected conflict on the right, a to keep our side, b to take theirs, c to
+                       keep both, u to undo, Enter to stage once every conflict is decided. A binary file,
+                       an add/add, or a modify/delete carries one whole-file decision instead of hunks.
+                       Nothing is written until every conflict is decided. Options: --ours / --theirs
+                       (answer every conflict one way, no screen), --continue (complete the operation
+                       once staged, rather than leaving it for 'git commit' / 'git <op> --continue').
   stop                 Stop the watcher but keep the base and recorded commits for later finish/resume.
+  unstick [--yes]      Abandon an interrupted merge, rebase, cherry-pick, revert, or bisect — the state that
+                       makes drop and cherry-pick refuse to run — by way of git's own abort for whichever
+                       one is detected, returning the repository to the state before it started. Without
+                       --yes, names the operation and the exact git command and does nothing. A gitomic
+                       session on the branch is preserved; a live watcher is stopped across the abort and
+                       restarted. Alias: --force, -f, -y
   abort [--yes]        Discard the session: reset the branch to the base and drop the atomic commits.
                        Alias: --force, -f, -y
   help, --version
@@ -423,5 +623,5 @@ NOTES:
 ",
         env!("CARGO_PKG_VERSION"),
         snippet = BASHRC_SNIPPET
-    );
+    )
 }

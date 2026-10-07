@@ -3,7 +3,7 @@
 // `gitomic init` that outlives the invoking shell and is reaped by `gitomic finish` or `gitomic stop`.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{IsTerminal, Read, Seek, SeekFrom, Write};
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -380,4 +380,52 @@ mod registry_tests {
         std::env::remove_var("XDG_CONFIG_HOME");
         let _ = fs::remove_dir_all(&tmp);
     }
+}
+
+// Pager command for long output: GITOMIC_PAGER, then PAGER, then `less`. An empty value or `cat` disables
+// paging, matching git's convention.
+fn pager_command() -> Option<String> {
+    let chosen = std::env::var("GITOMIC_PAGER")
+        .or_else(|_| std::env::var("PAGER"))
+        .unwrap_or_else(|_| "less".to_string());
+    let trimmed = chosen.trim();
+    if trimmed.is_empty() || trimmed == "cat" {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+// Write `text` to stdout, through a pager when stdout is a terminal. When `LESS` is unset it is given
+// `FRX` for the child: exit at once if the text fits on one screen, pass colour through, and leave the
+// screen uncleared. Text is written directly when stdout is not a terminal, when paging is disabled, or when
+// the pager cannot be started. A pager closed before the end of the text (quit with `q`) is not an error.
+pub fn page(text: &str) {
+    let direct = || {
+        let mut out = std::io::stdout().lock();
+        let _ = out.write_all(text.as_bytes());
+        let _ = out.write_all(b"\n");
+    };
+    if !std::io::stdout().is_terminal() {
+        return direct();
+    }
+    let Some(cmd) = pager_command() else {
+        return direct();
+    };
+    let mut child = std::process::Command::new("sh");
+    child
+        .arg("-c")
+        .arg(&cmd)
+        .stdin(std::process::Stdio::piped());
+    if std::env::var_os("LESS").is_none() {
+        child.env("LESS", "FRX");
+    }
+    let Ok(mut child) = child.spawn() else {
+        return direct();
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(text.as_bytes());
+        let _ = stdin.write_all(b"\n");
+    }
+    let _ = child.wait();
 }

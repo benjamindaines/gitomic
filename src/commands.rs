@@ -604,6 +604,94 @@ pub fn stop(cwd: &Path) -> Res<()> {
     Ok(())
 }
 
+// Diagnostic returned by any command that refuses to rewrite history while git is part-way through a
+// multi-step operation. The earlier wording listed all five operations without saying which one was actually
+// detected, and offered no way forward, which left the operator to identify the state by hand at precisely the
+// moment the repository state is least legible. The operation is named, and so is the single command that
+// clears it.
+pub(crate) fn blocked_by(command: &str, op: git::InProgress) -> String {
+    format!(
+        "{command}: a {} is in progress; run 'gitomic resolve' to decide its conflicts and finish it, \
+         or 'gitomic unstick --yes' (equivalent to '{}') to abandon it and return to the state before it \
+         started",
+        op.name(),
+        op.abort_command()
+    )
+}
+
+// Abandon an interrupted merge, rebase, cherry-pick, revert, or bisect, returning the repository to the state
+// preceding it. Every history-rewriting command in gitomic refuses to run while one of these is outstanding,
+// because the operation's own bookkeeping (MERGE_HEAD, the rebase todo list, the sequencer state) describes a
+// history that the rewrite would invalidate. The correct response is to remove the blocking state rather than
+// to work around it, so the clearing is performed here by git's own abort path for the detected operation, not
+// by deleting marker files: git's abort restores the index and work tree that the operation replaced, which
+// unlinking a marker would not.
+//
+// Reported but not performed without `force`, matching `abort`: abandoning an in-flight rebase or merge
+// discards conflict resolutions made so far, which gitomic cannot recover. Any gitomic session on the current
+// branch is left untouched — its base marker and recorded commits are independent of the git operation being
+// cleared — though a live watcher is stopped first, since the abort moves HEAD and the work tree underneath
+// it, and restarted afterwards.
+pub fn unstick(cwd: &Path, force: bool) -> Res<()> {
+    let root = git::work_tree(cwd)?;
+    let git_dir = git::git_dir(cwd)?;
+
+    let Some(op) = git::operation_kind(&git_dir) else {
+        println!(
+            "gitomic: no merge, rebase, cherry-pick, revert, or bisect in progress in {}",
+            root.display()
+        );
+        return Ok(());
+    };
+
+    if !force {
+        println!(
+            "gitomic: unstick would abandon the {} in progress by running '{}'.",
+            op.name(),
+            op.abort_command()
+        );
+        println!(
+            "  the repository returns to the state before it started; conflict resolutions made during it \
+             are discarded. Re-run with --yes to proceed."
+        );
+        return Ok(());
+    }
+
+    // The watcher is bound to a branch, and the abort may move HEAD off it (a rebase started from another
+    // branch) as well as rewrite the work tree wholesale. Stopping it first keeps the abort's intermediate
+    // states out of the session's atomic commits.
+    let branch = git::current_branch(&root).ok();
+    let was_live = branch
+        .as_deref()
+        .is_some_and(|b| live_watcher(&git_dir, b).is_some());
+    if let (true, Some(b)) = (was_live, branch.as_deref()) {
+        terminate_watcher(&git_dir, b)?;
+    }
+
+    let outcome = git::run(&root, op.abort_args());
+
+    if was_live {
+        if let Err(e) = init(cwd, false, false) {
+            eprintln!("gitomic: unstick: watcher could not be restarted: {e}");
+        }
+    }
+
+    match outcome {
+        Ok(_) => {
+            println!(
+                "gitomic: {} abandoned; HEAD is {}",
+                op.name(),
+                short(&git::rev_parse(&root, "HEAD")?)
+            );
+            println!("  'gitomic drop' and 'gitomic cherry-pick' are available again.");
+            Ok(())
+        }
+        // git's own failure text is the useful part here (an unmerged path it will not discard, a bisect with
+        // no recorded start), so it is passed through rather than replaced.
+        Err(e) => Err(format!("unstick: '{}' failed: {e}", op.abort_command()).into()),
+    }
+}
+
 // Discard the session: stop the watcher, move the branch back to the base marker (dropping all atomic
 // commits), and remove the marker. The working tree is preserved: `reset --mixed` rewinds the branch and
 // index to the base without touching files on disk, so content the watcher swept into atomic commits from a
@@ -722,8 +810,8 @@ pub fn drop_commits(cwd: &Path, selectors: &[String], dry_run: bool) -> Res<()> 
     if selectors.is_empty() {
         return Err("drop: expected at least one commit hash".into());
     }
-    if git::operation_in_progress(&git_dir) {
-        return Err("drop: a merge, rebase, cherry-pick, revert, or bisect is in progress".into());
+    if let Some(op) = git::operation_kind(&git_dir) {
+        return Err(blocked_by("drop", op).into());
     }
 
     // Rejecting a bad selector before the watcher is disturbed keeps a typo from interrupting a
@@ -874,8 +962,8 @@ pub fn check_drop(cwd: &Path, selectors: &[String]) -> Res<usize> {
     let root = git::work_tree(cwd)?;
     let git_dir = git::git_dir(cwd)?;
     let branch = git::current_branch(&root)?;
-    if git::operation_in_progress(&git_dir) {
-        return Err("drop: a merge, rebase, cherry-pick, revert, or bisect is in progress".into());
+    if let Some(op) = git::operation_kind(&git_dir) {
+        return Err(blocked_by("drop", op).into());
     }
     Ok(plan_drop(&root, &branch, selectors)?.replayed)
 }
@@ -1523,6 +1611,64 @@ fn numbered(message: &str, index: usize, total: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::testrepo::Repo;
+
+    // A conflicted merge leaves MERGE_HEAD, which every history-rewriting command refuses to act under.
+    // unstick clears it through git's own abort, and the branch tip is unchanged by the clearing.
+    fn conflicted_merge() -> Repo {
+        let r = Repo::new();
+        r.commit_file("f.txt", &Repo::lines(), "base");
+        r.git(&["checkout", "-q", "-b", "other"]);
+        r.commit_file("f.txt", &Repo::lines_with(&[(5, "other")]), "other edit");
+        r.git(&["checkout", "-q", "main"]);
+        r.commit_file("f.txt", &Repo::lines_with(&[(5, "main")]), "main edit");
+        let _ = git::run(&r.0, &["merge", "other"]);
+        r
+    }
+
+    #[test]
+    fn a_conflicted_merge_is_detected_as_a_merge() {
+        let r = conflicted_merge();
+        let git_dir = git::git_dir(&r.0).unwrap();
+        assert_eq!(git::operation_kind(&git_dir), Some(git::InProgress::Merge));
+    }
+
+    #[test]
+    fn drop_names_the_operation_and_the_way_out() {
+        let r = conflicted_merge();
+        let err = drop_commits(&r.0, &["HEAD".to_string()], false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("a merge is in progress"), "{err}");
+        assert!(err.contains("gitomic unstick"), "{err}");
+    }
+
+    #[test]
+    fn unstick_without_force_leaves_the_operation_in_place() {
+        let r = conflicted_merge();
+        unstick(&r.0, false).unwrap();
+        let git_dir = git::git_dir(&r.0).unwrap();
+        assert_eq!(git::operation_kind(&git_dir), Some(git::InProgress::Merge));
+    }
+
+    #[test]
+    fn unstick_clears_the_operation_and_keeps_the_tip() {
+        let r = conflicted_merge();
+        let tip = r.head();
+        unstick(&r.0, true).unwrap();
+        let git_dir = git::git_dir(&r.0).unwrap();
+        assert_eq!(git::operation_kind(&git_dir), None);
+        assert_eq!(r.head(), tip);
+    }
+
+    #[test]
+    fn unstick_on_a_clean_repository_is_a_no_op() {
+        let r = Repo::new();
+        r.commit_file("f.txt", "x\n", "base");
+        unstick(&r.0, true).unwrap();
+        assert!(git::operation_kind(&git::git_dir(&r.0).unwrap()).is_none());
+    }
 
     #[test]
     fn strip_removes_comments_and_trims() {

@@ -21,11 +21,15 @@
 //                file, each restricted to that file (an overlay asks which file when the commit
 //                changes several; a second press unmarks the chain)
 //   l, Right     open the diff   Tab  choose the source branch
+//   F            switch to the file-restore screen (restore_ui.rs); Esc there comes back
+//   S            the same screen with the stashes selected, to take single files out of them
+//   PgUp, PgDn   move a page
 //   Enter        prepare the marked commits (conflicts are decided first), then confirm with y/n
 //   q, Esc       quit (confirmed first when commits are marked)
 // Keys, diff pane: as for `drop` (j/k h/l g/G Ctrl-d/u, Enter/n next, N previous, space, Tab).
 // Keys, branch overlay:
-//   j/k, g/G     move     Enter  use the branch (marks are cleared)     Esc, Tab, q  close
+//   j/k, g/G, PgUp/PgDn  move     h/l  scroll sideways     Enter  use the branch (marks are
+//   cleared)     Esc, Tab, q  close
 // Keys, decision screen:
 //   j/k          previous/next conflict     a  keep the tree copy     b  take the picked commit's
 //   c            keep both (text conflicts)  u  undo the decision      Ctrl-d/u  scroll
@@ -47,7 +51,7 @@ use ratatui::{DefaultTerminal, Frame};
 use crate::cherry::{self, Preview};
 use crate::conflict::{Segment, Side};
 use crate::patch::{Body, FileConflict, Job, Spec, Step};
-use crate::pick::{style_diff, with_terminal, DiffView, H_STEP, RUN_WINDOW};
+use crate::pick::{hslice, max_hscroll, style_diff, with_terminal, DiffView, H_STEP, RUN_WINDOW};
 use crate::work::{Done, Loaded, Pool};
 use crate::{git, Res};
 
@@ -271,6 +275,12 @@ pub enum Outcome {
     Continue,
     Quit,
     Submit(Spec),
+    // F: hand the terminal to the file-restore screen (restore_ui.rs).
+    Files,
+    // S: the same screen, started with the stashes selected.
+    Stashes,
+    // What that screen produced: one spec per file to restore.
+    Restore(Vec<Spec>),
 }
 
 struct Entry {
@@ -295,6 +305,8 @@ struct Overlay {
     kind: OverlayKind,
     names: Vec<String>,
     cursor: usize,
+    // Columns the rows are scrolled to the left, for names wider than the box.
+    hscroll: usize,
 }
 
 // The decision screen's state: the conflicted files of the pick being replayed and a cursor over
@@ -640,6 +652,7 @@ impl App {
             kind: OverlayKind::Branch,
             names,
             cursor: 0,
+            hscroll: 0,
         });
         self.mode = Mode::Overlay;
     }
@@ -989,6 +1002,27 @@ impl App {
         }
     }
 
+    // PgUp/PgDn: move about a screenful of rows, to the nearest commit that changes something from
+    // there (looking back toward the cursor when nothing below the target does). From the parked
+    // state a page enters the list like j or k.
+    fn page(&mut self, dir: isize, now: Instant, src: &mut dyn Source) {
+        if self.entries.is_empty() {
+            return;
+        }
+        if self.parked {
+            self.enter(dir, now, src);
+            return;
+        }
+        let last = self.entries.len() as isize - 1;
+        let target = (self.cursor as isize + dir * self.view_h.max(1) as isize).clamp(0, last);
+        let found = self
+            .first_applicable(target as usize, dir, src)
+            .or_else(|| self.first_applicable(target as usize, -dir, src));
+        if let Some(i) = found {
+            self.jump(i, now);
+        }
+    }
+
     // D: offer to read the large files the preview of the highlighted commit left out.
     fn ask_full(&mut self) {
         if self.parked {
@@ -1061,6 +1095,7 @@ impl App {
                     kind: OverlayKind::File,
                     names: paths,
                     cursor: 0,
+                    hscroll: 0,
                 });
                 self.mode = Mode::Overlay;
             }
@@ -1167,9 +1202,13 @@ impl App {
             KeyCode::Char('G') | KeyCode::End => {
                 self.land(self.entries.len().saturating_sub(1), -1, now, src);
             }
+            KeyCode::PageDown => self.page(1, now, src),
+            KeyCode::PageUp => self.page(-1, now, src),
             KeyCode::Char(' ') => self.toggle(),
             KeyCode::Char('R') => self.mark_file_chain(src),
             KeyCode::Char('D') => self.ask_full(),
+            KeyCode::Char('F') => return Outcome::Files,
+            KeyCode::Char('S') => return Outcome::Stashes,
             KeyCode::Char('l') | KeyCode::Right if !self.parked => self.focus = Focus::Diff,
             KeyCode::Tab => self.open_branches(src),
             KeyCode::Enter => self.submit(src),
@@ -1194,6 +1233,10 @@ impl App {
             }
             KeyCode::Char('g') | KeyCode::Home => self.vscroll = 0,
             KeyCode::Char('G') | KeyCode::End => self.vscroll = self.max_v(),
+            KeyCode::PageDown => {
+                self.vscroll = (self.vscroll + self.view_h.max(1)).min(self.max_v())
+            }
+            KeyCode::PageUp => self.vscroll = self.vscroll.saturating_sub(self.view_h.max(1)),
             KeyCode::Char('l') | KeyCode::Right => {
                 self.hscroll = (self.hscroll + H_STEP).min(self.max_h())
             }
@@ -1206,6 +1249,8 @@ impl App {
             KeyCode::Char(' ') => self.toggle(),
             KeyCode::Char('R') => self.mark_file_chain(src),
             KeyCode::Char('D') => self.ask_full(),
+            KeyCode::Char('F') => return Outcome::Files,
+            KeyCode::Char('S') => return Outcome::Stashes,
             KeyCode::Tab => self.open_branches(src),
             KeyCode::Esc => self.focus = Focus::List,
             KeyCode::Char('q') => return self.request_quit(),
@@ -1234,7 +1279,12 @@ impl App {
             return;
         };
         let last = ov.names.len().saturating_sub(1);
+        let page = (self.view_h * 3 / 5).max(1);
         match key.code {
+            KeyCode::Char('h') | KeyCode::Left => ov.hscroll = ov.hscroll.saturating_sub(H_STEP),
+            KeyCode::Char('l') | KeyCode::Right => ov.hscroll += H_STEP,
+            KeyCode::PageDown => ov.cursor = (ov.cursor + page).min(last),
+            KeyCode::PageUp => ov.cursor = ov.cursor.saturating_sub(page),
             KeyCode::Char('j') | KeyCode::Down => ov.cursor = (ov.cursor + 1).min(last),
             KeyCode::Char('k') | KeyCode::Up => ov.cursor = ov.cursor.saturating_sub(1),
             KeyCode::Char('g') | KeyCode::Home => ov.cursor = 0,
@@ -1578,7 +1628,7 @@ impl App {
     }
 
     fn render_overlay(&mut self, frame: &mut Frame, area: Rect) {
-        let Some(ov) = self.overlay.as_ref() else {
+        let Some(ov) = self.overlay.as_mut() else {
             return;
         };
         let w = (area.width * 3 / 5).clamp(30.min(area.width), area.width);
@@ -1589,10 +1639,22 @@ impl App {
             width: w,
             height: h,
         };
-        let items: Vec<ListItem> = ov.names.iter().map(|n| ListItem::new(n.as_str())).collect();
+        // Names wider than the box scroll sideways; the offset is clamped to the widest of them.
+        let reach = max_hscroll(&ov.names, w.saturating_sub(2) as usize);
+        ov.hscroll = ov.hscroll.min(reach);
+        let items: Vec<ListItem> = ov
+            .names
+            .iter()
+            .map(|n| ListItem::new(hslice(n, 0, ov.hscroll)))
+            .collect();
         let title = match ov.kind {
             OverlayKind::Branch => " Pick from which branch?  (Enter use, Esc close) ",
             OverlayKind::File => " Follow which file?  (Enter use, Esc close) ",
+        };
+        let title = if reach > 0 {
+            format!("{title}‹ h/l › ")
+        } else {
+            title.to_string()
         };
         let list = List::new(items)
             .block(
@@ -1644,13 +1706,14 @@ impl App {
                     Style::new().fg(color).add_modifier(Modifier::BOLD),
                 ))
             }
-            Mode::Overlay => hint(" j/k move  Enter use  Esc close "),
+            Mode::Overlay => hint(" j/k PgUp/PgDn move  h/l scroll  Enter use  Esc close "),
             Mode::Resolve => hint(
                 " j/k conflict  a tree  b picked  c both  u undo  X restore file  Enter go  Esc leave ",
             ),
             Mode::Browse => match self.focus {
                 Focus::List => hint(
-                    " j/k move  space mark  R file  D large  l diff  Tab branch  Enter pick  q quit",
+                    " j/k PgUp/PgDn move  space mark  R file  D large  F files  S stash  l diff  \
+                     Tab branch  Enter pick  q quit",
                 ),
                 Focus::Diff => {
                     hint(" j/k h/l scroll  Enter/n next  N prev  space mark  Tab branch  q quit")
@@ -1665,10 +1728,10 @@ fn hint(text: &'static str) -> Line<'static> {
     Line::from(Span::styled(text, Style::new().fg(Color::DarkGray)))
 }
 
-// Run the screen on the real terminal. Returns the recipe of the patch the operator confirmed, or
+// Run the screen on the real terminal. Returns the recipes of the patches the operator confirmed, or
 // None when the screen was left without confirming. `from` names the branch to list at once;
 // without it the branch overlay opens first.
-pub fn run(cwd: &Path, from: Option<&str>) -> Res<Option<Spec>> {
+pub fn run(cwd: &Path, from: Option<&str>) -> Res<Option<Vec<Spec>>> {
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         return Err(
             "cherry-pick: no commit given, and the interactive screen needs a terminal".into(),
@@ -1710,9 +1773,31 @@ pub fn run(cwd: &Path, from: Option<&str>) -> Res<Option<Spec>> {
         }
     }
 
-    let result = with_terminal(|terminal| event_loop(terminal, &mut app, &mut src));
+    // F opens the file-restore screen on the same terminal; leaving it without confirming
+    // returns to this screen with its marks intact.
+    let result = with_terminal(|terminal| loop {
+        match event_loop(terminal, &mut app, &mut src)? {
+            which @ (Outcome::Files | Outcome::Stashes) => {
+                // The classification worker would compete with the restore screen for the CPU and
+                // the disk while it is up, for answers nobody is looking at.
+                if let Some(pool) = &app.pool {
+                    pool.pause();
+                }
+                let chosen =
+                    crate::restore_ui::browse(terminal, cwd, None, which == Outcome::Stashes);
+                if let Some(pool) = &app.pool {
+                    pool.resume();
+                }
+                if let Some(specs) = chosen? {
+                    return Ok(Outcome::Restore(specs));
+                }
+            }
+            done => return Ok(done),
+        }
+    });
     match result? {
-        Outcome::Submit(spec) => Ok(Some(spec)),
+        Outcome::Submit(spec) => Ok(Some(vec![spec])),
+        Outcome::Restore(specs) => Ok(Some(specs)),
         _ => Ok(None),
     }
 }
@@ -2010,6 +2095,14 @@ mod tests {
         assert_eq!(a.source_label.as_deref(), Some("origin/dev"));
         assert_eq!(a.marked_count(), 0);
         assert_eq!(a.cursor, 0);
+    }
+
+    #[test]
+    fn f_hands_the_terminal_to_the_file_screen_from_either_pane() {
+        let (mut app, mut fake) = app();
+        assert_eq!(press(&mut app, &mut fake, ch('F')), Outcome::Files);
+        app.focus = Focus::Diff;
+        assert_eq!(press(&mut app, &mut fake, ch('F')), Outcome::Files);
     }
 
     #[test]
@@ -2956,5 +3049,135 @@ mod tests {
             "f.txt", TWO_HUNKS,
         )]))]);
         render_text(&mut a, 12, 4);
+    }
+
+    #[test]
+    fn s_hands_the_terminal_to_the_stash_files_from_either_pane() {
+        let (mut app, mut fake) = app();
+        assert_eq!(press(&mut app, &mut fake, ch('S')), Outcome::Stashes);
+        app.focus = Focus::Diff;
+        assert_eq!(press(&mut app, &mut fake, ch('S')), Outcome::Stashes);
+    }
+
+    // Forty commits on a source, c0 newest, with the screen ten rows high.
+    fn long_list() -> (App, Fake) {
+        let mut fake = Fake::new();
+        fake.commits = (0..40)
+            .map(|i| (format!("{i:040x}"), format!("c{i}")))
+            .collect();
+        entered(fake)
+    }
+
+    #[test]
+    fn page_keys_move_a_screenful_through_the_commits() {
+        let (mut a, mut f) = long_list();
+        assert_eq!(a.cursor, 0);
+        press(&mut a, &mut f, KeyCode::PageDown);
+        assert_eq!(a.cursor, 10);
+        press(&mut a, &mut f, KeyCode::PageDown);
+        assert_eq!(a.cursor, 20);
+        press(&mut a, &mut f, KeyCode::PageUp);
+        assert_eq!(a.cursor, 10);
+        a.cursor = 35;
+        press(&mut a, &mut f, KeyCode::PageDown);
+        assert_eq!(a.cursor, 39, "the end of the list stops the page");
+        a.cursor = 4;
+        press(&mut a, &mut f, KeyCode::PageUp);
+        assert_eq!(a.cursor, 0, "so does the start");
+    }
+
+    #[test]
+    fn a_page_passes_over_commits_that_change_nothing() {
+        let (mut a, mut f) = long_list();
+        f.inert = vec![format!("{:040x}", 10)];
+        press(&mut a, &mut f, KeyCode::PageDown);
+        assert_eq!(
+            a.cursor, 11,
+            "the commit at the target changes nothing, so the next one is taken"
+        );
+        f.inert = (30..40).map(|i| format!("{i:040x}")).collect();
+        a.cursor = 25;
+        press(&mut a, &mut f, KeyCode::PageDown);
+        assert_eq!(
+            a.cursor, 29,
+            "with nothing below the target the nearest above it is taken"
+        );
+    }
+
+    #[test]
+    fn a_page_from_the_parked_state_enters_the_list_like_j() {
+        let mut fake = Fake::new();
+        fake.commits = (0..40)
+            .map(|i| (format!("{i:040x}"), format!("c{i}")))
+            .collect();
+        let (mut a, mut f) = parked_app(fake);
+        assert!(a.parked);
+        press(&mut a, &mut f, KeyCode::PageDown);
+        assert!(!a.parked);
+        assert_eq!(a.cursor, 0);
+    }
+
+    #[test]
+    fn page_keys_scroll_the_diff_pane_when_it_has_the_focus() {
+        let (mut a, mut f) = long_list();
+        press(&mut a, &mut f, ch('l'));
+        assert_eq!(a.focus, Focus::Diff);
+        press(&mut a, &mut f, KeyCode::PageDown);
+        assert!(a.vscroll <= a.max_v());
+        assert_eq!(a.cursor, 0, "the selection stays where it is");
+        press(&mut a, &mut f, KeyCode::PageUp);
+        assert_eq!(a.vscroll, 0);
+    }
+
+    #[test]
+    fn long_names_in_the_branch_overlay_scroll_sideways() {
+        let (mut a, mut f) = app();
+        f.branches = vec![format!("{}TAILMARK", "y".repeat(100)), "other".to_string()];
+        press(&mut a, &mut f, KeyCode::Tab);
+        assert_eq!(a.mode, Mode::Overlay);
+        let draw = |a: &mut App| {
+            let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
+            term.draw(|fr| a.render(fr)).unwrap();
+            let buf = term.backend().buffer().clone();
+            (0..20u16)
+                .map(|y| {
+                    (0..80u16)
+                        .map(|x| buf[(x, y)].symbol().to_string())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let start = draw(&mut a);
+        assert!(
+            start.contains("yyyy") && !start.contains("TAILMARK"),
+            "{start}"
+        );
+        for _ in 0..20 {
+            press(&mut a, &mut f, ch('l'));
+        }
+        let end = draw(&mut a);
+        assert!(end.contains("TAILMARK"), "{end}");
+        for _ in 0..20 {
+            press(&mut a, &mut f, KeyCode::Left);
+        }
+        let back = draw(&mut a);
+        assert!(!back.contains("TAILMARK"), "{back}");
+        assert_eq!(
+            a.mode,
+            Mode::Overlay,
+            "scrolling does not close the overlay"
+        );
+    }
+
+    #[test]
+    fn page_keys_move_the_overlay_cursor() {
+        let (mut a, mut f) = app();
+        f.branches = (0..30).map(|i| format!("b{i}")).collect();
+        press(&mut a, &mut f, KeyCode::Tab);
+        press(&mut a, &mut f, KeyCode::PageDown);
+        assert_eq!(a.overlay.as_ref().unwrap().cursor, 6);
+        press(&mut a, &mut f, KeyCode::PageUp);
+        assert_eq!(a.overlay.as_ref().unwrap().cursor, 0);
     }
 }

@@ -45,6 +45,25 @@ pub(crate) const H_STEP: usize = 8;
 // Two h presses closer together than this are treated as one continuous run (key auto-repeat or a
 // held key), so the second cannot switch panes if the first was still scrolling.
 pub(crate) const RUN_WINDOW: Duration = Duration::from_millis(200);
+
+// The part of an overlay row that shows when the row is scrolled `skip` characters to the left. The
+// first `fixed` characters stay in place (a selection marker must not scroll out of sight), the
+// rest of the row starts `skip` characters in.
+pub(crate) fn hslice(row: &str, fixed: usize, skip: usize) -> String {
+    let mut chars = row.chars();
+    let head: String = chars.by_ref().take(fixed).collect();
+    let rest: String = chars.skip(skip).collect();
+    format!("{head}{rest}")
+}
+
+// The furthest an overlay of `inner_w` columns can scroll to see the end of its widest row.
+pub(crate) fn max_hscroll(rows: &[String], inner_w: usize) -> usize {
+    rows.iter()
+        .map(|r| r.chars().count())
+        .max()
+        .unwrap_or(0)
+        .saturating_sub(inner_w)
+}
 // Diffs longer than this are cut off, so that a commit touching a generated file cannot stall the
 // picker or exhaust memory. The cut is announced on the final line.
 const MAX_DIFF_LINES: usize = 20_000;
@@ -275,6 +294,8 @@ impl App {
             KeyCode::Char('k') | KeyCode::Up => self.step(-1),
             KeyCode::Char('g') | KeyCode::Home => self.jump(0),
             KeyCode::Char('G') | KeyCode::End => self.jump(self.entries.len().saturating_sub(1)),
+            KeyCode::PageDown => self.step(self.view_h.max(1) as isize),
+            KeyCode::PageUp => self.step(-(self.view_h.max(1) as isize)),
             KeyCode::Char(' ') => self.toggle(),
             KeyCode::Char('l') | KeyCode::Right => self.focus = Focus::Diff,
             KeyCode::Enter => self.submit(src),
@@ -299,6 +320,10 @@ impl App {
             }
             KeyCode::Char('g') | KeyCode::Home => self.vscroll = 0,
             KeyCode::Char('G') | KeyCode::End => self.vscroll = self.max_v(),
+            KeyCode::PageDown => {
+                self.vscroll = (self.vscroll + self.view_h.max(1)).min(self.max_v())
+            }
+            KeyCode::PageUp => self.vscroll = self.vscroll.saturating_sub(self.view_h.max(1)),
             KeyCode::Char('l') | KeyCode::Right => {
                 self.hscroll = (self.hscroll + H_STEP).min(self.max_h())
             }
@@ -1024,5 +1049,43 @@ mod tests {
             !s.contains("+++ b/a.txt"),
             "scrolled past the start of that line: {s}"
         );
+    }
+
+    #[test]
+    fn rows_scroll_sideways_and_a_fixed_marker_stays_in_view() {
+        assert_eq!(hslice("[x] abcdef", 4, 2), "[x] cdef");
+        assert_eq!(hslice("abcdef", 0, 2), "cdef");
+        assert_eq!(hslice("abc", 0, 9), "");
+        assert_eq!(hslice("[x] ab", 4, 9), "[x] ");
+        let rows = vec!["short".to_string(), "a longer row".to_string()];
+        assert_eq!(max_hscroll(&rows, 5), 7);
+        assert_eq!(max_hscroll(&rows, 40), 0);
+        assert_eq!(max_hscroll(&[], 10), 0);
+    }
+
+    #[test]
+    fn page_keys_move_a_screenful_in_the_list_and_in_the_diff() {
+        let choices = (0..40)
+            .map(|i| (format!("{i:040x}"), format!("c{i}")))
+            .collect();
+        let mut a = App::new(choices);
+        a.view_h = 10;
+        a.view_w = 40;
+        let mut f = Fake::ok();
+        let t = Instant::now();
+        press(&mut a, &mut f, KeyCode::PageDown, t);
+        assert_eq!(a.cursor, 10);
+        press(&mut a, &mut f, KeyCode::PageDown, t);
+        press(&mut a, &mut f, KeyCode::PageDown, t);
+        press(&mut a, &mut f, KeyCode::PageDown, t);
+        press(&mut a, &mut f, KeyCode::PageDown, t);
+        assert_eq!(a.cursor, 39, "the end of the list stops the page");
+        press(&mut a, &mut f, KeyCode::PageUp, t);
+        assert_eq!(a.cursor, 29);
+        a.focus = Focus::Diff;
+        press(&mut a, &mut f, KeyCode::PageDown, t);
+        assert_eq!(a.vscroll, 10);
+        press(&mut a, &mut f, KeyCode::PageUp, t);
+        assert_eq!(a.vscroll, 0);
     }
 }

@@ -228,6 +228,20 @@ impl Pool {
         self.classifying().is_some() || !lock(&self.wanted.0).list.is_empty()
     }
 
+    // Hold the classification worker back and abandon the classification in progress, for the time
+    // another screen has the terminal; `resume` releases it. Calls must be paired. The worker
+    // already waits while previews are outstanding, so a pause is counted as one more of those.
+    pub fn pause(&self) {
+        self.previews.fetch_add(1, Ordering::SeqCst);
+        if let Some(cancel) = lock(&self.classify_cancel).as_ref() {
+            cancel.cancel();
+        }
+    }
+
+    pub fn resume(&self) {
+        self.previews.fetch_sub(1, Ordering::SeqCst);
+    }
+
     // The next answer, if one has arrived.
     pub fn try_recv(&self) -> Option<Done> {
         self.done.try_recv().ok()
@@ -508,6 +522,22 @@ pub mod tests {
             vec!["ca", "cc"],
             "b was never started"
         );
+    }
+
+    #[test]
+    fn a_paused_pool_classifies_nothing_until_it_is_resumed() {
+        let slow = Slow::new();
+        let pool = Pool::start(slow.clone());
+        pool.pause();
+        pool.want(vec![(0, "c0".to_string())]);
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(lock(&slow.classified).is_empty(), "held back while paused");
+        pool.resume();
+        let end = Instant::now() + Duration::from_secs(10);
+        while lock(&slow.classified).is_empty() {
+            assert!(Instant::now() < end, "never classified after the resume");
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 
     #[test]

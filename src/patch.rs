@@ -644,6 +644,7 @@ impl Job {
                 decisions: self.decided.clone(),
                 only: self.only.clone(),
                 restore: self.restores.clone(),
+                discard: Vec::new(),
             },
             body,
             paths,
@@ -680,6 +681,10 @@ pub struct Spec {
     // (commit, path): after the picks, the file is set to its exact content in that commit, or
     // removed if the commit lacks it. A whole-file alternative to replaying a conflicting history.
     pub restore: Vec<(String, String)>,
+    // Paths whose unstaged edits are thrown away, returning each file to its state in the index.
+    // Such a spec has no patch: the edit exists only in the work tree, so there is nothing for a
+    // patch to be built from and nothing to write to a patch file (see `cherry::apply_specs`).
+    pub discard: Vec<String>,
 }
 
 const HEADER_TAG: &str = "# gitomic-patch 1";
@@ -752,6 +757,7 @@ impl Spec {
             decisions,
             only,
             restore,
+            discard: Vec::new(),
         })
     }
 }

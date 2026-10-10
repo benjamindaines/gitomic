@@ -173,7 +173,7 @@ pub fn run(root: &Path, git_dir: &Path, branch: &str, cfg: &Config, verbose: boo
                                 short_id(&id)
                             ));
                         }
-                        commit_cycle(root, &git_dir, &base_ref, cfg, verbose, &observed);
+                        commit_cycle(root, &git_dir, &base_ref, cfg, verbose, &observed, branch);
                     }
                     Ok(cur) => log(&format!(
                         "checked-out branch is '{cur}', this session is for '{branch}'; skipping capture until \
@@ -241,6 +241,7 @@ pub(crate) fn take_pending_observed(sdir: &Path) -> BTreeSet<String> {
 // Outcome of one capture attempt, returned rather than logged so the caller can report it in the register
 // appropriate to its context: the background watcher writes it to its log, while a foreground command prints
 // it to the operator's terminal.
+#[derive(Debug)]
 pub(crate) enum Flush {
     // A commit was recorded; the field carries the short object id (empty when it could not be re-read).
     Committed(String),
@@ -284,20 +285,31 @@ pub(crate) fn foreign_in_batch(root: &Path, base_ref: &str, tip: &str) -> Option
 // watcher saw change this cycle, used only under `StageMode::Observed`; the tracked and all modes ignore it.
 // Also honours coalesce_same_file, so a capture whose staged paths match the prior atomic commit's paths
 // extends that commit rather than starting a new one. A thin selector over flush_staged, which holds the
-// shared capture logic.
+// shared capture logic. `guard_branch`, when supplied, causes the capture to re-check `current_branch()`
+// after staging but before committing; a mismatch unstages the changes and returns `Skipped`. The background
+// watcher passes the session branch so that a checkout landing between the outer branch check and the commit
+// is caught rather than silently recording onto the wrong branch.
 pub(crate) fn flush_once(
     root: &Path,
     git_dir: &Path,
     base_ref: &str,
     cfg: &Config,
     observed: &BTreeSet<String>,
+    guard_branch: Option<&str>,
 ) -> Flush {
     let breadth = match cfg.stage {
         StageMode::Observed => Breadth::Observed(observed),
         StageMode::Tracked => Breadth::Tracked,
         StageMode::All => Breadth::All,
     };
-    flush_staged(root, git_dir, base_ref, breadth, cfg.coalesce_same_file)
+    flush_staged(
+        root,
+        git_dir,
+        base_ref,
+        breadth,
+        cfg.coalesce_same_file,
+        guard_branch,
+    )
 }
 
 // Capture one atomic commit staging every change including untracked files (`git add -A`), irrespective of the
@@ -308,7 +320,7 @@ pub(crate) fn flush_once(
 // to touch the same paths as the preceding commit. Coalescing is off, so no base ref is needed to evaluate it;
 // the empty string is passed and never read (see flush_staged).
 pub(crate) fn flush_all(root: &Path, git_dir: &Path) -> Flush {
-    flush_staged(root, git_dir, "", Breadth::All, false)
+    flush_staged(root, git_dir, "", Breadth::All, false, None)
 }
 
 // Record, as one atomic commit, the changes to tracked files that were made while no watcher ran
@@ -345,7 +357,7 @@ fn startup_sweep(root: &Path, git_dir: &Path, branch: &str) {
 // overwritten. Untracked files are left alone, and so are submodules. Coalescing is off: the capture stands as its own
 // step, which keeps the pre-restore state one `drop` away.
 pub(crate) fn flush_tracked(root: &Path, git_dir: &Path) -> Flush {
-    flush_staged(root, git_dir, "", Breadth::TrackedFiles, false)
+    flush_staged(root, git_dir, "", Breadth::TrackedFiles, false, None)
 }
 
 // Paths of the submodules (gitlinks) in the index.
@@ -390,6 +402,13 @@ fn stage_tracked_files(root: &Path) -> Res<()> {
 // session. The retained paths are staged with `-A` breadth, so a rename observed as a delete plus a create is
 // recorded as a rename and a newly created file is captured, which tracked-only staging (`git add -u`) would
 // miss.
+//
+// Porcelain status reports a directory that contains no tracked file as a single entry with a trailing slash
+// (`?? dir/`) instead of listing the files inside it. An observed file path never equals such an entry, so a
+// plain set lookup dropped every file of a newly created directory tree and the capture ended with nothing
+// staged and no log line. `is_reported_changed` therefore also accepts a path whose own name or any ancestor
+// directory appears in the status output with the trailing slash. Only the observed files are staged, not the
+// whole directory, so a sibling the watcher never saw is still left out of the session.
 fn stage_observed(root: &Path, observed: &BTreeSet<String>) -> Res<()> {
     if observed.is_empty() {
         return Ok(());
@@ -397,10 +416,32 @@ fn stage_observed(root: &Path, observed: &BTreeSet<String>) -> Res<()> {
     let changed = git::status_paths(root)?;
     let to_stage: Vec<&str> = observed
         .iter()
-        .filter(|p| changed.contains(p.as_str()))
+        .filter(|p| is_reported_changed(&changed, p))
         .map(|s| s.as_str())
         .collect();
     git::add_pathspec(root, &to_stage)
+}
+
+// Whether `path` is covered by the set of paths in a porcelain status report: listed itself, or contained in a
+// collapsed untracked directory entry (`dir/`) that is listed. The ancestors are tested outermost first by
+// walking the `/` separators of `path`; the path's own name with a trailing slash is tested last so that an
+// observed directory event matches the entry git reports for that directory.
+fn is_reported_changed(changed: &std::collections::HashSet<String>, path: &str) -> bool {
+    if changed.contains(path) {
+        return true;
+    }
+    let mut dir = String::with_capacity(path.len() + 1);
+    for (i, _) in path.match_indices('/') {
+        dir.clear();
+        dir.push_str(&path[..=i]);
+        if changed.contains(dir.as_str()) {
+            return true;
+        }
+    }
+    dir.clear();
+    dir.push_str(path);
+    dir.push('/');
+    changed.contains(dir.as_str())
 }
 
 // Shared capture body. `breadth` selects which paths are staged. `coalesce` enables the same-file policy: when
@@ -415,12 +456,19 @@ fn stage_observed(root: &Path, observed: &BTreeSet<String>) -> Res<()> {
 // neither block on nor repeatedly trigger hooks.
 // `base_ref` names the active session's base marker, used only when `coalesce` is true (see
 // same_paths_as_last_commit); a caller that never coalesces (flush_all) may pass an empty string.
+// `guard_branch`, when `Some`, causes a second `current_branch()` check after staging and before committing.
+// A mismatch resets the index (undoing the staging) and returns `Skipped`, preventing a commit that would
+// land on whatever branch a concurrent checkout switched to. The remaining TOCTOU window between this check
+// and the commit is on the order of microseconds; eliminating it entirely would require a separate index file
+// or the commit-tree + update-ref CAS path that `finalize` already uses. Foreground callers (flush_all,
+// flush_tracked, report_flush) pass `None` because the operator controls the branch in those contexts.
 fn flush_staged(
     root: &Path,
     git_dir: &Path,
     base_ref: &str,
     breadth: Breadth,
     coalesce: bool,
+    guard_branch: Option<&str>,
 ) -> Flush {
     if git::operation_in_progress(git_dir) {
         return Flush::Skipped("multi-step git operation in progress".to_string());
@@ -443,6 +491,28 @@ fn flush_staged(
         Ok(true) => return Flush::Nothing, // exit 0: no staged differences
         Ok(false) => {}                    // exit 1: staged differences present
         Err(e) => return Flush::Failed(format!("diff check failed: {e}")),
+    }
+
+    // Second branch check: the outer loop verified the branch before entering this function, but a
+    // checkout could have landed between that check and the staging above. Re-checking here narrows
+    // the race to the microseconds between this read and the commit below. A mismatch resets the
+    // index so the staged changes do not leak into the next capture cycle on the new branch.
+    if let Some(expected) = guard_branch {
+        match git::current_branch(root) {
+            Ok(ref cur) if cur != expected => {
+                let _ = git::run(root, &["reset", "-q"]);
+                return Flush::Skipped(format!(
+                    "branch changed to '{cur}' after staging; index reset"
+                ));
+            }
+            Err(_) => {
+                let _ = git::run(root, &["reset", "-q"]);
+                return Flush::Skipped(
+                    "HEAD detached after staging; index reset".to_string(),
+                );
+            }
+            _ => {}
+        }
     }
 
     if coalesce && same_paths_as_last_commit(root, base_ref) {
@@ -518,6 +588,8 @@ fn same_paths_as_last_commit(root: &Path, base_ref: &str) -> bool {
 }
 
 // Attempt one atomic commit on the watcher's schedule, logging the outcome to the watcher's redirected log.
+// `branch` is the session's branch, forwarded to flush_staged as a guard against a concurrent checkout
+// landing between the outer branch check and the commit.
 fn commit_cycle(
     root: &Path,
     git_dir: &Path,
@@ -525,8 +597,9 @@ fn commit_cycle(
     cfg: &Config,
     verbose: bool,
     observed: &BTreeSet<String>,
+    branch: &str,
 ) {
-    match flush_once(root, git_dir, base_ref, cfg, observed) {
+    match flush_once(root, git_dir, base_ref, cfg, observed, Some(branch)) {
         Flush::Committed(sha) if !sha.is_empty() => log(&format!("atomic commit {sha}")),
         Flush::Committed(_) => log("atomic commit recorded"),
         // Nothing staged is the common quiescent outcome and is silent by default to keep the log terse; under
@@ -744,6 +817,121 @@ mod tests {
         r.git(&["update-ref", "-d", &git::base_ref("main")]);
         startup_sweep(&r.0, &git_dir, "main");
         assert_eq!(r.head(), head, "no session base");
+    }
+
+    fn observed_set(paths: &[&str]) -> BTreeSet<String> {
+        paths.iter().map(|p| p.to_string()).collect()
+    }
+
+    // A directory with no tracked file is one `?? dir/` entry in porcelain status. Observed staging has to
+    // stage the observed files inside it, and only those.
+    #[test]
+    fn observed_staging_captures_files_of_a_wholly_untracked_directory() {
+        let r = session();
+        r.write("boot/kernel.img", "k\n");
+        r.write("boot/cpio_tree/init", "i\n");
+        r.write("boot/unseen.txt", "never observed\n");
+        assert!(
+            r.git(&["status", "--porcelain"])
+                .lines()
+                .any(|l| l == "?? boot/"),
+            "the premise: git collapses the untracked directory into one entry"
+        );
+        stage_observed(
+            &r.0,
+            &observed_set(&["boot/kernel.img", "boot/cpio_tree/init"]),
+        )
+        .unwrap();
+        let staged = r.git(&["diff", "--cached", "--name-only"]);
+        let mut staged: Vec<&str> = staged.lines().collect();
+        staged.sort();
+        assert_eq!(staged, ["boot/cpio_tree/init", "boot/kernel.img"]);
+    }
+
+    #[test]
+    fn observed_staging_still_ignores_unchanged_and_unobserved_paths() {
+        let r = session();
+        r.write("a.txt", "edited\n");
+        r.write("other/new.txt", "n\n");
+        stage_observed(&r.0, &observed_set(&["b.txt", "a.txt"])).unwrap();
+        assert_eq!(r.git(&["diff", "--cached", "--name-only"]), "a.txt");
+    }
+
+    #[test]
+    fn a_reported_directory_covers_its_descendants_and_itself_but_not_a_prefix_sibling() {
+        let changed: std::collections::HashSet<String> =
+            ["boot/".to_string(), "x.txt".to_string()].into();
+        assert!(is_reported_changed(&changed, "x.txt"));
+        assert!(is_reported_changed(&changed, "boot/a/b/c.img"));
+        assert!(is_reported_changed(&changed, "boot"));
+        assert!(!is_reported_changed(&changed, "bootleg/a.img"));
+        assert!(!is_reported_changed(&changed, "y.txt"));
+    }
+
+    // The branch guard in flush_staged resets the index and returns Skipped when the checked-out branch
+    // no longer matches the expected session branch. This simulates a checkout landing between the outer
+    // branch check and the commit by switching branches after staging.
+    #[test]
+    fn branch_guard_prevents_commit_on_wrong_branch() {
+        let r = session();
+        let base = r.head();
+        r.git(&["checkout", "-q", "-b", "other"]);
+        r.git(&["checkout", "-q", "main"]);
+        r.git(&["update-ref", &git::base_ref("main"), "HEAD"]);
+        r.write("a.txt", "changed\n");
+        let git_dir = git::git_dir(&r.0).unwrap();
+        // Stage the change as if the watcher observed it on "main".
+        stage_observed(&r.0, &observed_set(&["a.txt"])).unwrap();
+        assert!(
+            !r.git(&["diff", "--cached", "--name-only"]).is_empty(),
+            "a.txt is staged"
+        );
+        // Switch to "other" to simulate a concurrent checkout before the commit.
+        r.git(&["checkout", "-q", "other"]);
+        // flush_staged with guard_branch = Some("main") should detect the mismatch, reset the
+        // index, and return Skipped instead of committing onto "other".
+        let result = flush_staged(
+            &r.0,
+            &git_dir,
+            &git::base_ref("main"),
+            Breadth::Observed(&observed_set(&["a.txt"])),
+            false,
+            Some("main"),
+        );
+        assert!(
+            matches!(result, Flush::Skipped(_)),
+            "expected Skipped, got {result:?}"
+        );
+        // The index should be clean after the reset.
+        assert!(
+            r.git(&["diff", "--cached", "--name-only"]).is_empty(),
+            "index was not reset"
+        );
+        // "other" should still be at its original commit (no stray commit landed on it).
+        assert_eq!(r.head(), base, "no commit landed on the wrong branch");
+    }
+
+    // Without the branch guard (None), flush_staged commits regardless of which branch is checked out.
+    // This is the correct behaviour for foreground callers where the operator controls the branch.
+    #[test]
+    fn no_branch_guard_commits_normally() {
+        let r = session();
+        let base = r.head();
+        r.write("a.txt", "changed\n");
+        let git_dir = git::git_dir(&r.0).unwrap();
+        let result = flush_staged(
+            &r.0,
+            &git_dir,
+            &git::base_ref("main"),
+            Breadth::Observed(&observed_set(&["a.txt"])),
+            false,
+            None,
+        );
+        assert!(
+            matches!(result, Flush::Committed(_)),
+            "expected Committed, got {result:?}"
+        );
+        assert_ne!(r.head(), base, "a commit was made");
     }
 
     #[test]

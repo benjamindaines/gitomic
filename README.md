@@ -51,6 +51,8 @@ gitomic drop <hash>...       # delete individual unpublished commits (alias: rm)
 gitomic cherry-pick [<hash>...]  # bring commits from another branch, via a patch file (alias: pick)
 gitomic restore [<path>...]      # bring files from other branches into the work tree as they are there
 gitomic pick --stash [<path>...] # the same, out of a stash; the stash keeps the file (alias: restore --stash)
+gitomic restore -s -m <path>...  # merge a stashed file into the work-tree copy one change at a time
+gitomic restore -M [<path>...]  # put modified or deleted files back to their staged state, in place
 gitomic history <path>           # the commits that changed one file, each with its change; Enter restores a version
 ```
 
@@ -222,10 +224,23 @@ untracked file in the way, say) is reported and the others still go through.
   current directory. `--from` takes a branch, tag or commit; without it the local branches must agree
   about each file, and a disagreement is refused with the branches listed. `-n/--dry-run` reports,
   `-p/--patch-only` writes the patch file and stops.
+- **Merge** (`-m/--merge`, with paths, needs a terminal). Instead of overwriting the work-tree copy, the
+  file is compared with the source's copy (`-s` for the newest stash, or `--from` for a stash, branch or
+  commit) line by line, and each separate change is put as a question on the conflict-resolution screen:
+  `a` keeps the work-tree lines, `b` takes the source's, `c` keeps both, `u` withdraws a decision, `j`/`k`
+  move between changes and `[`/`]` between files, `Enter` writes once every change is decided and `q`
+  leaves with nothing written. An insertion in the source has an empty A side and a deletion an empty B
+  side. Binary files, files absent from the work tree, and files identical to the source are reported
+  rather than merged. Recording is as for restore: with a session open, pending edits are captured and
+  each merged file is one commit (`gitomic drop` undoes it); otherwise the result is left uncommitted. The
+  stash is only read. `-n` lists the number of changes per file without writing. The comparison is exact
+  by lines, so a region changed in both the stash and later work appears as one change with both versions
+  to choose from. Files whose differing region exceeds about four million line pairs are offered as a
+  single change.
 - **Interactive** (no path, needs a terminal; also `F` from the cherry-pick screen, `Esc`/`q` returns).
   Files on the left, what restoring the highlighted file would change on HEAD on the right (loaded on a
   worker thread after the selection has rested for 150 ms, as in the cherry-pick screen). `Tab` chooses
-  the branches (local ones at first; space selects, `a` all/none). `/` filters by name: every word must
+  the branches (local ones at first; space selects, `a` all/none, `v` inverts, so one `v` swaps the default branches for the stashes). `/` filters by name: every word must
   occur, case ignored, and a word with `*` or `?` is a glob matched against the file name (against the
   whole path when it contains a `/`), so `*.img` and `boot/*` work; `Esc` clears. `B` shows only binary
   files. `space` marks and moves to the next file, so a run of presses marks a run of files. A file whose content
@@ -254,6 +269,24 @@ untracked file in the way, say) is reported and the others still go through.
   `stash@{N}` or just `N` (`gitomic pick --stash --from 1 src/main.rs`). History (`H`) and the deleted-file
   scan (`D`) cover branches only; a stash has no history of its own. Files over `cherry_size_limit_mb` are
   restored but not previewed, as for branches.
+- **Modified files.** The `(modified)` entry of the `Tab` overlay (shown only while some tracked file has
+  edits that are not staged, i.e. `git status` lists it under "Changes not staged" as modified; unselected
+  unless asked for) offers those files at their staged state, which is what `git restore <path>` returns
+  them to: a file with nothing staged goes back to HEAD, one with staged work keeps it. The right pane shows
+  the work tree turning back into that state. It is a selective reset of the work tree: pick the files to
+  put back and leave the others as they are (after a build has rewritten tracked files, say, and a few
+  of them are to be swapped by hand before the next one). `gitomic restore --modified [<path>...]` (`-m`)
+  opens this screen with only that entry selected, or, with paths, restores those files; a path with no
+  unstaged edit is refused. The edits are **discarded in place**: no commit is made, no session is needed,
+  no patch file is written, and nothing records what was there, so they cannot be brought back. The screen's
+  `y`/`n` is the only confirmation; the command line has none, as with `git restore`. Files deleted in
+  the work tree are listed too and come back; untracked files and files whose only change is staged are
+  not listed. The modified files cannot be combined with branches or stashes: choosing `(modified)` in the
+  `Tab` overlay deselects everything else, choosing anything else deselects it, and `a` (all) leaves it
+  out. Leaving the overlay with it newly chosen asks `y`/`n` before the file list is shown (not when it was
+  already the selection, and not for `restore -M`, which was asked for on the command line). `-n` on the command line lists what
+  would be discarded; `-p` is refused, since there is no patch. `--modified` cannot be combined with
+  `--stash` or `--from`. History (`H`) and the deleted-file scan (`D`) do not cover it.
 - **Keys.** `PgUp`/`PgDn` move a page in the file list (and scroll a page in the diff pane when it has the
   focus); in every overlay `h`/`l` (or the arrow keys) scroll the rows sideways, which matters for long branch
   and stash names, the `[x]` marker staying in place. The same keys work in the `drop` and cherry-pick screens.

@@ -99,4 +99,27 @@ expect_fail "pick --stash with a file the stash does not hold" "$BIN" pick --sta
 expect_fail "pick --stash with a branch for --from" "$BIN" pick --stash --from main a.txt
 expect_fail "pick --stash with --only" "$BIN" pick --stash --only a.txt a.txt
 
+# --- modified files ----------------------------------------------------------------------------
+# `restore --modified` discards unstaged edits in place, like `git restore <path>` for the named
+# files: no session, no commit. Other edits stay.
+echo a-edited >a.txt
+echo b-edited >b.txt
+head_before="$(git rev-parse HEAD)"
+expect_fail "restore --modified of a file without edits" "$BIN" restore --modified new.txt
+expect_fail "restore --modified with --stash" "$BIN" restore --modified --stash a.txt
+expect_fail "restore --modified with --patch-only" "$BIN" restore --modified -p a.txt
+"$BIN" restore --modified --dry-run a.txt >/dev/null 2>&1
+expect_eq "a dry run keeps the edit" a-edited "$(cat a.txt)"
+
+"$BIN" restore -M a.txt >/dev/null 2>&1
+expect_eq "restore --modified returns the file to its staged state" a "$(cat a.txt)"
+expect_eq "other edits are left alone" b-edited "$(cat b.txt)"
+expect_eq "nothing is committed" "$head_before" "$(git rev-parse HEAD)"
+git checkout -q -- b.txt
+
+rm a.txt
+"$BIN" restore -M a.txt >/dev/null 2>&1
+expect_eq "restore --modified brings back a deleted file" a "$(cat a.txt)"
+expect_eq "still nothing committed" "$head_before" "$(git rev-parse HEAD)"
+
 echo "cli-smoke: ok"

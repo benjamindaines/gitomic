@@ -278,14 +278,17 @@ fn parse_history(rest: &[String]) -> Res<history::Opts> {
 // Parse restore arguments. Every positional word is a path (relative to the current directory);
 // `--from <rev>` names the branch, tag or commit the files are taken from; `-n/--dry-run` reports
 // the patch without writing or applying it; `-p/--patch-only` writes the patch file and stops.
-// `-s/--stash` takes the files from a stash. With no path, the interactive screen opens.
+// `-s/--stash` takes the files from a stash; `-M/--modified` offers the tracked files whose edits are
+// not staged, to be returned to their staged state. With no path, the interactive screen opens.
 fn parse_restore(rest: &[String]) -> Res<restore::Opts> {
+    let mut modified = false;
     let mut opts = restore::Opts {
         from: None,
         paths: Vec::new(),
         dry_run: false,
         patch_only: false,
         stash: false,
+        merge: false,
     };
     let mut it = rest.iter();
     while let Some(arg) = it.next() {
@@ -293,6 +296,8 @@ fn parse_restore(rest: &[String]) -> Res<restore::Opts> {
             "-n" | "--dry-run" => opts.dry_run = true,
             "-p" | "--patch-only" => opts.patch_only = true,
             "-s" | "--stash" => opts.stash = true,
+            "-m" | "--merge" => opts.merge = true,
+            "-M" | "--modified" => modified = true,
             "--from" => {
                 let value = it.next().ok_or("expected a branch after --from")?;
                 opts.from = Some(value.clone());
@@ -305,6 +310,12 @@ fn parse_restore(rest: &[String]) -> Res<restore::Opts> {
             }
             path => opts.paths.push(path.to_string()),
         }
+    }
+    if modified {
+        if opts.stash || opts.from.is_some() {
+            return Err("restore: --modified cannot be combined with --stash or --from".into());
+        }
+        opts.from = Some(restore::MODIFIED.to_string());
     }
     Ok(opts)
 }
@@ -555,7 +566,17 @@ COMMANDS:
                        leaves the stash as it was. PgUp/PgDn page the lists, h/l scroll an overlay.
                        Options: -n/--dry-run, -p/--patch-only, -s/--stash (start with the stashes
                        selected; with paths, take them from stash@{{0}}, or from the stash named
-                       by --from, as stash@{{N}} or just N).
+                       by --from, as stash@{{N}} or just N), -m/--merge (with paths: instead of
+                       overwriting the local copy, go through the differences one change at a
+                       time, a keeping the local lines, b taking the source's, c both, u undoing
+                       a decision; nothing is written until every change is decided, and the
+                       stash is left as it was),
+                       -M/--modified (the tracked files that are modified or deleted, returned
+                       to their staged state like 'git restore <path>'; the '(modified)' entry
+                       of the Tab overlay is the same, and it excludes the branches and stashes.
+                       The changes are discarded in place:
+                       nothing is committed, no session is needed, and they cannot be brought
+                       back; -n lists what would go, -p is refused).
   history [options] <path>
                        The commits of the checked-out branch that changed one file, newest first,
                        each with the change it made to that file (v switches the right pane to what

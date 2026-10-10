@@ -1543,7 +1543,7 @@ pub(crate) fn terminate_watcher(git_dir: &Path, branch: &str) -> Res<bool> {
 // — is still captured whole. For tracked/all modes the set is consumed and ignored.
 pub(crate) fn report_flush(root: &Path, git_dir: &Path, branch: &str, cfg: &Config) {
     let observed = watch::take_pending_observed(&state_dir(git_dir, branch));
-    match watch::flush_once(root, git_dir, &git::base_ref(branch), cfg, &observed) {
+    match watch::flush_once(root, git_dir, &git::base_ref(branch), cfg, &observed, None) {
         watch::Flush::Committed(sha) if !sha.is_empty() => {
             println!("  captured final change as {sha}")
         }

@@ -31,7 +31,7 @@
 //   q            quit (confirmed first when files are marked)
 // Keys, diff pane: j/k h/l g/G Ctrl-d/u scroll, Enter/n next file, N previous, space, Tab, Esc
 //   back to the list.
-// Keys, branch overlay: j/k g/G move, space select, a all/none, Enter use, Esc cancel.
+// Keys, branch overlay: j/k g/G move, space select, a all/none, v invert, Enter use, Esc cancel.
 // Keys, version overlay: j/k g/G move, Enter use that branch, Esc cancel.
 // Keys, history overlay: j/k g/G move (the right pane follows), Enter use that version, Esc/H cancel.
 // Keys, patch list: j/k g/G move, space mark and move down, Ctrl-d/u scroll the patch, d delete the
@@ -57,7 +57,8 @@ use crate::git::Cancel;
 use crate::patch::Spec;
 use crate::pick::{hslice, max_hscroll, style_diff, with_terminal, DiffView, H_STEP, RUN_WINDOW};
 use crate::restore::{
-    self, BranchTip, Deleted, FileEntry, Filter, HistRow, Index, PatchInfo, Source, State, Version,
+    self, is_modified, BranchTip, Deleted, FileEntry, Filter, HistRow, Index, PatchInfo, Source,
+    State, Version,
 };
 use crate::{git, Res};
 
@@ -402,6 +403,9 @@ enum Mode {
     // The commits that changed the highlighted file.
     History,
     ConfirmApply,
+    // Asked when the source overlay is left with the modified files newly chosen; the overlay
+    // stays open behind it.
+    ConfirmModified,
     ConfirmQuit,
     // The list of patch files.
     Patches,
@@ -1074,6 +1078,10 @@ impl App {
                 self.key_confirm_trash(key, names, src);
                 Outcome::Continue
             }
+            Mode::ConfirmModified => {
+                self.key_confirm_modified(key, src);
+                Outcome::Continue
+            }
             Mode::ConfirmApply => self.key_confirm_apply(key, src),
             Mode::ConfirmQuit => self.key_confirm_quit(key),
             Mode::Browse => {
@@ -1211,27 +1219,81 @@ impl App {
             }
             KeyCode::Char('g') | KeyCode::Home => self.overlay_cursor = 0,
             KeyCode::Char('G') | KeyCode::End => self.overlay_cursor = last,
-            KeyCode::Char(' ') => {
-                if let Some(on) = self.pending.get_mut(self.overlay_cursor) {
-                    *on = !*on;
+            KeyCode::Char(' ') => self.toggle_pending(self.overlay_cursor),
+            KeyCode::Char('a') => {
+                // The modified files stand alone, so "all" is every other source.
+                let others: Vec<usize> = (0..self.sources.len())
+                    .filter(|&i| !self.sources[i].0.is_modified())
+                    .collect();
+                if !others.is_empty() {
+                    let all_on = others.iter().all(|&i| self.pending[i]);
+                    for i in 0..self.pending.len() {
+                        self.pending[i] = !self.sources[i].0.is_modified() && !all_on;
+                    }
                 }
             }
-            KeyCode::Char('a') => {
-                let all_on = self.pending.iter().all(|on| *on);
-                self.pending.iter_mut().for_each(|on| *on = !all_on);
-            }
+            // Inverts every row. With the default selection (branches on, stashes off) one press
+            // leaves exactly the stashes selected. Scoped to this overlay: the commit and file
+            // lists have no select-all key, since a stray press there would mark many entries.
+            KeyCode::Char('v') => self.pending.iter_mut().for_each(|on| *on = !*on),
             KeyCode::Enter => {
                 if !self.pending.iter().any(|on| *on) {
                     self.say("select at least one branch", true);
                     return;
                 }
-                for ((_, on), new) in self.sources.iter_mut().zip(&self.pending) {
-                    *on = *new;
+                // Choosing the modified files is a way of throwing work away, so it is asked
+                // about before the list of files is shown.
+                let chosen = self.pending_has_modified();
+                let already = self.sources.iter().any(|(s, on)| s.is_modified() && *on);
+                if chosen && !already {
+                    self.mode = Mode::ConfirmModified;
+                    return;
                 }
-                self.mode = Mode::Browse;
-                self.load(src);
+                self.apply_pending(src);
             }
             KeyCode::Esc | KeyCode::Tab | KeyCode::Char('q') => self.mode = Mode::Browse,
+            _ => {}
+        }
+    }
+
+    // Flip the source at `i` in the overlay. The modified files cannot be combined with a branch
+    // or stash (their restore throws the change away, the others bring a file in), so selecting
+    // either kind clears the other.
+    fn toggle_pending(&mut self, i: usize) {
+        let Some(&on) = self.pending.get(i) else {
+            return;
+        };
+        if !on {
+            let modified = self.sources[i].0.is_modified();
+            for j in 0..self.pending.len() {
+                if j != i && (modified || self.sources[j].0.is_modified()) {
+                    self.pending[j] = false;
+                }
+            }
+        }
+        self.pending[i] = !on;
+    }
+
+    fn pending_has_modified(&self) -> bool {
+        self.sources
+            .iter()
+            .zip(&self.pending)
+            .any(|((s, _), on)| s.is_modified() && *on)
+    }
+
+    // Make the overlay's choice the selection and read its files.
+    fn apply_pending(&mut self, src: &mut dyn Files) {
+        for ((_, on), new) in self.sources.iter_mut().zip(&self.pending) {
+            *on = *new;
+        }
+        self.mode = Mode::Browse;
+        self.load(src);
+    }
+
+    fn key_confirm_modified(&mut self, key: KeyEvent, src: &mut dyn Files) {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => self.apply_pending(src),
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => self.mode = Mode::Branches,
             _ => {}
         }
     }
@@ -1492,7 +1554,9 @@ impl App {
         }
         self.render_bar(frame, rows[1]);
         match self.mode {
-            Mode::Branches | Mode::Versions | Mode::History => self.render_overlay(frame, area),
+            Mode::Branches | Mode::ConfirmModified | Mode::Versions | Mode::History => {
+                self.render_overlay(frame, area)
+            }
             _ => {}
         }
     }
@@ -1708,7 +1772,7 @@ impl App {
 
     fn render_overlay(&mut self, frame: &mut Frame, area: Rect) {
         let (title, rows): (&str, Vec<String>) = match self.mode {
-            Mode::Branches => (
+            Mode::Branches | Mode::ConfirmModified => (
                 " Restore from which branches? ",
                 self.sources
                     .iter()
@@ -1750,7 +1814,11 @@ impl App {
             height: h,
         };
         // Rows wider than the box scroll sideways. The `[x]` marker of the source overlay stays put.
-        let fixed = if self.mode == Mode::Branches { 4 } else { 0 };
+        let fixed = if matches!(self.mode, Mode::Branches | Mode::ConfirmModified) {
+            4
+        } else {
+            0
+        };
         let reach = max_hscroll(&rows, w.saturating_sub(2) as usize);
         self.ov_hscroll = self.ov_hscroll.min(reach);
         let title = if reach > 0 {
@@ -1810,6 +1878,21 @@ impl App {
     fn render_bar(&self, frame: &mut Frame, area: Rect) {
         let prompt = Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD);
         let bar = match &self.mode {
+            Mode::ConfirmModified => Line::from(Span::styled(
+                " Switch to the modified files? Restoring one discards its unstaged changes for good \
+                 (nothing is recorded); other sources are deselected. [y/n] ",
+                prompt,
+            )),
+            Mode::ConfirmApply if self.marks.values().all(|v| is_modified(&v.source)) => {
+                Line::from(Span::styled(
+                    format!(
+                        " Discard the unstaged changes to {} file(s)? Nothing is recorded; they \
+                         cannot be brought back. [y/n] ",
+                        self.marks.len()
+                    ),
+                    prompt,
+                ))
+            }
             Mode::ConfirmApply => {
                 let mut from: Vec<&str> = self.marks.values().map(|v| &*v.source).collect();
                 from.sort();
@@ -1850,7 +1933,7 @@ impl App {
             }
             Mode::Patches => hint(" j/k move  space mark  d delete  Ctrl-d/u scroll  Esc back"),
             Mode::Branches => hint(
-                " j/k PgUp/PgDn move  h/l scroll  space select  a all/none  Enter use  Esc cancel ",
+                " j/k PgUp/PgDn move  h/l scroll  space select  a all/none  v invert  Enter use  Esc ",
             ),
             Mode::Versions => hint(" j/k move  h/l scroll  Enter use this branch  Esc cancel "),
             Mode::History => hint(" j/k PgUp/PgDn move  h/l scroll  Enter use this version  Esc cancel "),
@@ -1872,9 +1955,9 @@ fn hint(text: &'static str) -> Line<'static> {
     Line::from(Span::styled(text, Style::new().fg(Color::DarkGray)))
 }
 
-// The sources offered and which start selected: the local branches (the stashes are listed but
-// start off), just `from` when it names a source, or every stash when `stashes` is set and `from`
-// is not.
+// The sources offered and which start selected: the local branches (the stashes and the modified
+// files are listed but start off), just `from` when it names a source, or every stash when
+// `stashes` is set and `from` is not.
 fn initial_sources(
     all: Vec<Source>,
     from: Option<&str>,
@@ -1886,6 +1969,9 @@ fn initial_sources(
     match from {
         Some(name) => {
             if !all.iter().any(|s| s.name == name) {
+                if restore::is_modified(name) {
+                    return Err("restore: no tracked file has unstaged changes".into());
+                }
                 return Err(
                     format!("restore: '{name}' is not a branch or stash to restore from").into(),
                 );
@@ -1913,7 +1999,7 @@ fn initial_sources(
         None => Ok(all
             .into_iter()
             .map(|s| {
-                let on = !s.remote && !s.is_stash();
+                let on = !s.remote && !s.is_stash() && !s.is_modified();
                 (s, on)
             })
             .collect()),
@@ -2117,6 +2203,7 @@ mod tests {
             add("c.txt", Some("C"), &[("one", "C1"), ("two", "C2")]);
             add("d.txt", None, &[("two", "D")]);
             add("img.png", Some("I"), &[("one", "I2")]);
+            add("m.txt", Some("M"), &[("(modified)", "M")]);
             Ok(out)
         }
         fn binary(&mut self, _sources: &[String]) -> Result<HashSet<String>, String> {
@@ -2405,6 +2492,26 @@ mod tests {
         assert_eq!(app.mode, Mode::Browse);
         assert_eq!(app.selected(), ["one", "two"]);
         assert_eq!(fake.loads.len(), 1);
+    }
+
+    #[test]
+    fn v_inverts_the_branch_overlay_selection_and_twice_restores_it() {
+        let (mut app, mut fake) = app();
+        press(&mut app, &mut fake, KeyCode::Tab);
+        let before = app.pending.clone();
+        press(&mut app, &mut fake, ch('v'));
+        let flipped: Vec<bool> = before.iter().map(|on| !*on).collect();
+        assert_eq!(app.pending, flipped);
+        press(&mut app, &mut fake, ch('v'));
+        assert_eq!(app.pending, before);
+        // Inverting a full selection leaves none, which Enter refuses like any empty selection.
+        press(&mut app, &mut fake, ch('a'));
+        assert!(app.pending.iter().all(|on| *on));
+        press(&mut app, &mut fake, ch('v'));
+        assert!(app.pending.iter().all(|on| !*on));
+        press(&mut app, &mut fake, KeyCode::Enter);
+        assert_eq!(app.mode, Mode::Branches);
+        assert!(app.status.contains("at least one"));
     }
 
     #[test]
@@ -3198,5 +3305,145 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("no stash"), "{err}");
+    }
+
+    #[test]
+    fn the_modified_files_start_unselected_and_can_be_named() {
+        let branches_only: Vec<Source> = sources().into_iter().map(|(s, _)| s).collect();
+        let mut all = branches_only.clone();
+        all.push(Source {
+            name: restore::MODIFIED.into(),
+            remote: false,
+            note: "2 files with unstaged changes".into(),
+        });
+        let default = initial_sources(all.clone(), None, false).unwrap();
+        assert!(!default.last().unwrap().1, "not offered by default");
+        assert_eq!(default.iter().filter(|(_, on)| *on).count(), 2);
+        let named = initial_sources(all, Some(restore::MODIFIED), false).unwrap();
+        let on: Vec<&str> = named
+            .iter()
+            .filter(|(_, on)| *on)
+            .map(|(s, _)| s.name.as_str())
+            .collect();
+        assert_eq!(on, [restore::MODIFIED]);
+        let err = initial_sources(branches_only, Some(restore::MODIFIED), false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("no tracked file has unstaged changes"),
+            "{err}"
+        );
+    }
+
+    // The usual two branches plus the modified files, with the branches selected.
+    fn app_with_modified() -> (App, Fake) {
+        let mut srcs = sources();
+        srcs.push((
+            Source {
+                name: restore::MODIFIED.into(),
+                remote: false,
+                note: "1 file with unstaged changes".into(),
+            },
+            false,
+        ));
+        let mut fake = Fake::new();
+        let mut app = App::new(srcs);
+        app.use_history(fake.hist.clone());
+        app.load(&mut fake);
+        (app, fake)
+    }
+
+    // Move the overlay cursor to the source called `name`.
+    fn on_source(app: &mut App, fake: &mut Fake, name: &str) {
+        press(app, fake, ch('g'));
+        while app.sources[app.overlay_cursor].0.name != name {
+            press(app, fake, ch('j'));
+        }
+    }
+
+    #[test]
+    fn choosing_the_modified_files_deselects_everything_else_and_back() {
+        let (mut app, mut fake) = app_with_modified();
+        press(&mut app, &mut fake, KeyCode::Tab);
+        assert_eq!(app.pending, [true, true, false, false]);
+        on_source(&mut app, &mut fake, restore::MODIFIED);
+        press(&mut app, &mut fake, ch(' '));
+        assert_eq!(app.pending, [false, false, false, true]);
+        // Choosing a branch again drops the modified files.
+        on_source(&mut app, &mut fake, "one");
+        press(&mut app, &mut fake, ch(' '));
+        assert_eq!(app.pending, [true, false, false, false]);
+        // "all" never includes them, and clears them when it is pressed.
+        on_source(&mut app, &mut fake, restore::MODIFIED);
+        press(&mut app, &mut fake, ch(' '));
+        press(&mut app, &mut fake, ch('a'));
+        assert_eq!(app.pending, [true, true, true, false]);
+        press(&mut app, &mut fake, ch('a'));
+        assert_eq!(app.pending, [false, false, false, false]);
+    }
+
+    #[test]
+    fn leaving_the_overlay_with_the_modified_files_chosen_asks_first() {
+        let (mut app, mut fake) = app_with_modified();
+        let loads = fake.loads.len();
+        press(&mut app, &mut fake, KeyCode::Tab);
+        on_source(&mut app, &mut fake, restore::MODIFIED);
+        press(&mut app, &mut fake, ch(' '));
+        press(&mut app, &mut fake, KeyCode::Enter);
+        assert_eq!(app.mode, Mode::ConfirmModified);
+        assert_eq!(fake.loads.len(), loads, "nothing is read before the answer");
+        assert!(screen(&mut app, 120, 14).contains("discards its unstaged changes for good"));
+        // Other keys do nothing; n goes back to the overlay with the choice kept.
+        press(&mut app, &mut fake, ch('x'));
+        assert_eq!(app.mode, Mode::ConfirmModified);
+        press(&mut app, &mut fake, ch('n'));
+        assert_eq!(app.mode, Mode::Branches);
+        assert_eq!(app.pending, [false, false, false, true]);
+        assert_eq!(app.selected(), ["one", "two"], "still the branches");
+        // y makes it the selection and shows its files.
+        press(&mut app, &mut fake, KeyCode::Enter);
+        press(&mut app, &mut fake, ch('y'));
+        assert_eq!(app.mode, Mode::Browse);
+        assert_eq!(app.selected(), [restore::MODIFIED]);
+        assert_eq!(paths(&app), ["m.txt"]);
+    }
+
+    #[test]
+    fn no_question_when_the_modified_files_were_already_the_selection() {
+        let (mut app, mut fake) = app_with_modified();
+        press(&mut app, &mut fake, KeyCode::Tab);
+        on_source(&mut app, &mut fake, restore::MODIFIED);
+        press(&mut app, &mut fake, ch(' '));
+        press(&mut app, &mut fake, KeyCode::Enter);
+        press(&mut app, &mut fake, ch('y'));
+        press(&mut app, &mut fake, KeyCode::Tab);
+        press(&mut app, &mut fake, KeyCode::Enter);
+        assert_eq!(app.mode, Mode::Browse);
+        // Going to a branch needs no question either.
+        press(&mut app, &mut fake, KeyCode::Tab);
+        on_source(&mut app, &mut fake, "one");
+        press(&mut app, &mut fake, ch(' '));
+        press(&mut app, &mut fake, KeyCode::Enter);
+        assert_eq!(app.mode, Mode::Browse);
+        assert_eq!(app.selected(), ["one"]);
+    }
+
+    #[test]
+    fn the_final_question_for_modified_files_says_they_are_discarded() {
+        let (mut app, mut fake) = app_with_modified();
+        press(&mut app, &mut fake, KeyCode::Tab);
+        on_source(&mut app, &mut fake, restore::MODIFIED);
+        press(&mut app, &mut fake, ch(' '));
+        press(&mut app, &mut fake, KeyCode::Enter);
+        press(&mut app, &mut fake, ch('y'));
+        press(&mut app, &mut fake, ch(' '));
+        press(&mut app, &mut fake, KeyCode::Enter);
+        assert_eq!(app.mode, Mode::ConfirmApply);
+        let text = screen(&mut app, 120, 14);
+        assert!(
+            text.contains("Discard the unstaged changes to 1 file(s)"),
+            "{text}"
+        );
+        assert!(text.contains("cannot be brought back"), "{text}");
     }
 }

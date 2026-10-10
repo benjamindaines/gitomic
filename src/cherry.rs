@@ -564,6 +564,7 @@ pub fn run(cwd: &Path, opts: Opts) -> Res<()> {
                 dry_run: opts.dry_run,
                 patch_only: opts.patch_only,
                 stash: true,
+                merge: false,
             },
         );
     }
@@ -664,6 +665,22 @@ pub fn apply_specs(cwd: &Path, specs: Vec<Spec>, dry_run: bool, patch_only: bool
         return Err(crate::commands::blocked_by("cherry-pick", op).into());
     }
 
+    // Discards run first and alone: they touch no commit, so neither the watcher nor the capture
+    // below has anything to do for them, and a file discarded here is not captured as an edit by
+    // the restores that follow.
+    let (discards, specs): (Vec<Spec>, Vec<Spec>) =
+        specs.into_iter().partition(|s| !s.discard.is_empty());
+    let discarded: Vec<&str> = discards
+        .iter()
+        .flat_map(|s| s.discard.iter().map(String::as_str))
+        .collect();
+    if !discarded.is_empty() {
+        discard_unstaged(&root, &discarded, dry_run, patch_only)?;
+        if specs.is_empty() {
+            return Ok(());
+        }
+    }
+
     let writes = !dry_run && !patch_only;
     let was_live = writes
         && branch
@@ -730,6 +747,119 @@ pub fn apply_specs(cwd: &Path, specs: Vec<Spec>, dry_run: bool, patch_only: bool
         names.join(", ")
     )
     .into())
+}
+
+// Throw away the unstaged edits to `paths`, returning each file to its state in the index, which
+// is what `git restore <path>` does. Nothing is recorded: the point of the operation is to get
+// rid of changes (the files a build rewrote, say), so no commit is made and no session is needed;
+// the confirmation, where there is one, is the screen's. A dry run reports the diffstat of what
+// would go. A patch file cannot be written, since the edit is in no commit to build one from.
+fn discard_unstaged(root: &Path, paths: &[&str], dry_run: bool, patch_only: bool) -> Res<()> {
+    if patch_only {
+        return Err(
+            "restore: --patch-only has no patch to write for unstaged changes, which are \
+                    discarded in place; -n/--dry-run shows what would go"
+                .into(),
+        );
+    }
+    if dry_run {
+        println!("gitomic: dry run; these unstaged changes would be discarded:");
+    }
+    for chunk in paths.chunks(256) {
+        let mut args = vec!["--literal-pathspecs"];
+        args.extend(if dry_run {
+            ["diff", "--stat", "--"]
+        } else {
+            ["restore", "--worktree", "--"]
+        });
+        args.extend(chunk.iter().copied());
+        let out = git::run(root, &args)?;
+        if dry_run && !out.is_empty() {
+            println!("{out}");
+        }
+    }
+    if dry_run {
+        println!("gitomic: dry run; nothing was modified");
+        return Ok(());
+    }
+    println!(
+        "gitomic: discarded the unstaged changes to {} file(s):",
+        paths.len()
+    );
+    for p in paths {
+        println!("  {p}");
+    }
+    println!("  nothing was recorded; the changes are gone");
+    Ok(())
+}
+
+// Write finished file contents into the work tree, one atomic commit per file when a session is open
+// (`gitomic drop` undoes each), otherwise leaving them uncommitted. Pending edits to tracked files are
+// recorded first in a session, so the state a file had before it was overwritten stays recoverable. A live
+// watcher is stopped for the duration and restarted afterwards, as for every other write of this kind.
+// `what` names the origin of the contents in the messages. Each entry is (path relative to the top of the
+// work tree, new bytes).
+pub fn apply_contents(cwd: &Path, files: Vec<(String, Vec<u8>)>, what: &str) -> Res<()> {
+    let root = git::work_tree(cwd)?;
+    let git_dir = git::git_dir(cwd)?;
+    let branch = git::current_branch(&root).ok();
+    if let Some(op) = git::operation_kind(&git_dir) {
+        return Err(crate::commands::blocked_by("restore", op).into());
+    }
+    let was_live = branch
+        .as_deref()
+        .is_some_and(|b| live_watcher(&git_dir, b).is_some());
+    if was_live {
+        let b = branch.as_deref().unwrap_or_default();
+        let cfg = Config::load()?;
+        terminate_watcher(&git_dir, b)?;
+        report_flush(&root, &git_dir, b, &cfg);
+    }
+    let in_session = match branch.as_deref() {
+        Some(b) => git::rev_exists(&root, &git::base_ref(b))?,
+        None => false,
+    };
+    if in_session {
+        capture_tracked(&root, &git_dir);
+    }
+    let mut failed = Vec::new();
+    for (path, bytes) in &files {
+        let target = root.join(path);
+        let written = match target.parent() {
+            Some(dir) => std::fs::create_dir_all(dir).and_then(|()| std::fs::write(&target, bytes)),
+            None => std::fs::write(&target, bytes),
+        };
+        if let Err(e) = written {
+            println!("gitomic: {path} was not written: {e}");
+            failed.push(path.clone());
+            continue;
+        }
+        println!("gitomic: {path} merged with {what}");
+        if in_session {
+            match git::commit_only(&root, &[path.as_str()]) {
+                Ok(Some(sha)) => println!(
+                    "gitomic: recorded as {}\n  undo with: gitomic drop {}",
+                    short(&sha),
+                    short(&sha)
+                ),
+                Ok(None) => println!("gitomic: the merge left no change to record"),
+                Err(e) => println!("gitomic: {path} was written but not recorded: {e}"),
+            }
+        }
+    }
+    if !in_session && failed.len() < files.len() {
+        println!("gitomic: written to the work tree; the change is not committed");
+    }
+    if was_live {
+        if let Err(e) = commands::init(cwd, false, false) {
+            eprintln!("gitomic: restore: watcher could not be restarted: {e}");
+        }
+    }
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("not written: {}", failed.join(", ")).into())
+    }
 }
 
 // Record pending changes to tracked files as one atomic commit. A capture that is skipped or fails

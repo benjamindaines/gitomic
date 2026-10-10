@@ -686,6 +686,20 @@ fn draw_unit(f: &mut Frame, app: &App, area: Rect) {
     );
 }
 
+// Run the decision screen over files built elsewhere (restore --merge) and return them with every unit
+// decided, or None when the operator left without submitting. Requires a terminal on both ends.
+pub fn decide_files(
+    files: Vec<Conflicted>,
+    labels: (String, String),
+) -> Res<Option<Vec<Conflicted>>> {
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        return Err("the decision screen needs a terminal".into());
+    }
+    let mut app = App::new(files, labels);
+    let done = with_terminal(|t| event_loop(t, &mut app))?;
+    Ok(done.then_some(app.files))
+}
+
 // Returns true when the operator submitted a complete set of decisions.
 fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Res<bool> {
     loop {

@@ -32,6 +32,7 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use crate::cherry;
+use crate::conflict;
 use crate::patch::{self, Spec};
 use crate::{git, Res};
 
@@ -53,6 +54,10 @@ impl Source {
     pub fn is_stash(&self) -> bool {
         is_stash(&self.name)
     }
+
+    pub fn is_modified(&self) -> bool {
+        is_modified(&self.name)
+    }
 }
 
 // The revision a `--stash` argument names: a bare number N stands for `stash@{N}`, anything else is
@@ -63,6 +68,18 @@ pub fn stash_ref(arg: &str) -> String {
     } else {
         arg.to_string()
     }
+}
+
+// Name of the pseudo-source that offers tracked files that are modified or deleted in the work
+// tree and not staged. The name contains a space and parentheses, which no ref name can, so it cannot collide
+// with a branch or stash. Its version of a file is the content in the index, i.e. the state
+// `git restore <path>` returns the file to. Choosing one discards the edit in place (see
+// `Spec::discard`); no commit is made and no session is needed.
+pub const MODIFIED: &str = "(modified)";
+
+// Whether a source name designates the modified-files pseudo-source rather than a branch or stash.
+pub fn is_modified(name: &str) -> bool {
+    name == MODIFIED
 }
 
 // One file as it is at the tip of one branch.
@@ -380,8 +397,99 @@ pub fn sources(cwd: &Path) -> Res<Vec<Source>> {
             note: String::new(),
         })
         .collect();
+    let (modified, _) = read_modified(&root)?;
+    if !modified.is_empty() {
+        out.push(Source {
+            name: MODIFIED.to_string(),
+            remote: false,
+            note: format!(
+                "{} with unstaged changes; restoring discards them for good",
+                count_files(modified.len())
+            ),
+        });
+    }
     out.extend(stashes(&root)?);
     Ok(out)
+}
+
+// "1 file" or "N files".
+fn count_files(n: usize) -> String {
+    if n == 1 {
+        "1 file".to_string()
+    } else {
+        format!("{n} files")
+    }
+}
+
+// The tracked files whose work-tree content differs from the index, modified or deleted, as
+// (path, blob in the index), with the count of entries left out (submodules and paths that are not
+// UTF-8). Type changes are not listed: git reports them apart. The index blob, not the HEAD blob,
+// is what a restore returns to, so that staged work survives.
+fn read_modified(root: &Path) -> Res<(Vec<(String, String)>, usize)> {
+    let raw = git_bytes(
+        root,
+        &[
+            "diff",
+            "--raw",
+            "-z",
+            "--no-abbrev",
+            "--no-renames",
+            "--no-ext-diff",
+            "--diff-filter=MD",
+        ],
+    )?;
+    let mut out = Vec::new();
+    let mut skipped = 0;
+    let mut fields = raw.split(|b| *b == 0).filter(|r| !r.is_empty());
+    while let Some(meta) = fields.next() {
+        let Some(path) = fields.next() else {
+            break;
+        };
+        let (Ok(meta), Ok(path)) = (std::str::from_utf8(meta), std::str::from_utf8(path)) else {
+            skipped += 1;
+            continue;
+        };
+        let f: Vec<&str> = meta.trim_start_matches(':').split(' ').collect();
+        let [old_mode, new_mode, old, _new, _status] = f[..] else {
+            continue;
+        };
+        if old_mode == "160000" || new_mode == "160000" {
+            skipped += 1;
+            continue;
+        }
+        out.push((path.to_string(), old.to_string()));
+    }
+    Ok((out, skipped))
+}
+
+// The blob each of `paths` has at `head`; paths that HEAD lacks are absent from the map.
+fn head_blobs(root: &Path, head: &str, paths: &[String]) -> Res<HashMap<String, String>> {
+    let mut map = HashMap::new();
+    for chunk in paths.chunks(PATH_CHUNK) {
+        let mut args = vec![
+            "--literal-pathspecs",
+            "ls-tree",
+            "-r",
+            "-z",
+            "--full-tree",
+            head,
+            "--",
+        ];
+        args.extend(chunk.iter().map(String::as_str));
+        let raw = git_bytes(root, &args)?;
+        for rec in raw.split(|b| *b == 0).filter(|r| !r.is_empty()) {
+            // `<mode> SP <type> SP <blob> TAB <path>`
+            let Ok(rec) = std::str::from_utf8(rec) else {
+                continue;
+            };
+            if let Some((meta, path)) = rec.split_once('\t') {
+                if let Some(blob) = meta.split(' ').nth(2) {
+                    map.insert(path.to_string(), blob.to_string());
+                }
+            }
+        }
+    }
+    Ok(map)
 }
 
 // The differences between HEAD and several branches, read on demand and kept.
@@ -454,9 +562,41 @@ impl Index {
         })
     }
 
+    // The work tree's unstaged edits, offered as a return to the index. Every listed path is one
+    // whose work-tree content differs from the index, so, unlike a branch, a listed version may equal
+    // HEAD (nothing is staged); the entry's `head` blob is kept for the comparison all the same.
+    // There is no commit to read the versions from, and none is needed: nothing is applied from
+    // them, the edit is discarded in place. `Version::commit` is HEAD, which previews and the size
+    // check do not read for this source. Nothing here changes the index or the work tree beyond
+    // what `git diff` does in refreshing stat data.
+    fn modified_tip(&mut self) -> Res<Tip> {
+        let (modified, skipped) = read_modified(&self.root)?;
+        self.skipped = self.skipped.max(skipped);
+        let paths: Vec<String> = modified.iter().map(|(p, _)| p.clone()).collect();
+        let heads = head_blobs(&self.root, &self.head, &paths)?;
+        let changes: Vec<Change> = modified
+            .into_iter()
+            .map(|(path, blob)| Change {
+                old: heads.get(&path).cloned(),
+                path,
+                blob,
+                from: None,
+            })
+            .collect();
+        Ok(Tip {
+            commit: Arc::from(self.head.as_str()),
+            changes: Arc::new(changes),
+            untracked: None,
+        })
+    }
+
     fn tip(&mut self, source: &str) -> Res<&Tip> {
         if is_stash(source) && !self.tips.contains_key(source) {
             let tip = self.stash_tip(source)?;
+            self.tips.insert(source.to_string(), tip);
+        }
+        if is_modified(source) && !self.tips.contains_key(source) {
+            let tip = self.modified_tip()?;
             self.tips.insert(source.to_string(), tip);
         }
         if !self.tips.contains_key(source) {
@@ -500,8 +640,8 @@ impl Index {
         let mut out = Vec::new();
         for s in sources {
             // A stash has no history of its own to read; its parents belong to the branch it was
-            // made on.
-            if is_stash(s) {
+            // made on. The modified files are the work tree's, with no history either.
+            if is_stash(s) || is_modified(s) {
                 continue;
             }
             out.push((s.clone(), Arc::clone(&self.tip(s)?.commit)));
@@ -582,7 +722,13 @@ impl Index {
                     (tip.commit.clone(), tip.untracked.clone())
                 };
                 let mut set = HashSet::new();
-                if is_stash(s) {
+                if is_modified(s) {
+                    // The change a restore makes is index to work tree, not HEAD to a commit.
+                    set = numstat_binary(&git_bytes(
+                        &self.root,
+                        &["diff", "--numstat", "-z", "--no-renames", "--no-ext-diff"],
+                    )?);
+                } else if is_stash(s) {
                     // Against its own base, since only the paths the stash changed are listed.
                     let base = format!("{commit}^1");
                     set.extend(numstat_binary(&git_bytes(
@@ -654,21 +800,17 @@ pub fn diff_text(
     cancel: Option<&git::Cancel>,
 ) -> Res<String> {
     let literal = format!(":(literal){path}");
-    let out = git::run_capped(
-        root,
-        &[
-            "diff",
-            "--no-color",
-            "--no-ext-diff",
-            "--no-renames",
-            "HEAD",
-            &version.commit,
-            "--",
-            &literal,
-        ],
-        MAX_DIFF_BYTES,
-        cancel,
-    )?;
+    // A modified file goes back to its staged state, so the change shown is work tree to index
+    // (`-R` turns the diff of the index against the work tree around); anything else is restored
+    // onto HEAD.
+    let mut args = vec!["diff", "--no-color", "--no-ext-diff", "--no-renames"];
+    if is_modified(&version.source) {
+        args.push("-R");
+    } else {
+        args.extend(["HEAD", &*version.commit]);
+    }
+    args.extend(["--", literal.as_str()]);
+    let out = git::run_capped(root, &args, MAX_DIFF_BYTES, cancel)?;
     let mut text = out.text;
     if out.truncated {
         text.push_str("\n... (truncated)\n");
@@ -890,6 +1032,14 @@ pub fn deleted_files(
 // The recipe for restoring `path` from `version` onto the current HEAD. Each file is its own
 // spec, hence its own patch, so a file that cannot be applied does not hold up the others.
 pub fn spec_for(root: &Path, version: &Version, path: &str) -> Res<Spec> {
+    // Unstaged edits have no commit to restore from; the spec says to discard them.
+    if is_modified(&version.source) {
+        return Ok(Spec {
+            base: git::rev_parse(root, "HEAD")?,
+            discard: vec![path.to_string()],
+            ..Spec::default()
+        });
+    }
     Ok(Spec {
         base: git::rev_parse(root, "HEAD")?,
         restore: vec![(version.commit.to_string(), path.to_string())],
@@ -907,6 +1057,9 @@ pub struct Opts {
     // Take the files from a stash: `from` then names one (`stash@{N}`, or just N), and without it
     // the screen opens with every stash selected and named paths come from `stash@{0}`.
     pub stash: bool,
+    // Merge each named file with the work-tree copy change by change instead of overwriting it. Needs
+    // paths and a terminal; the source is read as for any restore and is never altered.
+    pub merge: bool,
 }
 
 // Names relative to the directory the command was run in, as `git` does, become paths relative to
@@ -933,6 +1086,20 @@ pub(crate) fn from_top(cwd: &Path, given: &str) -> Res<String> {
 // branches disagree the choice is refused and the branches are listed.
 fn spec_from_paths(cwd: &Path, opts: &Opts) -> Res<Vec<Spec>> {
     let root = git::work_tree(cwd)?;
+    let picks = picks_from_paths(cwd, opts)?;
+    let mut specs = Vec::new();
+    for (i, (version, path)) in picks.iter().enumerate() {
+        if picks[..i].iter().any(|(_, p)| p == path) {
+            continue;
+        }
+        specs.push(spec_for(&root, version, path)?);
+    }
+    Ok(specs)
+}
+
+// The version of each named path that a restore would take, in the order named.
+fn picks_from_paths(cwd: &Path, opts: &Opts) -> Res<Vec<(Version, String)>> {
+    let root = git::work_tree(cwd)?;
     let mut index = Index::open(&root)?;
     let mut picks: Vec<(Version, String)> = Vec::new();
     match &opts.from {
@@ -943,6 +1110,10 @@ fn spec_from_paths(cwd: &Path, opts: &Opts) -> Res<Vec<Spec>> {
                 let path = from_top(cwd, given)?;
                 let version = match entries.iter().find(|e| e.path == path) {
                     Some(entry) => entry.versions[0].clone(),
+                    // A file without unstaged edits has nothing to discard.
+                    None if is_modified(rev) => {
+                        return Err(format!("restore: {path} has no unstaged changes").into())
+                    }
                     // Not listed: absent on the branch, or identical to HEAD.
                     None => index
                         .version_at(rev, &path)?
@@ -994,14 +1165,106 @@ fn spec_from_paths(cwd: &Path, opts: &Opts) -> Res<Vec<Spec>> {
             }
         }
     }
-    let mut specs = Vec::new();
+    Ok(picks)
+}
+
+// True when the bytes look like binary content, by the rule git applies: a NUL in the first 8000 bytes.
+fn looks_binary(bytes: &[u8]) -> bool {
+    bytes[..bytes.len().min(8000)].contains(&0)
+}
+
+// The files a change-by-change merge would decide, each as a screen entry, together with the paths
+// that need no decision. A file is refused, with the reason, when it cannot be merged by lines: binary
+// content on either side, or no work-tree copy to merge into.
+fn merge_entries(
+    cwd: &Path,
+    picks: &[(Version, String)],
+) -> Res<(Vec<crate::resolve::Conflicted>, Vec<String>)> {
+    let root = git::work_tree(cwd)?;
+    let mut entries = Vec::new();
+    let mut same = Vec::new();
     for (i, (version, path)) in picks.iter().enumerate() {
         if picks[..i].iter().any(|(_, p)| p == path) {
             continue;
         }
-        specs.push(spec_for(&root, version, path)?);
+        let ours = std::fs::read(root.join(path)).map_err(|_| {
+            format!("restore --merge: {path} is not in the work tree; restore it whole instead")
+        })?;
+        let theirs = git::cat_blob(&root, &version.blob)?;
+        if looks_binary(&ours) || looks_binary(&theirs) {
+            return Err(format!(
+                "restore --merge: {path} is binary; it can only be restored whole"
+            )
+            .into());
+        }
+        let segs = conflict::diff_segments(&ours, &theirs);
+        if conflict::hunk_count(&segs) == 0 {
+            same.push(path.clone());
+        } else {
+            entries.push(crate::resolve::Conflicted {
+                path: path.clone(),
+                body: crate::resolve::Body::Hunks(segs),
+            });
+        }
     }
-    Ok(specs)
+    Ok((entries, same))
+}
+
+// `restore --merge`: decide, change by change, what of the source's copy to take and what of the work-tree
+// copy to keep. Side A of each hunk is the work tree, side B the source. Nothing is written until every
+// change of every file is decided, and the source (a stash included) is only read.
+fn merge_run(cwd: &Path, opts: &Opts) -> Res<()> {
+    if opts.paths.is_empty() {
+        return Err("restore --merge: name the files to merge".into());
+    }
+    if opts.patch_only {
+        return Err("restore --merge: no patch file is written for a merge".into());
+    }
+    let picks = picks_from_paths(cwd, opts)?;
+    let (entries, same) = merge_entries(cwd, &picks)?;
+    for path in &same {
+        println!("gitomic: {path} is already identical to the source; nothing to merge");
+    }
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let from = picks
+        .first()
+        .map(|(v, _)| v.source.to_string())
+        .unwrap_or_default();
+    if opts.dry_run {
+        for e in &entries {
+            println!(
+                "gitomic: {} would ask about {} change(s)",
+                e.path,
+                e.units()
+            );
+        }
+        println!("gitomic: dry run; nothing was modified");
+        return Ok(());
+    }
+    let labels = (
+        "A  the work tree copy (kept unless B is chosen)".to_string(),
+        format!("B  {from} (taken when chosen)"),
+    );
+    let Some(decided) = crate::resolve::decide_files(entries, labels)? else {
+        println!("gitomic: nothing merged");
+        return Ok(());
+    };
+    let mut out = Vec::new();
+    for c in &decided {
+        let crate::resolve::Body::Hunks(segs) = &c.body else {
+            continue;
+        };
+        let bytes = conflict::render(segs).ok_or_else(|| {
+            format!(
+                "restore --merge: {} is undecided; nothing was written",
+                c.path
+            )
+        })?;
+        out.push((c.path.clone(), bytes));
+    }
+    cherry::apply_contents(cwd, out, &from)
 }
 
 // Entry point for the command.
@@ -1017,6 +1280,12 @@ pub fn run(cwd: &Path, mut opts: Opts) -> Res<()> {
         if !opts.from.as_deref().is_none_or(is_stash) {
             return Err("restore: --from must name a stash (stash@{N}, or N) with --stash".into());
         }
+    }
+    if opts.merge {
+        if opts.stash && opts.from.is_none() {
+            opts.from = Some("stash@{0}".to_string());
+        }
+        return merge_run(cwd, &opts);
     }
     let specs = if opts.paths.is_empty() {
         match crate::restore_ui::run(cwd, opts.from.as_deref(), opts.stash)? {
@@ -1167,6 +1436,7 @@ mod tests {
             dry_run: false,
             patch_only: false,
             stash: false,
+            merge: false,
         }
     }
 
@@ -1858,5 +2128,374 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("not a stash"), "{err}");
+    }
+
+    // `main` holds a.txt, b.txt, c.txt, gone.txt and bin.dat. Unstaged changes: a.txt (only in the
+    // work tree), c.txt (staged as c-staged, then edited again), bin.dat (binary), gone.txt
+    // (deleted); b.txt is edited and staged only; untracked.txt is new. So the listed files are
+    // a.txt, bin.dat, c.txt and gone.txt.
+    fn edited() -> Repo {
+        let r = Repo::new();
+        for f in ["a.txt", "b.txt", "c.txt", "gone.txt"] {
+            r.write(f, &format!("{f}\n"));
+        }
+        std::fs::write(r.0.join("bin.dat"), [0u8, 1, 2, 3]).unwrap();
+        r.git(&["add", "."]);
+        r.git(&["commit", "-q", "-m", "base"]);
+        r.write("a.txt", "a-edited\n");
+        r.write("b.txt", "b-staged\n");
+        r.git(&["add", "b.txt"]);
+        r.write("c.txt", "c-staged\n");
+        r.git(&["add", "c.txt"]);
+        r.write("c.txt", "c-edited\n");
+        std::fs::write(r.0.join("bin.dat"), [0u8, 9, 9, 9]).unwrap();
+        std::fs::remove_file(r.0.join("gone.txt")).unwrap();
+        r.write("untracked.txt", "u\n");
+        r
+    }
+
+    fn modified_opts(paths: &[&str]) -> Opts {
+        opts(Some(MODIFIED), paths)
+    }
+
+    fn open_session(r: &Repo) {
+        r.git(&["update-ref", "refs/gitomic/base/main", "HEAD"]);
+    }
+
+    #[test]
+    fn the_modified_files_are_offered_only_when_there_are_some() {
+        let r = edited();
+        let s = sources(&r.0).unwrap();
+        let m = s.iter().find(|s| s.is_modified()).expect("offered");
+        assert_eq!(
+            m.note,
+            "4 files with unstaged changes; restoring discards them for good"
+        );
+        assert!(!m.remote && !m.is_stash());
+        r.git(&["checkout", "-q", "--", "."]);
+        assert!(!sources(&r.0).unwrap().iter().any(|s| s.is_modified()));
+    }
+
+    #[test]
+    fn only_tracked_files_with_unstaged_edits_are_listed_at_their_staged_state() {
+        let r = edited();
+        let mut idx = Index::open(&r.0).unwrap();
+        let e = idx.entries(&names(&[MODIFIED])).unwrap();
+        let paths: Vec<&str> = e.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            ["a.txt", "bin.dat", "c.txt", "gone.txt"],
+            "not b (staged only) or the untracked file"
+        );
+        let a = &e[0];
+        assert_eq!(a.versions.len(), 1);
+        assert_eq!(a.versions[0].blob, r.git(&["rev-parse", "HEAD:a.txt"]));
+        assert_eq!(a.head.as_deref(), Some(a.versions[0].blob.as_str()));
+        assert_eq!(a.state(), State::Differs);
+        // c.txt's version is the staged content, which is not HEAD's.
+        let c = e.iter().find(|e| e.path == "c.txt").unwrap();
+        assert_eq!(c.versions[0].blob, r.git(&["rev-parse", ":c.txt"]));
+        assert_ne!(Some(c.versions[0].blob.as_str()), c.head.as_deref());
+    }
+
+    #[test]
+    fn the_version_commit_is_always_head() {
+        let r = Repo::new();
+        r.commit_file("a.txt", "a\n", "base");
+        r.write("a.txt", "a2\n");
+        let mut idx = Index::open(&r.0).unwrap();
+        let e = idx.entries(&names(&[MODIFIED])).unwrap();
+        assert_eq!(&*e[0].versions[0].commit, r.head());
+    }
+
+    #[test]
+    fn modified_files_have_no_history_and_binary_ones_are_found() {
+        let r = edited();
+        let mut idx = Index::open(&r.0).unwrap();
+        assert!(idx.tips(&names(&[MODIFIED])).unwrap().is_empty());
+        let bin = idx.binary_paths(&names(&[MODIFIED])).unwrap();
+        assert_eq!(bin.into_iter().collect::<Vec<_>>(), ["bin.dat"]);
+    }
+
+    #[test]
+    fn the_preview_shows_the_work_tree_turning_back_into_the_staged_state() {
+        let r = edited();
+        let mut idx = Index::open(&r.0).unwrap();
+        let e = idx.entries(&names(&[MODIFIED])).unwrap();
+        let c = e.iter().find(|e| e.path == "c.txt").unwrap();
+        let text = diff_text(&r.0, &c.versions[0], "c.txt", None).unwrap();
+        assert!(
+            text.contains("-c-edited") && text.contains("+c-staged"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn named_files_go_back_and_nothing_else_is_touched_or_recorded() {
+        let r = edited();
+        let head = r.head();
+        run(&r.0, modified_opts(&["a.txt"])).unwrap();
+        assert_eq!(r.read("a.txt"), "a.txt\n");
+        // No commit, and the other edits stay where they were.
+        assert_eq!(r.head(), head);
+        assert_eq!(r.read("c.txt"), "c-edited\n");
+        assert_eq!(r.read("b.txt"), "b-staged\n");
+        assert_eq!(r.read("untracked.txt"), "u\n");
+        assert_eq!(r.git(&["diff", "--cached", "--name-only"]), "b.txt\nc.txt");
+        assert!(patch_files(&r).is_empty(), "no patch file is written");
+    }
+
+    // The patch files in the repository's patch directory.
+    fn patch_files(r: &Repo) -> Vec<String> {
+        std::fs::read_dir(patch::patch_dir(&r.0.join(".git")))
+            .map(|d| {
+                d.filter_map(|e| e.ok())
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn a_file_with_staged_work_returns_to_the_staged_state_not_to_head() {
+        let r = edited();
+        run(&r.0, modified_opts(&["c.txt"])).unwrap();
+        assert_eq!(r.read("c.txt"), "c-staged\n");
+        assert_eq!(r.git(&["show", ":c.txt"]), "c-staged");
+        assert_eq!(r.git(&["show", "HEAD:c.txt"]), "c.txt");
+    }
+
+    #[test]
+    fn it_works_with_or_without_a_session_and_records_nothing_either_way() {
+        for session in [false, true] {
+            let r = edited();
+            if session {
+                open_session(&r);
+            }
+            let head = r.head();
+            run(&r.0, modified_opts(&["a.txt", "bin.dat"])).unwrap();
+            assert_eq!(r.read("a.txt"), "a.txt\n");
+            assert_eq!(std::fs::read(r.0.join("bin.dat")).unwrap(), [0u8, 1, 2, 3]);
+            assert_eq!(r.head(), head, "session: {session}");
+        }
+    }
+
+    #[test]
+    fn the_spec_of_a_modified_file_discards_it_and_names_no_commit() {
+        let r = edited();
+        let mut idx = Index::open(&r.0).unwrap();
+        let e = idx.entries(&names(&[MODIFIED])).unwrap();
+        let spec = spec_for(&r.0, &e[0].versions[0], "a.txt").unwrap();
+        assert_eq!(spec.discard, ["a.txt"]);
+        assert!(spec.restore.is_empty() && spec.picks.is_empty());
+    }
+
+    #[test]
+    fn a_file_without_unstaged_edits_is_refused() {
+        let r = edited();
+        open_session(&r);
+        for f in ["b.txt", "untracked.txt", "nope.txt"] {
+            let err = run(&r.0, modified_opts(&[f])).unwrap_err().to_string();
+            assert!(err.contains("no unstaged changes"), "{f}: {err}");
+        }
+        assert_eq!(r.read("a.txt"), "a-edited\n");
+    }
+
+    #[test]
+    fn a_dry_run_changes_nothing_and_a_patch_only_run_is_refused() {
+        let r = edited();
+        open_session(&r);
+        let head = r.head();
+        let mut o = modified_opts(&["a.txt"]);
+        o.dry_run = true;
+        run(&r.0, o).unwrap();
+        assert_eq!(r.read("a.txt"), "a-edited\n");
+        assert_eq!(r.head(), head);
+        let mut o = modified_opts(&["a.txt"]);
+        o.patch_only = true;
+        assert!(run(&r.0, o).is_err());
+        assert_eq!(r.read("a.txt"), "a-edited\n");
+    }
+
+    // A stash holding edits to lines 2 and 8 of a ten-line file, taken before HEAD gained edits to lines 5
+    // and 8 of the same file.
+    fn merge_case() -> Repo {
+        let r = Repo::new();
+        r.commit_file("f.txt", &Repo::lines(), "base");
+        r.write("f.txt", &Repo::lines_with(&[(2, "S2"), (8, "S8")]));
+        r.git(&["stash", "push", "-q", "-m", "mine"]);
+        r.commit_file("f.txt", &Repo::lines_with(&[(5, "W5"), (8, "W8")]), "drift");
+        r
+    }
+
+    fn merge_opts(paths: &[&str]) -> Opts {
+        Opts {
+            merge: true,
+            ..stash_opts(None, paths)
+        }
+    }
+
+    // Answer the screen's units in order with the given keys, as an operator would, and return the files.
+    fn answered(
+        entries: Vec<crate::resolve::Conflicted>,
+        keys: &str,
+    ) -> Vec<crate::resolve::Conflicted> {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = crate::resolve::App::new(entries, (String::new(), String::new()));
+        for c in keys.chars() {
+            app.key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        assert_eq!(app.remaining(), 0);
+        app.files
+    }
+
+    fn merged_bytes(files: &[crate::resolve::Conflicted]) -> Vec<(String, Vec<u8>)> {
+        files
+            .iter()
+            .map(|c| match &c.body {
+                crate::resolve::Body::Hunks(segs) => {
+                    (c.path.clone(), conflict::render(segs).unwrap())
+                }
+                _ => unreachable!(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_stashed_file_is_compared_with_the_work_tree_change_by_change() {
+        let r = merge_case();
+        let picks = picks_from_paths(&r.0, &merge_opts_from_stash(&["f.txt"])).unwrap();
+        let (entries, same) = merge_entries(&r.0, &picks).unwrap();
+        assert!(same.is_empty());
+        assert_eq!(entries.len(), 1);
+        // Lines 2, 5 and 8 differ between the work tree and the stash.
+        assert_eq!(entries[0].units(), 3);
+    }
+
+    fn merge_opts_from_stash(paths: &[&str]) -> Opts {
+        Opts {
+            from: Some("stash@{0}".to_string()),
+            ..merge_opts(paths)
+        }
+    }
+
+    #[test]
+    fn each_change_is_taken_or_kept_on_its_own_and_the_stash_is_untouched() {
+        let r = merge_case();
+        let stash = r.git(&["rev-parse", "stash@{0}"]);
+        let picks = picks_from_paths(&r.0, &merge_opts_from_stash(&["f.txt"])).unwrap();
+        let (entries, _) = merge_entries(&r.0, &picks).unwrap();
+        // Take the stash's line 2, keep the work tree's line 5, keep the work tree's line 8.
+        let files = answered(entries, "baa");
+        cherry::apply_contents(&r.0, merged_bytes(&files), "stash@{0}").unwrap();
+        assert_eq!(
+            r.read("f.txt"),
+            Repo::lines_with(&[(2, "S2"), (5, "W5"), (8, "W8")])
+        );
+        assert_eq!(r.git(&["rev-parse", "stash@{0}"]), stash);
+        assert_eq!(r.git(&["stash", "list"]).lines().count(), 1);
+    }
+
+    #[test]
+    fn both_sides_of_a_change_can_be_kept() {
+        let r = merge_case();
+        let picks = picks_from_paths(&r.0, &merge_opts_from_stash(&["f.txt"])).unwrap();
+        let (entries, _) = merge_entries(&r.0, &picks).unwrap();
+        let files = answered(entries, "aac");
+        cherry::apply_contents(&r.0, merged_bytes(&files), "stash@{0}").unwrap();
+        assert!(r.read("f.txt").contains("W8\nS8\n"), "{}", r.read("f.txt"));
+    }
+
+    #[test]
+    fn in_a_session_the_merge_is_one_commit_after_the_pending_edits_are_captured() {
+        let r = merge_case();
+        r.git(&["update-ref", "refs/gitomic/base/main", "HEAD"]);
+        let head = r.head();
+        // A pending edit to another tracked line must be recorded first, not swallowed by the merge.
+        r.write(
+            "f.txt",
+            &Repo::lines_with(&[(5, "W5"), (8, "W8"), (10, "PENDING")]),
+        );
+        let picks = picks_from_paths(&r.0, &merge_opts_from_stash(&["f.txt"])).unwrap();
+        let (entries, _) = merge_entries(&r.0, &picks).unwrap();
+        let files = answered(entries, "bbbb");
+        cherry::apply_contents(&r.0, merged_bytes(&files), "stash@{0}").unwrap();
+        assert_eq!(
+            r.git(&["rev-list", "--count", &format!("{head}..HEAD")]),
+            "2"
+        );
+        // The first of the two commits holds the pending edit, the second the merge.
+        assert!(r.git(&["show", "HEAD~1:f.txt"]).contains("PENDING"));
+        assert!(!r.git(&["show", "HEAD:f.txt"]).contains("PENDING"));
+        assert!(r.git(&["show", "HEAD:f.txt"]).contains("S2"));
+    }
+
+    #[test]
+    fn outside_a_session_the_merge_is_left_uncommitted() {
+        let r = merge_case();
+        let head = r.head();
+        let picks = picks_from_paths(&r.0, &merge_opts_from_stash(&["f.txt"])).unwrap();
+        let (entries, _) = merge_entries(&r.0, &picks).unwrap();
+        let files = answered(entries, "bbb");
+        cherry::apply_contents(&r.0, merged_bytes(&files), "stash@{0}").unwrap();
+        assert_eq!(r.head(), head);
+        assert!(r.git(&["status", "--porcelain"]).contains("f.txt"));
+    }
+
+    #[test]
+    fn a_file_the_stash_holds_unchanged_needs_no_decision() {
+        let r = merge_case();
+        r.write("f.txt", &Repo::lines_with(&[(2, "S2"), (8, "S8")]));
+        let picks = picks_from_paths(&r.0, &merge_opts_from_stash(&["f.txt"])).unwrap();
+        let (entries, same) = merge_entries(&r.0, &picks).unwrap();
+        assert!(entries.is_empty());
+        assert_eq!(same, ["f.txt"]);
+    }
+
+    #[test]
+    fn binary_and_missing_files_are_refused_with_a_reason() {
+        let r = stashed();
+        let picks = picks_from_paths(&r.0, &merge_opts_from_stash(&["bin.dat"])).unwrap();
+        let err = merge_entries(&r.0, &picks).unwrap_err().to_string();
+        assert!(err.contains("binary"), "{err}");
+
+        // new.txt exists only in the stash; the work tree has no copy to merge into.
+        let picks = picks_from_paths(&r.0, &merge_opts_from_stash(&["new.txt"])).unwrap();
+        let err = merge_entries(&r.0, &picks).unwrap_err().to_string();
+        assert!(err.contains("not in the work tree"), "{err}");
+    }
+
+    #[test]
+    fn merge_needs_paths_and_has_no_patch_only_form() {
+        let r = merge_case();
+        let err = run(&r.0, merge_opts(&[])).unwrap_err().to_string();
+        assert!(err.contains("name the files"), "{err}");
+        let mut o = merge_opts(&["f.txt"]);
+        o.patch_only = true;
+        let err = run(&r.0, o).unwrap_err().to_string();
+        assert!(err.contains("patch"), "{err}");
+    }
+
+    #[test]
+    fn a_dry_run_reports_the_changes_and_writes_nothing() {
+        let r = merge_case();
+        let before = r.read("f.txt");
+        let mut o = merge_opts(&["f.txt"]);
+        o.dry_run = true;
+        run(&r.0, o).unwrap();
+        assert_eq!(r.read("f.txt"), before);
+    }
+
+    #[test]
+    fn a_deleted_file_comes_back_and_is_previewed_as_returning() {
+        let r = edited();
+        let mut idx = Index::open(&r.0).unwrap();
+        let e = idx.entries(&names(&[MODIFIED])).unwrap();
+        let gone = e.iter().find(|e| e.path == "gone.txt").unwrap();
+        let text = diff_text(&r.0, &gone.versions[0], "gone.txt", None).unwrap();
+        assert!(text.contains("+gone.txt"), "{text}");
+        run(&r.0, modified_opts(&["gone.txt"])).unwrap();
+        assert_eq!(r.read("gone.txt"), "gone.txt\n");
+        assert_eq!(r.read("a.txt"), "a-edited\n", "the other changes stay");
     }
 }

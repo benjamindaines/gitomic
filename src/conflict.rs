@@ -226,6 +226,134 @@ pub fn render(segments: &[Segment]) -> Option<Vec<u8>> {
     Some(out)
 }
 
+// Largest product of line counts, after the common head and tail are set aside, for which the exact
+// longest-common-subsequence table is built (4 bytes a cell). Beyond it the differing middle becomes one
+// hunk: coarser to decide, but bounded in memory and time.
+const DIFF_CELL_LIMIT: usize = 4_000_000;
+
+// The line-level difference between two versions of one file, as the segments the decision screen works on.
+// `a` is the copy to keep by default (the work tree), `b` the copy offered (a stashed or otherwise saved
+// version). Lines both share are plain text; every maximal run of lines that differ is one hunk whose `ours`
+// holds the lines only `a` has and whose `theirs` holds the lines only `b` has, so an insertion in `b` is a
+// hunk with an empty A side and a deletion a hunk with an empty B side. Deciding every hunk for A renders
+// `a` again byte for byte; deciding every hunk for B renders `b`. A final line without a terminator is a
+// line of its own and differs from the same text with one, which keeps that distinction decidable too.
+// Identical inputs give no hunk.
+pub fn diff_segments(a: &[u8], b: &[u8]) -> Vec<Segment> {
+    let la: Vec<&[u8]> = a.split_inclusive(|&c| c == b'\n').collect();
+    let lb: Vec<&[u8]> = b.split_inclusive(|&c| c == b'\n').collect();
+    let head = la.iter().zip(&lb).take_while(|(x, y)| x == y).count();
+    let tail = la[head..]
+        .iter()
+        .rev()
+        .zip(lb[head..].iter().rev())
+        .take_while(|(x, y)| x == y)
+        .count();
+    let ma = &la[head..la.len() - tail];
+    let mb = &lb[head..lb.len() - tail];
+
+    let mut out = Out::default();
+    out.same(&la[..head]);
+    if ma.len().saturating_mul(mb.len()) > DIFF_CELL_LIMIT {
+        out.ours(ma);
+        out.theirs(mb);
+    } else {
+        // lcs[i][j]: length of the longest common subsequence of ma[i..] and mb[j..].
+        let w = mb.len() + 1;
+        let mut lcs = vec![0u32; (ma.len() + 1) * w];
+        for i in (0..ma.len()).rev() {
+            for j in (0..mb.len()).rev() {
+                lcs[i * w + j] = if ma[i] == mb[j] {
+                    lcs[(i + 1) * w + j + 1] + 1
+                } else {
+                    lcs[(i + 1) * w + j].max(lcs[i * w + j + 1])
+                };
+            }
+        }
+        let (mut i, mut j) = (0, 0);
+        while i < ma.len() && j < mb.len() {
+            if ma[i] == mb[j] {
+                out.same(&ma[i..=i]);
+                i += 1;
+                j += 1;
+            } else if lcs[(i + 1) * w + j] >= lcs[i * w + j + 1] {
+                out.ours(&ma[i..=i]);
+                i += 1;
+            } else {
+                out.theirs(&mb[j..=j]);
+                j += 1;
+            }
+        }
+        out.ours(&ma[i..]);
+        out.theirs(&mb[j..]);
+    }
+    out.same(&la[la.len() - tail..]);
+    out.finish()
+}
+
+// Accumulator for `diff_segments`: shared lines extend the current text run, differing lines extend the
+// current hunk, and a shared line after a hunk closes it.
+#[derive(Default)]
+struct Out {
+    segments: Vec<Segment>,
+    text: Vec<u8>,
+    ours: Vec<u8>,
+    theirs: Vec<u8>,
+}
+
+impl Out {
+    fn close(&mut self) {
+        if !self.ours.is_empty() || !self.theirs.is_empty() {
+            self.segments.push(Segment::Hunk(Hunk {
+                ours: std::mem::take(&mut self.ours),
+                theirs: std::mem::take(&mut self.theirs),
+                choice: None,
+            }));
+        }
+    }
+
+    fn same(&mut self, lines: &[&[u8]]) {
+        if lines.is_empty() {
+            return;
+        }
+        self.close();
+        for l in lines {
+            self.text.extend_from_slice(l);
+        }
+    }
+
+    fn flush_text(&mut self) {
+        if !self.text.is_empty() {
+            self.segments
+                .push(Segment::Text(std::mem::take(&mut self.text)));
+        }
+    }
+
+    fn ours(&mut self, lines: &[&[u8]]) {
+        if !lines.is_empty() {
+            self.flush_text();
+        }
+        for l in lines {
+            self.ours.extend_from_slice(l);
+        }
+    }
+
+    fn theirs(&mut self, lines: &[&[u8]]) {
+        if !lines.is_empty() {
+            self.flush_text();
+        }
+        for l in lines {
+            self.theirs.extend_from_slice(l);
+        }
+    }
+
+    fn finish(mut self) -> Vec<Segment> {
+        self.close();
+        self.flush_text();
+        self.segments
+    }
+}
+
 // A stable identity for a conflict, derived from where it is and what both sides hold (FNV-1a, 64
 // bit). The same conflict met again while a patch is recomputed against a newer HEAD hashes to the
 // same value, so an earlier decision can be reused; a conflict whose content changed does not, and
@@ -357,6 +485,93 @@ mod tests {
         assert_ne!(base, fingerprint("f", b"a", b"bc"));
         assert_ne!(base, fingerprint("f", b"ab", b"d"));
         assert_eq!(base.len(), 16);
+    }
+
+    fn rendered(segs: &mut [Segment], side: Side) -> Vec<u8> {
+        decide_all(segs, side);
+        render(segs).unwrap()
+    }
+
+    #[test]
+    fn identical_inputs_have_no_hunk() {
+        assert_eq!(hunk_count(&diff_segments(b"a\nb\n", b"a\nb\n")), 0);
+        assert_eq!(hunk_count(&diff_segments(b"", b"")), 0);
+    }
+
+    #[test]
+    fn each_separate_change_is_its_own_hunk() {
+        let a = b"1\n2\n3\n4\n5\n6\n7\n";
+        let b = b"1\nTWO\n3\n4\n5\n6\n7\nEIGHT\n";
+        let mut segs = diff_segments(a, b);
+        assert_eq!(
+            segs,
+            vec![
+                text("1\n"),
+                hunk("2\n", "TWO\n"),
+                text("3\n4\n5\n6\n7\n"),
+                hunk("", "EIGHT\n"),
+            ]
+        );
+        assert_eq!(rendered(&mut segs.clone(), Side::A), a);
+        assert_eq!(rendered(&mut segs, Side::B), b);
+    }
+
+    #[test]
+    fn one_hunk_can_be_taken_while_another_is_kept() {
+        let mut segs = diff_segments(b"a\nx\nb\ny\nc\n", b"a\nX\nb\nY\nc\n");
+        decide(&mut segs, 0, Some(Side::B));
+        decide(&mut segs, 1, Some(Side::A));
+        assert_eq!(render(&segs).unwrap(), b"a\nX\nb\ny\nc\n");
+    }
+
+    #[test]
+    fn a_deletion_and_an_insertion_are_decidable() {
+        let segs = diff_segments(b"a\ngone\nb\n", b"a\nb\nnew\n");
+        assert_eq!(
+            segs,
+            vec![
+                text("a\n"),
+                hunk("gone\n", ""),
+                text("b\n"),
+                hunk("", "new\n")
+            ]
+        );
+    }
+
+    #[test]
+    fn a_missing_final_newline_is_a_difference_of_its_own() {
+        let a = b"a\nb";
+        let b = b"a\nb\n";
+        let mut segs = diff_segments(a, b);
+        assert_eq!(hunk_count(&segs), 1);
+        assert_eq!(rendered(&mut segs.clone(), Side::A), a);
+        assert_eq!(rendered(&mut segs, Side::B), b);
+    }
+
+    #[test]
+    fn crlf_lines_are_compared_with_their_terminators() {
+        let mut segs = diff_segments(b"a\r\nb\r\n", b"a\r\nB\r\n");
+        assert_eq!(segs, vec![text("a\r\n"), hunk("b\r\n", "B\r\n")]);
+        assert_eq!(rendered(&mut segs, Side::B), b"a\r\nB\r\n");
+    }
+
+    #[test]
+    fn a_file_with_nothing_in_common_is_one_hunk() {
+        let segs = diff_segments(b"a\nb\n", b"c\n");
+        assert_eq!(segs, vec![hunk("a\nb\n", "c\n")]);
+        let segs = diff_segments(b"", b"c\n");
+        assert_eq!(segs, vec![hunk("", "c\n")]);
+    }
+
+    #[test]
+    fn inputs_past_the_table_limit_fall_back_to_one_hunk_and_still_render_both_sides() {
+        let n = 2200;
+        let a: String = (0..n).map(|i| format!("a{i}\n")).collect();
+        let b: String = (0..n).map(|i| format!("b{i}\n")).collect();
+        let mut segs = diff_segments(a.as_bytes(), b.as_bytes());
+        assert_eq!(hunk_count(&segs), 1);
+        assert_eq!(rendered(&mut segs.clone(), Side::A), a.as_bytes());
+        assert_eq!(rendered(&mut segs, Side::B), b.as_bytes());
     }
 
     #[test]

@@ -1,3 +1,5 @@
+## WARNING: Data-loss potential found, not fixed yet https://github.com/benjamindaines/gitomic/issues/2
+
 # gitomic
 
 `gitomic` records **atomic commits** while a git repository changes, then stamps a **single message** across the
